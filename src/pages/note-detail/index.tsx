@@ -1,6 +1,6 @@
 import { useParams, useNavigate } from 'react-router-dom';
 import {
-  ArrowLeft, Play, Pause, ChevronUp, ChevronDown, Edit3, Plus, Loader2, AlertCircle, ImagePlus,
+  ArrowLeft, Play, Pause, ChevronUp, ChevronDown, Edit3, Loader2, AlertCircle, ImagePlus,
   X, FileText, Square, Download, Bold, List, Share2, Trash2, Mic, MicOff,
   ChevronDown as ChevronDownIcon
 } from 'lucide-react';
@@ -9,7 +9,7 @@ import { useState, useRef, useCallback, useEffect } from 'react';
 import { getProfile, getAvatarUrl } from '@/services/auth';
 import ThemeToggle from '@/components/ThemeToggle';
 import RichTextEditor from '@/components/RichTextEditor';
-import { API_BASE, deleteAudio, fetchNote, updateNote, uploadPPT, insertPPTIntoTranscript } from '@/services/api';
+import { API_BASE, deleteAudio, fetchNote, updateNote, uploadPPT, insertPPTIntoTranscript, uploadAudio } from '@/services/api';
 import { sanitizeHTML } from '@/lib/sanitize';
 
 import { useRecording } from './useRecording';
@@ -49,10 +49,12 @@ export default function NoteDetail() {
   const [shareLink, setShareLink] = useState('');
   const [copySuccess, setCopySuccess] = useState(false);
   const [showLeftPanel, setShowLeftPanel] = useState(false); // tablet sidebar
+  const [isUploadingAudio, setIsUploadingAudio] = useState(false);
+  const [audioUploadError, setAudioUploadError] = useState<string | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const transcriptEditRef = useRef<HTMLDivElement>(null);
-  const noteEditRefs = useRef<Map<string, HTMLDivElement>>(new Map());
+  const noteEditRef = useRef<HTMLDivElement>(null);
   const activeTextElRef = useRef<HTMLDivElement | null>(null);
   const activeTextSetterRef = useRef<((text: string) => void) | null>(null);
 
@@ -163,6 +165,44 @@ export default function NoteDetail() {
     if (fileInputRef.current) fileInputRef.current.value = '';
   };
 
+  const audioInputRef = useRef<HTMLInputElement>(null);
+
+  const handleAudioUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file || !sessionId) return;
+
+    setIsUploadingAudio(true);
+    setAudioUploadError(null);
+
+    try {
+      const note = await uploadAudio(file, sessionId);
+      if (note && note.content) {
+        const transcriptRestored = false;
+        if (!transcriptRestored && note.content) {
+          const match = note.content.match(/^## 语音转文字\n\n([\s\S]*?)(?:\n\n---\n\n[\s\S]*)?$/);
+          if (match && match[1].trim()) transcript.actions.setTranscriptText(match[1].trim());
+        }
+        if (note.transcript && Array.isArray(note.transcript) && note.transcript.length > 0) {
+          const fullTranscript = note.transcript
+            .sort((a: any, b: any) => (a.chunk_index || 0) - (b.chunk_index || 0))
+            .map((chunk: any) => chunk.text || '')
+            .join(' ')
+            .trim();
+          if (fullTranscript) transcript.actions.setTranscriptText(fullTranscript);
+        }
+        if (note.content) {
+          const parsed = notesHook.actions.parseNotesFromContent(note.content);
+          if (parsed.length > 0) notesHook.actions.setNotes(parsed);
+        }
+      }
+    } catch (error: any) {
+      setAudioUploadError(error.message || '上传失败，请重试');
+    } finally {
+      setIsUploadingAudio(false);
+      if (audioInputRef.current) audioInputRef.current.value = '';
+    }
+  };
+
   if (isLoading) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-slate-50 dark:bg-slate-950">
@@ -175,7 +215,7 @@ export default function NoteDetail() {
     <div className="min-h-screen flex flex-col bg-slate-50 dark:bg-slate-950">
       {/* ---- Top Nav ---- */}
       <nav className="flex-shrink-0 bg-white/70 dark:bg-slate-900/70 backdrop-blur-md border-b border-slate-200/60 dark:border-slate-800/60">
-        <div className="px-4 py-2.5 flex items-center justify-between">
+        <div className="px-3 py-2 flex items-center justify-between">
           <div className="flex items-center gap-3 min-w-0">
             <button onClick={() => navigate(`/subject/${id}`)} className="min-w-[44px] min-h-[44px] flex items-center justify-center rounded-lg text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors">
               <ArrowLeft className="w-5 h-5" />
@@ -228,7 +268,7 @@ export default function NoteDetail() {
 
       {/* ---- Toolbar ---- */}
       <div className="flex-shrink-0 bg-white/60 dark:bg-slate-800/60 backdrop-blur-sm border-b border-slate-200/60 dark:border-slate-700/60">
-        <div className="px-4 py-2.5 flex items-center justify-between gap-4">
+        <div className="px-3 py-2 flex items-center justify-between gap-3">
           <div className="flex items-center gap-2">
             <input ref={fileInputRef} type="file" accept=".ppt,.pptx,.pdf" onChange={handlePPTSelect} className="hidden" />
             <button onClick={handlePPTClick} disabled={ppt.state.isUploadingPPT}
@@ -237,6 +277,13 @@ export default function NoteDetail() {
               {ppt.state.isUploadingPPT ? '上传中...' : '上传PPT'}
             </button>
             {ppt.state.slides.length > 0 && <span className="text-xs text-slate-400">{ppt.state.slides.length} 页</span>}
+
+            <input ref={audioInputRef} type="file" accept=".wav,.mp3,.webm,.m4a,.ogg,.flac" onChange={handleAudioUpload} className="hidden" />
+            <button onClick={() => audioInputRef.current?.click()} disabled={isUploadingAudio}
+              className="flex items-center gap-1 px-2.5 py-1.5 text-xs text-slate-600 dark:text-slate-300 bg-white dark:bg-slate-700 border border-slate-200 dark:border-slate-600 rounded-lg hover:border-green-300 hover:text-green-600 transition-all disabled:opacity-50">
+              {isUploadingAudio ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Mic className="w-3.5 h-3.5" />}
+              {isUploadingAudio ? '上传中...' : '上传录音'}
+            </button>
           </div>
 
           <div className="flex items-center gap-3">
@@ -328,17 +375,19 @@ export default function NoteDetail() {
         </div>
       )}
 
+      {audioUploadError && (
+        <div className="flex-shrink-0 mx-4 mt-3 p-3 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-xl flex items-start gap-2">
+          <AlertCircle className="w-4 h-4 text-red-500 flex-shrink-0 mt-0.5" />
+          <div className="flex-1"><p className="text-xs text-red-600 dark:text-red-400">{audioUploadError}</p></div>
+          <button onClick={() => setAudioUploadError(null)}
+            className="p-0.5 text-red-400 hover:text-red-600"><X className="w-3.5 h-3.5" /></button>
+        </div>
+      )}
+
       {transcript.state.isAiRestructuring && recording.state.isRecording && (
         <div className="flex-shrink-0 mx-4 mt-2 flex items-center gap-2 px-3 py-2 bg-blue-50 dark:bg-blue-900/20 border border-blue-100 dark:border-blue-800 rounded-lg text-xs text-blue-600 dark:text-blue-400">
           <Loader2 className="w-3 h-3 animate-spin" />
           AI 正在整理文本...
-        </div>
-      )}
-
-      {transcript.state.isTranscribing && !recording.state.isRecording && (
-        <div className="flex-shrink-0 mx-4 mt-2 flex items-center gap-2 px-3 py-2 bg-green-50 dark:bg-green-900/20 border border-green-100 dark:border-green-800 rounded-lg text-xs text-green-600 dark:text-green-400">
-          <Loader2 className="w-3 h-3 animate-spin" />
-          录音已保存，AI 正在整理全文...
         </div>
       )}
 
@@ -394,7 +443,7 @@ export default function NoteDetail() {
             {/* PPT slide image */}
             <div className="px-3 pb-3">
               {ppt.state.slides.length > 0 && ppt.state.slides[ppt.state.activeSlideIndex] ? (
-                <div className="bg-slate-100 dark:bg-slate-900 rounded-lg overflow-hidden border border-slate-200 dark:border-slate-700">
+                <div className="rounded-lg overflow-hidden border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900">
                   {(() => {
                     const s = ppt.state.slides[ppt.state.activeSlideIndex];
                     const src = s.image_path
@@ -402,7 +451,7 @@ export default function NoteDetail() {
                       : s.image_base64 || '';
                     return src ? (
                       <img src={src} alt={`Slide ${s.page}`}
-                        className="w-full object-contain max-h-[35vh]"
+                        className="w-full object-cover"
                         onError={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }} />
                     ) : (
                       <div className="flex items-center justify-center h-28 text-xs text-slate-400">无预览图</div>
@@ -423,39 +472,25 @@ export default function NoteDetail() {
               <Edit3 className="w-3.5 h-3.5 text-amber-500" />
               <h3 className="text-xs font-semibold text-slate-600 dark:text-slate-300">随堂思考与重难点</h3>
             </div>
-            <div className="flex-1 overflow-y-auto p-3 space-y-2.5">
-              {notesHook.state.notes.map((note, idx) => (
-                <div key={idx} className="group">
-                  {notesHook.state.editingNote === String(idx) ? (
-                    <div onBlur={() => notesHook.actions.setEditingNote(null)}>
-                      <RichTextEditor ref={(el) => { if (el) noteEditRefs.current.set(String(idx), el); }}
-                        value={note.content} onChange={(text) => notesHook.actions.updateNote(idx, text)}
-                        onFocus={() => { activeTextElRef.current = noteEditRefs.current.get(String(idx)) || null; activeTextSetterRef.current = (text: string) => notesHook.actions.updateNote(idx, text); }}
-                        placeholder="笔记内容..."
-                        className="rich-text-editor w-full p-2.5 text-sm text-slate-600 dark:text-slate-300 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 rounded-lg focus:outline-none focus:ring-2 focus:ring-amber-200 leading-relaxed"
-                      />
-                    </div>
-                  ) : note.content ? (
-                    <div onClick={() => notesHook.actions.setEditingNote(String(idx))}
-                      className="p-2.5 text-sm text-slate-600 dark:text-slate-300 bg-white dark:bg-slate-700 border border-slate-100 dark:border-slate-600 rounded-lg hover:border-amber-200 hover:bg-amber-50/50 dark:hover:bg-amber-900/10 cursor-pointer transition-all leading-relaxed"
-                      dangerouslySetInnerHTML={{ __html: sanitizeHTML(note.content) }} />
-                  ) : (
-                    <div onClick={() => notesHook.actions.setEditingNote(String(idx))}
-                      className="p-2.5 text-sm text-slate-400 dark:text-slate-500 bg-white dark:bg-slate-700 border border-slate-100 dark:border-slate-600 rounded-lg hover:border-amber-200 cursor-pointer transition-all">点此编辑...</div>
-                  )}
-                </div>
-              ))}
-              <button onClick={notesHook.actions.addNote}
-                className="w-full p-2.5 border-2 border-dashed border-slate-200 dark:border-slate-600 rounded-lg text-sm text-slate-400 hover:border-blue-300 hover:text-blue-500 hover:bg-blue-50/30 transition-all flex items-center justify-center gap-1.5">
-                <Plus className="w-3.5 h-3.5" />添加笔记
-              </button>
+            <div className="flex-1 overflow-y-auto p-3">
+              <RichTextEditor
+                ref={noteEditRef}
+                value={notesHook.state.notes.length > 0 ? notesHook.state.notes[0].content : ''}
+                onChange={(text) => notesHook.actions.updateNote(0, text)}
+                onFocus={() => {
+                  activeTextElRef.current = noteEditRef.current;
+                  activeTextSetterRef.current = (text: string) => notesHook.actions.updateNote(0, text);
+                }}
+                placeholder="在此记录随堂思考与重难点..."
+                className="rich-text-editor w-full p-2.5 text-sm text-slate-600 dark:text-slate-300 bg-white dark:bg-slate-700 border border-slate-200 dark:border-slate-600 rounded-lg focus:outline-none focus:ring-2 focus:ring-amber-200 leading-relaxed"
+              />
             </div>
           </div>
         </aside>
 
         {/* ---- Right (2/3): Transcript ---- */}
         <main className="w-7/12 overflow-y-auto bg-white/40 dark:bg-slate-900/40 backdrop-blur-sm">
-          <div className="px-6 md:px-8 py-5">
+          <div className="px-4 md:px-6 py-4">
             <div className="flex items-center justify-between mb-3">
               <h2 className="text-sm font-semibold text-slate-600 dark:text-slate-300 flex items-center gap-2">
                 {recording.state.isRecording ? <span className="w-2 h-2 rounded-full bg-red-400 animate-pulse" /> : <span className="w-2 h-2 rounded-full bg-slate-400" />}
@@ -497,50 +532,96 @@ export default function NoteDetail() {
                 <p className="text-xs mt-1 text-slate-300 dark:text-slate-600">录音将实时转写，PPT 自动对齐插入</p>
               </div>
             ) : transcript.state.contentBlocks.length > 0 ? (
-              <div className="space-y-5">
-                {transcript.state.contentBlocks.map((block: ContentBlock, idx) =>
-                  block.type === 'text' ? (
-                    <div key={idx} className="prose prose-slate prose-sm dark:prose-invert max-w-none text-slate-600 dark:text-slate-300 leading-relaxed"
-                      dangerouslySetInnerHTML={{ __html: sanitizeHTML(block.content || '') }} />
-                  ) : block.type === 'image' ? (
-                    <div key={idx} className="group my-2">
-                      <div
-                        className="flex items-center gap-3 p-3 bg-white dark:bg-slate-800 rounded-xl border border-slate-200 dark:border-slate-700 shadow-sm hover:border-blue-300 dark:hover:border-blue-600 transition-colors cursor-pointer"
-                        onClick={() => {
-                          const pageIdx = (block.page || 1) - 1;
-                          if (pageIdx >= 0 && pageIdx < ppt.state.slides.length) {
-                            ppt.actions.setActiveSlideIndex(pageIdx);
-                            setShowLeftPanel(true);
-                          }
-                        }}
-                      >
-                        <img
-                          src={block.src?.startsWith('data:') ? block.src : `${API_BASE}${block.src}`}
-                          alt={`PPT 第 ${block.page} 页`}
-                          className="w-16 h-12 object-cover rounded-md border border-slate-100 dark:border-slate-600 flex-shrink-0"
-                          onError={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }}
-                        />
-                        <div className="flex-1 min-w-0">
-                          <div className="flex items-center gap-1.5">
-                            <FileText className="w-3.5 h-3.5 text-blue-500 flex-shrink-0" />
-                            <span className="text-xs font-semibold text-slate-600 dark:text-slate-300 truncate">
-                              PPT 第 {block.page} 页 · {block.title}
-                            </span>
+              <div className="space-y-3">
+                {(() => {
+                  const blocks = transcript.state.contentBlocks;
+                  const combined: { type: 'combined' | 'text'; imageBlock?: ContentBlock; textBlock?: ContentBlock }[] = [];
+                  let i = 0;
+                  while (i < blocks.length) {
+                    if (blocks[i].type === 'image' && i + 1 < blocks.length && blocks[i + 1].type === 'text') {
+                      combined.push({ type: 'combined', imageBlock: blocks[i], textBlock: blocks[i + 1] });
+                      i += 2;
+                    } else if (blocks[i].type === 'text') {
+                      combined.push({ type: 'text', textBlock: blocks[i] });
+                      i++;
+                    } else {
+                      i++;
+                    }
+                  }
+                  return combined.map((group, idx) => {
+                    if (group.type === 'combined' && group.imageBlock && group.textBlock) {
+                      const imageBlock = group.imageBlock;
+                      const textBlock = group.textBlock;
+                      return (
+                        <div key={idx} className="bg-white dark:bg-slate-800 rounded-xl border border-slate-200 dark:border-slate-700 overflow-hidden shadow-sm">
+                        <div
+                          className="flex items-center gap-3 p-3 bg-slate-50/50 dark:bg-slate-800/50 border-b border-slate-100 dark:border-slate-700/50 cursor-pointer hover:bg-slate-100/50 dark:hover:bg-slate-700/50 transition-colors"
+                          onClick={() => {
+                            const pageIdx = (imageBlock.page || 1) - 1;
+                            if (pageIdx >= 0 && pageIdx < ppt.state.slides.length) {
+                              ppt.actions.setActiveSlideIndex(pageIdx);
+                              setShowLeftPanel(true);
+                            }
+                          }}
+                        >
+                          <img
+                            src={imageBlock.src?.startsWith('data:') ? imageBlock.src : `${API_BASE}${imageBlock.src}`}
+                            alt={`PPT 第 ${imageBlock.page} 页`}
+                            className="w-16 h-12 object-cover rounded-md border border-slate-100 dark:border-slate-600 flex-shrink-0 hover:scale-105 transition-transform"
+                            onError={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }}
+                          />
+                          <div className="flex-1 min-w-0">
+                            <div className="flex items-center gap-1.5">
+                              <FileText className="w-3.5 h-3.5 text-blue-500 flex-shrink-0" />
+                              <span className="text-xs font-semibold text-slate-600 dark:text-slate-300 truncate">
+                                PPT 第 {imageBlock.page} 页 · {imageBlock.title}
+                              </span>
+                            </div>
+                            <p className="text-xs text-slate-400 mt-0.5">点击查看大图</p>
                           </div>
-                          <p className="text-xs text-slate-400 mt-0.5">点击在右侧查看</p>
+                          <ChevronUp className="w-4 h-4 text-slate-400 rotate-90 flex-shrink-0" />
                         </div>
-                        <div className="w-5 h-5 rounded-full bg-slate-100 dark:bg-slate-700 flex items-center justify-center flex-shrink-0 group-hover:bg-blue-100 dark:group-hover:bg-blue-900/30 transition-colors">
-                          <ChevronUp className="w-3 h-3 text-slate-400 rotate-90" />
+                          <div
+                            contentEditable
+                            suppressContentEditableWarning
+                            onBlur={(e) => {
+                              const newBlocks = [...blocks];
+                              const textBlockIndex = blocks.indexOf(textBlock);
+                              if (textBlockIndex !== -1) {
+                                newBlocks[textBlockIndex] = { ...newBlocks[textBlockIndex], content: e.currentTarget.textContent || '' };
+                                transcript.actions.setContentBlocks(newBlocks);
+                              }
+                            }}
+                            className="p-4 text-sm text-slate-600 dark:text-slate-300 leading-relaxed whitespace-pre-wrap focus:outline-none min-h-[60px]"
+                          >
+                            {textBlock.content || ''}
+                          </div>
                         </div>
-                      </div>
-                    </div>
-                  ) : (
-                    <div key={idx} className="flex items-center gap-2 py-2 px-3 bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800 rounded-lg">
-                      <FileText className="w-3.5 h-3.5 text-blue-500" />
-                      <span className="text-xs text-blue-600 dark:text-blue-400 font-medium">PPT 第 {block.page} 页 · {block.title}</span>
-                    </div>
-                  )
-                )}
+                      );
+                    } else if (group.type === 'text' && group.textBlock) {
+                      const textBlock = group.textBlock;
+                      return (
+                        <div
+                          key={idx}
+                          contentEditable
+                          suppressContentEditableWarning
+                          onBlur={(e) => {
+                            const newBlocks = [...blocks];
+                            const textBlockIndex = blocks.indexOf(textBlock);
+                            if (textBlockIndex !== -1) {
+                              newBlocks[textBlockIndex] = { ...newBlocks[textBlockIndex], content: e.currentTarget.textContent || '' };
+                              transcript.actions.setContentBlocks(newBlocks);
+                            }
+                          }}
+                          className="w-full p-4 text-sm text-slate-600 dark:text-slate-300 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-600 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-200 leading-relaxed whitespace-pre-wrap min-h-[60px]"
+                        >
+                          {textBlock.content || ''}
+                        </div>
+                      );
+                    }
+                    return null;
+                  });
+                })()}
               </div>
             ) : recording.state.isRecording ? (
               <div className="space-y-2">

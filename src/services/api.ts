@@ -342,6 +342,21 @@ export async function updateTranscript(sessionId: string, transcript: any[]): Pr
   }
 }
 
+export async function uploadAudio(file: File, sessionId: string): Promise<BackendNote> {
+  const formData = new FormData();
+  formData.append('file', file);
+  const res = await fetch(`${API_BASE}/api/process/audio-batch?session_id=${sessionId}`, {
+    method: 'POST',
+    headers: authHeaders(),
+    body: formData,
+  });
+  if (!res.ok) {
+    const errorText = await res.text();
+    throw new Error(`Audio upload failed: ${res.status} ${errorText}`);
+  }
+  return res.json();
+}
+
 // Import/Export API
 export async function importNotebook(pkg: any): Promise<BackendNotebook> {
   const token = getToken();

@@ -6,7 +6,7 @@ export interface StudentNote {
 }
 
 export function useNotes() {
-  const [notes, setNotes] = useState<StudentNote[]>([]);
+  const [notes, setNotes] = useState<StudentNote[]>([{ type: 'text', content: '' }]);
   const [editingNote, setEditingNote] = useState<string | null>(null);
 
   const updateNote = useCallback((index: number, content: string) => {
@@ -17,20 +17,14 @@ export function useNotes() {
     });
   }, []);
 
-  const addNote = useCallback(() => {
-    const newIdx = notes.length;
-    setNotes((prev) => [...prev, { type: 'text', content: '' }]);
-    setEditingNote(String(newIdx));
-  }, [notes.length]);
-
   const parseNotesFromContent = useCallback((content: string) => {
     const transcriptSectionMatch = content.match(/^## 语音转文字\n\n([\s\S]*?)\n\n---\n\n([\s\S]*)$/);
     if (transcriptSectionMatch && transcriptSectionMatch[2].trim()) {
-      return transcriptSectionMatch[2].split('\n\n').filter(Boolean).map(c => ({ type: 'text', content: c }));
+      return [{ type: 'text', content: transcriptSectionMatch[2].trim() }];
     } else if (!content.startsWith('## 语音转文字\n\n')) {
-      return content.split('\n\n').filter(Boolean).map(c => ({ type: 'text', content: c }));
+      return [{ type: 'text', content }];
     }
-    return [];
+    return [{ type: 'text', content: '' }];
   }, []);
 
   return {
@@ -42,7 +36,6 @@ export function useNotes() {
       setNotes,
       setEditingNote,
       updateNote,
-      addNote,
       parseNotesFromContent,
     },
   };
