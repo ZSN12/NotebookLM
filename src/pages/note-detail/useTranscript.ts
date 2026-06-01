@@ -22,6 +22,15 @@ export function useTranscript(
   const [lastSaveTime, setLastSaveTime] = useState<number | null>(null);
   const prevTranscriptRef = useRef('');
 
+  const appendTranscriptText = useCallback((newText: string) => {
+    setTranscriptText(prev => {
+      const trimmed = newText.trim();
+      if (!trimmed) return prev;
+      const prevTrimmed = prev.trim();
+      return prevTrimmed ? `${prevTrimmed} ${trimmed}` : trimmed;
+    });
+  }, []);
+
   const loadHistory = useCallback(async () => {
     if (!sessionId) return;
     try {
@@ -104,8 +113,14 @@ export function useTranscript(
     if (transcriptText && transcriptText !== prevTranscriptRef.current) {
       prevTranscriptRef.current = transcriptText;
       setIsTranscribing(false);
+      // 转录重组完成，用干净文本重新匹配 PPT
+      if (sessionId) {
+        insertPPTIntoTranscript(sessionId).then(result => {
+          if (result.blocks?.length > 0) setContentBlocks(result.blocks);
+        }).catch(() => {});
+      }
     }
-  }, [isTranscribing, transcriptText]);
+  }, [isTranscribing, transcriptText, sessionId]);
 
   useEffect(() => {
     if (!isRecording || !sessionId || slides.length === 0) return;
@@ -139,6 +154,7 @@ export function useTranscript(
     },
     actions: {
       setTranscriptText,
+      appendTranscriptText,
       setIsAiRestructuring,
       setIsTranscribing,
       setContentBlocks,

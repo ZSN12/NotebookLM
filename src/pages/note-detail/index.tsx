@@ -6,6 +6,7 @@ import {
 } from 'lucide-react';
 import { useStore } from '@/store/useStore';
 import { useState, useRef, useCallback, useEffect } from 'react';
+import { getProfile, getAvatarUrl } from '@/services/auth';
 import ThemeToggle from '@/components/ThemeToggle';
 import RichTextEditor from '@/components/RichTextEditor';
 import { API_BASE, deleteAudio, fetchNote, updateNote, uploadPPT, insertPPTIntoTranscript } from '@/services/api';
@@ -32,6 +33,9 @@ export default function NoteDetail() {
 
   const notebook = notebooks.find((n) => n.id === id);
   const session = sessions.find((s) => s.id === sessionId);
+  const [profile, setProfile] = useState<any>(null);
+
+  useEffect(() => { getProfile().then(setProfile).catch(() => {}); }, []);
 
   // ---- Hooks ----
   const recording = useRecording(sessionId);
@@ -198,6 +202,10 @@ export default function NoteDetail() {
                     className="w-full text-left px-3 py-2 text-xs text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700 transition-colors disabled:opacity-50">
                     {exportTools.state.isExportingPDF ? '⏳ 导出中...' : '📄 导出 PDF'}
                   </button>
+                  <button onClick={() => exportTools.actions.exportNotebookPackage()} disabled={exportTools.state.isExportingPackage}
+                    className="w-full text-left px-3 py-2 text-xs text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700 transition-colors disabled:opacity-50">
+                    {exportTools.state.isExportingPackage ? '⏳ 导出中...' : '📦 导出笔记本包'}
+                  </button>
                 </div>
               )}
             </div>
@@ -205,7 +213,15 @@ export default function NoteDetail() {
               <Share2 className="w-3.5 h-3.5" />
             </button>
             <ThemeToggle />
-            <div className="w-7 h-7 rounded-full bg-gradient-to-br from-blue-400 to-blue-600 flex items-center justify-center text-white text-xs font-bold">U</div>
+            <button onClick={() => navigate('/profile')} className="cursor-pointer">
+              {profile?.avatar_url ? (
+                <img src={getAvatarUrl(profile.id)} alt="avatar" className="w-7 h-7 rounded-full object-cover" />
+              ) : (
+                <div className="w-7 h-7 rounded-full bg-gradient-to-br from-blue-400 to-blue-600 flex items-center justify-center text-white text-xs font-bold">
+                  {(profile?.username || profile?.email || 'U')[0].toUpperCase()}
+                </div>
+              )}
+            </button>
           </div>
         </div>
       </nav>
@@ -231,16 +247,16 @@ export default function NoteDetail() {
                 </button>
               ) : recording.state.isError ? (
                 <button onClick={() => {
-                  if (recording.state.isRecording) recording.actions.stopRecording(transcript.actions.setTranscriptText);
+                  if (recording.state.isRecording) recording.actions.stopRecording(transcript.actions.appendTranscriptText);
                 }}
                   className="w-9 h-9 rounded-full bg-gradient-to-br from-red-500 to-red-600 text-white flex items-center justify-center shadow-lg hover:shadow-xl transition-all hover:scale-105 active:scale-95">
                   <AlertCircle className="w-4 h-4" />
                 </button>
               ) : (
                 <button onClick={() => {
-                  if (recording.state.isPaused) recording.actions.resumeRecording(transcript.actions.setTranscriptText);
+                  if (recording.state.isPaused) recording.actions.resumeRecording(transcript.actions.appendTranscriptText);
                   else if (recording.state.isRecording) recording.actions.pauseRecording();
-                  else recording.actions.startRecording(transcript.actions.setTranscriptText);
+                  else recording.actions.startRecording(transcript.actions.appendTranscriptText);
                 }}
                   className={`w-11 h-11 rounded-full text-white flex items-center justify-center shadow-lg hover:shadow-xl transition-all hover:scale-105 active:scale-95 ${
                     recording.state.isRecording ? 'bg-gradient-to-br from-amber-500 to-amber-600 shadow-amber-200' : 'bg-gradient-to-br from-blue-500 to-blue-600 shadow-blue-200'
@@ -264,7 +280,7 @@ export default function NoteDetail() {
 
             {recording.state.isRecording && (
               <button onClick={() => {
-                if (recording.state.isPaused) recording.actions.resumeRecording(transcript.actions.setTranscriptText);
+                if (recording.state.isPaused) recording.actions.resumeRecording(transcript.actions.appendTranscriptText);
                 else recording.actions.pauseRecording();
               }}
                 className="flex items-center gap-1 px-3 py-2 text-sm font-medium rounded-md bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-400 hover:bg-amber-200 transition-colors min-h-[44px]">
@@ -274,7 +290,7 @@ export default function NoteDetail() {
             )}
 
             {recording.state.isRecording && (
-              <button onClick={() => recording.actions.stopRecording(transcript.actions.setTranscriptText)}
+              <button onClick={() => recording.actions.stopRecording(transcript.actions.appendTranscriptText)}
                 className="flex items-center gap-1 px-3 py-2 text-sm font-medium rounded-md bg-red-100 dark:bg-red-900/30 text-red-600 dark:text-red-400 hover:bg-red-200 dark:hover:bg-red-900/50 transition-colors min-h-[44px]">
                 <MicOff className="w-3.5 h-3.5" />
                 停止
@@ -379,23 +395,6 @@ export default function NoteDetail() {
                 <p className="text-sm">点击录制按钮开始录音</p>
                 <p className="text-xs mt-1 text-slate-300 dark:text-slate-600">录音将实时转写，PPT 自动对齐插入</p>
               </div>
-            ) : recording.state.isRecording ? (
-              <div className="space-y-2">
-                <RichTextEditor
-                  ref={transcriptEditRef}
-                  value={transcript.state.transcriptText}
-                  onChange={(text) => { transcript.actions.setTranscriptText(text); }}
-                  onFocus={() => {
-                    activeTextElRef.current = transcriptEditRef.current;
-                    activeTextSetterRef.current = (text: string) => transcript.actions.setTranscriptText(text);
-                  }}
-                  placeholder="正在转录中，可直接编辑修改..."
-                  className="rich-text-editor w-full p-4 text-sm text-slate-600 dark:text-slate-300 bg-white dark:bg-slate-800 border border-blue-200 dark:border-blue-700 rounded-xl min-h-[300px] focus:outline-none focus:ring-2 focus:ring-blue-200 leading-relaxed"
-                />
-                {recording.state.isProcessing && (
-                  <div className="flex items-center gap-2 text-slate-400 text-sm"><Loader2 className="w-4 h-4 animate-spin" />初始化录音...</div>
-                )}
-              </div>
             ) : transcript.state.contentBlocks.length > 0 ? (
               <div className="space-y-4">
                 {transcript.state.contentBlocks.map((block: ContentBlock, idx) =>
@@ -413,6 +412,23 @@ export default function NoteDetail() {
                       <span className="text-xs text-blue-600 dark:text-blue-400 font-medium">PPT 第 {block.page} 页 · {block.title}</span>
                     </div>
                   )
+                )}
+              </div>
+            ) : recording.state.isRecording ? (
+              <div className="space-y-2">
+                <RichTextEditor
+                  ref={transcriptEditRef}
+                  value={transcript.state.transcriptText}
+                  onChange={(text) => { transcript.actions.setTranscriptText(text); }}
+                  onFocus={() => {
+                    activeTextElRef.current = transcriptEditRef.current;
+                    activeTextSetterRef.current = (text: string) => transcript.actions.setTranscriptText(text);
+                  }}
+                  placeholder="正在转录中，可直接编辑修改..."
+                  className="rich-text-editor w-full p-4 text-sm text-slate-600 dark:text-slate-300 bg-white dark:bg-slate-800 border border-blue-200 dark:border-blue-700 rounded-xl min-h-[300px] focus:outline-none focus:ring-2 focus:ring-blue-200 leading-relaxed"
+                />
+                {recording.state.isProcessing && (
+                  <div className="flex items-center gap-2 text-slate-400 text-sm"><Loader2 className="w-4 h-4 animate-spin" />初始化录音...</div>
                 )}
               </div>
             ) : (

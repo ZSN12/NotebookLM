@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { ArrowLeft, Plus, Search, Share2, Download } from 'lucide-react';
 import { useStore } from '@/store/useStore';
+import { getProfile, getAvatarUrl } from '@/services/auth';
 import SessionCard from '@/components/SessionCard';
 import CreateDialog from '@/components/CreateDialog';
 import ThemeToggle from '@/components/ThemeToggle';
@@ -12,6 +13,7 @@ export default function ChapterList() {
   const { notebooks, sessions, loading, error, openDialog, loadSessions } = useStore();
   const [searchQuery, setSearchQuery] = useState('');
   const [copyFeedback, setCopyFeedback] = useState('');
+  const [profile, setProfile] = useState<any>(null);
 
   const notebook = notebooks.find((n) => n.id === id);
   const notebookSessions = sessions.filter((s) => s.notebookId === id);
@@ -19,6 +21,7 @@ export default function ChapterList() {
   useEffect(() => {
     if (id) {
       loadSessions(id);
+      getProfile().then(setProfile).catch(() => {});
     }
   }, [id, loadSessions]);
 
@@ -105,9 +108,15 @@ export default function ChapterList() {
                 <Download className="w-4 h-4" />
               </button>
               {copyFeedback && <span className="text-xs text-green-500 font-medium">{copyFeedback}</span>}
-              <div className="w-7 h-7 rounded-full bg-gradient-to-br from-blue-500 to-violet-500 flex items-center justify-center text-white text-xs font-medium ml-1">
-                U
-              </div>
+              <button onClick={() => navigate('/profile')} className="cursor-pointer">
+                {profile?.avatar_url ? (
+                  <img src={getAvatarUrl(profile.id)} alt="avatar" className="w-7 h-7 rounded-full object-cover" />
+                ) : (
+                  <div className="w-7 h-7 rounded-full bg-gradient-to-br from-blue-500 to-violet-500 flex items-center justify-center text-white text-xs font-medium">
+                    {(profile?.username || profile?.email || 'U')[0].toUpperCase()}
+                  </div>
+                )}
+              </button>
             </div>
           </div>
         </div>

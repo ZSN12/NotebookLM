@@ -6,7 +6,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 # Rate limit rules: (path_prefix, max_requests, window_seconds)
 RATE_LIMITS = [
-    ("/api/process/audio-stream", 10, 60),   # 10 requests per minute
+    ("/api/process/audio-stream", 200, 60),   # 200 requests per minute (1 per 2.5s = ~24/min, allows faster speech)
     ("/api/process/audio-finish", 5, 60),     # 5 requests per minute
     ("/api/process/audio-batch", 5, 60),      # 5 requests per minute
     ("/api/process/ppt-upload", 5, 60),       # 5 requests per minute

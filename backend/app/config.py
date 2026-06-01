@@ -47,7 +47,7 @@ REFRESH_TOKEN_EXPIRE_DAYS = 7  # 7 days
 
 # CORS
 # Comma-separated list of allowed origins (e.g. "http://localhost:5173,https://myapp.com")
-ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "http://localhost:5173,http://localhost:5174").split(",") if o.strip()]
+ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "http://localhost:5173,http://localhost:5174,http://localhost:5175").split(",") if o.strip()]
 
 # Default Admin Account (for first-run initialization)
 ADMIN_DEFAULT_EMAIL = os.getenv("ADMIN_DEFAULT_EMAIL", "admin")

@@ -39,3 +39,23 @@ export interface DialogState {
   editingNotebook?: Notebook;
   editingSession?: Session;
 }
+
+export interface SessionNoteBundle {
+  title: string;
+  summary?: string;
+  keywords?: string[];
+  content?: string;
+  transcript?: any[];
+  ppt_images?: string[];
+}
+
+export interface NotebookPackage {
+  format_version: number;
+  notebook: {
+    title: string;
+    description?: string;
+    icon?: string;
+    color?: string;
+  };
+  sessions: SessionNoteBundle[];
+}

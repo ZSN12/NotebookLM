@@ -75,3 +75,61 @@ export async function resetPassword(email: string, newPassword: string): Promise
     throw new Error(err.detail || "密码重置失败");
   }
 }
+
+export async function getProfile(): Promise<any> {
+  const token = getToken();
+  if (!token) throw new Error("Not authenticated");
+  const res = await fetch(`${API_BASE}/api/auth/me`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) throw new Error("Failed to fetch profile");
+  return res.json();
+}
+
+export async function updateProfile(username: string): Promise<any> {
+  const token = getToken();
+  const res = await fetch(`${API_BASE}/api/auth/profile`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ username }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: "更新失败" }));
+    throw new Error(err.detail || "更新失败");
+  }
+  return res.json();
+}
+
+export async function changePassword(oldPassword: string, newPassword: string): Promise<void> {
+  const token = getToken();
+  const res = await fetch(`${API_BASE}/api/auth/change-password`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ old_password: oldPassword, new_password: newPassword }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: "密码修改失败" }));
+    throw new Error(err.detail || "密码修改失败");
+  }
+}
+
+export async function uploadAvatar(file: File): Promise<string> {
+  const token = getToken();
+  const formData = new FormData();
+  formData.append("file", file);
+  const res = await fetch(`${API_BASE}/api/auth/avatar`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: formData,
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: "头像上传失败" }));
+    throw new Error(err.detail || "头像上传失败");
+  }
+  const data = await res.json();
+  return data.avatar_url;
+}
+
+export function getAvatarUrl(userId: string): string {
+  return `${API_BASE}/api/auth/avatar/${userId}`;
+}

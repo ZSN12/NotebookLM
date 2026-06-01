@@ -192,3 +192,41 @@ class TokenRefreshResponse(BaseModel):
 class PasswordReset(BaseModel):
     email: str
     new_password: str
+
+
+class UserProfileUpdate(BaseModel):
+    username: Optional[str] = None
+
+    @field_validator("username")
+    @classmethod
+    def username_length(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and (len(v) < 2 or len(v) > 50):
+            raise ValueError("Username must be between 2 and 50 characters")
+        return v
+
+
+class PasswordChange(BaseModel):
+    old_password: str
+    new_password: str
+
+    @field_validator("new_password")
+    @classmethod
+    def password_length(cls, v: str) -> str:
+        if len(v) < 8:
+            raise ValueError("Password must be at least 8 characters")
+        return v
+
+
+class SessionNoteBundle(BaseModel):
+    title: str
+    summary: Optional[str] = None
+    keywords: Optional[list[str]] = None
+    content: Optional[str] = None
+    transcript: Optional[list] = None
+    ppt_images: Optional[list] = None
+
+
+class NotebookPackage(BaseModel):
+    format_version: int = 1
+    notebook: NotebookCreate
+    sessions: list[SessionNoteBundle] = []

@@ -145,10 +145,24 @@ export async function updateNotebook(notebookId: string, title: string): Promise
   return mapBackendNotebook(data);
 }
 
+export async function fetchNotebookDetail(notebookId: string): Promise<BackendNotebook | null> {
+  try {
+    const data = await request<BackendNotebook>(`/api/notebooks/${notebookId}`);
+    return data;
+  } catch { return null; }
+}
+
 // Session API
 export async function fetchSessions(notebookId: string): Promise<Session[]> {
   const data = await request<BackendSession[]>(`/api/sessions?notebook_id=${notebookId}`);
   return data.map(mapBackendSession);
+}
+
+export async function fetchSessionDetail(notebookId: string): Promise<BackendSession[]> {
+  try {
+    const data = await request<BackendSession[]>(`/api/sessions?notebook_id=${notebookId}`);
+    return data;
+  } catch { return []; }
 }
 
 export async function createSession(notebookId: string, title: string): Promise<Session> {
@@ -218,7 +232,7 @@ export interface Slide {
   title: string;
   text: string;
   image_path?: string;
-  image_base64?: string;  // deprecated, for legacy data
+  image_base64?: string;
 }
 
 // File upload API
@@ -233,8 +247,6 @@ export async function uploadPPT(file: File, sessionId: string): Promise<{ status
   if (!res.ok) throw new Error(`PPT upload failed: ${res.status}`);
   return res.json();
 }
-
-// Note: uploadAudio and processSession removed - not implemented in backend
 
 export async function streamAudioChunk(
   audioBlob: Blob,
@@ -276,14 +288,12 @@ export async function streamAudioChunk(
   }
 }
 
-// Notes API
+// Note API
 export async function fetchNote(sessionId: string): Promise<BackendNote | null> {
   try {
     const data = await request<BackendNote>(`/api/notes/session/${sessionId}`);
     return data;
-  } catch (error) {
-    return null; // Note not found is OK
-  }
+  } catch { return null; }
 }
 
 export async function updateNote(sessionId: string, content: string): Promise<BackendNote | null> {
@@ -293,10 +303,7 @@ export async function updateNote(sessionId: string, content: string): Promise<Ba
       body: JSON.stringify({ content }),
     });
     return data;
-  } catch (error) {
-    console.error('Failed to update note:', error);
-    return null;
-  }
+  } catch { return null; }
 }
 
 export async function finishRecording(sessionId: string): Promise<{ status: string; audio_path: string | null }> {
@@ -306,8 +313,7 @@ export async function finishRecording(sessionId: string): Promise<{ status: stri
       { method: 'POST' }
     );
     return data;
-  } catch (error) {
-    console.error('Failed to finish recording:', error);
+  } catch {
     return { status: 'error', audio_path: null };
   }
 }
@@ -320,8 +326,7 @@ export async function deleteAudio(sessionId: string): Promise<boolean> {
   try {
     await request<void>(`/api/process/audio?session_id=${sessionId}`, { method: 'DELETE' });
     return true;
-  } catch (error) {
-    console.error('Failed to delete audio:', error);
+  } catch {
     return false;
   }
 }
@@ -332,7 +337,34 @@ export async function updateTranscript(sessionId: string, transcript: any[]): Pr
       method: 'PUT',
       body: JSON.stringify({ content: JSON.stringify(transcript) }),
     });
-  } catch (error) {
-    console.error('Failed to update transcript:', error);
+  } catch {
+    // ignore
   }
+}
+
+// Import/Export API
+export async function importNotebook(pkg: any): Promise<BackendNotebook> {
+  const token = getToken();
+  const res = await fetch(`${API_BASE}/api/notebooks/import`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+    body: JSON.stringify(pkg),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: '导入失败' }));
+    throw new Error(err.detail || '导入失败');
+  }
+  return res.json();
+}
+
+export async function exportNotebook(notebookId: string): Promise<any> {
+  const token = getToken();
+  const res = await fetch(`${API_BASE}/api/notebooks/${notebookId}/export`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: '导出失败' }));
+    throw new Error(err.detail || '导出失败');
+  }
+  return res.json();
 }

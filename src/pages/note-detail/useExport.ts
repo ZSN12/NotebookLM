@@ -1,18 +1,22 @@
 import { useState } from 'react';
 import html2pdf from 'html2pdf.js';
+import { exportNotebook } from '@/services/api';
 
 interface Session {
+  id?: string;
   title: string;
   duration?: string;
 }
 
 interface Notebook {
+  id?: string;
   title: string;
 }
 
 export function useExport(session: Session | undefined, notebook: Notebook | undefined) {
   const [showExportMenu, setShowExportMenu] = useState(false);
   const [isExportingPDF, setIsExportingPDF] = useState(false);
+  const [isExportingPackage, setIsExportingPackage] = useState(false);
 
   const exportMarkdown = (transcriptText: string, notes: Array<{ type: string; content: string }>) => {
     if (!session || !notebook) return;
@@ -75,15 +79,37 @@ export function useExport(session: Session | undefined, notebook: Notebook | und
     }
   };
 
+  const exportNotebookPackage = async () => {
+    if (!notebook?.id) return;
+    setIsExportingPackage(true);
+    try {
+      const pkg = await exportNotebook(notebook.id);
+      const blob = new Blob([JSON.stringify(pkg, null, 2)], { type: 'application/json' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = `${notebook.title}.nootbook`;
+      a.click();
+      URL.revokeObjectURL(a.href);
+    } catch (err: any) {
+      console.error('Notebook package export failed:', err);
+      alert(err.message || '导出失败');
+    } finally {
+      setIsExportingPackage(false);
+      setShowExportMenu(false);
+    }
+  };
+
   return {
     state: {
       showExportMenu,
       isExportingPDF,
+      isExportingPackage,
     },
     actions: {
       setShowExportMenu,
       exportMarkdown,
       exportPDF,
+      exportNotebookPackage,
     },
   };
 }
