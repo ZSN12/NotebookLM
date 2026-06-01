@@ -1,7 +1,7 @@
 import type { Notebook, Session } from '@/types';
 import { getToken, clearToken } from './auth';
-
-export const API_BASE = 'http://127.0.0.1:8003';
+import { API_BASE } from '@/config';
+export { API_BASE };
 
 function authHeaders(): Record<string, string> {
   const token = getToken();

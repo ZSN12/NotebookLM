@@ -187,3 +187,8 @@ class TokenRefresh(BaseModel):
 class TokenRefreshResponse(BaseModel):
     access_token: str
     token_type: str
+
+
+class PasswordReset(BaseModel):
+    email: str
+    new_password: str

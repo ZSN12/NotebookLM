@@ -17,8 +17,10 @@ export function useTranscript(
 ) {
   const [transcriptText, setTranscriptText] = useState('');
   const [isAiRestructuring, setIsAiRestructuring] = useState(false);
+  const [isTranscribing, setIsTranscribing] = useState(false);
   const [contentBlocks, setContentBlocks] = useState<ContentBlock[]>([]);
   const [lastSaveTime, setLastSaveTime] = useState<number | null>(null);
+  const prevTranscriptRef = useRef('');
 
   const loadHistory = useCallback(async () => {
     if (!sessionId) return;
@@ -91,6 +93,21 @@ export function useTranscript(
   }, [isRecording, sessionId, transcriptText]);
 
   useEffect(() => {
+    if (!isRecording && sessionId && transcriptText) {
+      prevTranscriptRef.current = transcriptText;
+      setIsTranscribing(true);
+    }
+  }, [isRecording, sessionId]);
+
+  useEffect(() => {
+    if (!isTranscribing) return;
+    if (transcriptText && transcriptText !== prevTranscriptRef.current) {
+      prevTranscriptRef.current = transcriptText;
+      setIsTranscribing(false);
+    }
+  }, [isTranscribing, transcriptText]);
+
+  useEffect(() => {
     if (!isRecording || !sessionId || slides.length === 0) return;
     const doInsert = async () => {
       try {
@@ -116,12 +133,14 @@ export function useTranscript(
     state: {
       transcriptText,
       isAiRestructuring,
+      isTranscribing,
       contentBlocks,
       lastSaveTime,
     },
     actions: {
       setTranscriptText,
       setIsAiRestructuring,
+      setIsTranscribing,
       setContentBlocks,
       saveContent,
     },

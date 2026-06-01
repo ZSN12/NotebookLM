@@ -319,6 +319,13 @@ export default function NoteDetail() {
         </div>
       )}
 
+      {transcript.state.isTranscribing && !recording.state.isRecording && (
+        <div className="flex-shrink-0 mx-4 mt-2 flex items-center gap-2 px-3 py-2 bg-green-50 dark:bg-green-900/20 border border-green-100 dark:border-green-800 rounded-lg text-xs text-green-600 dark:text-green-400">
+          <Loader2 className="w-3 h-3 animate-spin" />
+          录音已保存，AI 正在整理全文...
+        </div>
+      )}
+
       {/* ---- Two-column layout (sidebar hidden on tablet, toggleable) ---- */}
       <div className="flex-1 flex overflow-hidden">
         {!showSidebar && (

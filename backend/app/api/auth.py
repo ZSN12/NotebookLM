@@ -4,7 +4,7 @@ import time
 import threading
 from app.core.database import get_db
 from app.core.auth import hash_password, verify_password, create_access_token, create_refresh_token, decode_refresh_token, get_current_user
-from app.api.schemas import UserCreate, UserLogin, UserResponse, Token, TokenRefresh, TokenRefreshResponse
+from app.api.schemas import UserCreate, UserLogin, UserResponse, Token, TokenRefresh, TokenRefreshResponse, PasswordReset
 from app.models import User
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
@@ -94,3 +94,14 @@ def refresh_token(data: TokenRefresh, db: Session = Depends(get_db)):
 @router.get("/me", response_model=UserResponse)
 def get_me(current_user: User = Depends(get_current_user)):
     return current_user
+
+
+@router.post("/reset-password", status_code=status.HTTP_200_OK)
+def reset_password(data: PasswordReset, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.email == data.email).first()
+    if user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    user.password_hash = hash_password(data.new_password)
+    db.commit()
+    return {"status": "ok", "message": "Password has been reset successfully"}
