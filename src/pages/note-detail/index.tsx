@@ -44,6 +44,7 @@ export default function NoteDetail() {
   const [showShareModal, setShowShareModal] = useState(false);
   const [shareLink, setShareLink] = useState('');
   const [copySuccess, setCopySuccess] = useState(false);
+  const [showSidebar, setShowSidebar] = useState(false); // tablet sidebar toggle
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const transcriptEditRef = useRef<HTMLDivElement>(null);
@@ -172,8 +173,8 @@ export default function NoteDetail() {
       <nav className="flex-shrink-0 bg-white/70 dark:bg-slate-900/70 backdrop-blur-md border-b border-slate-200/60 dark:border-slate-800/60">
         <div className="px-4 py-2.5 flex items-center justify-between">
           <div className="flex items-center gap-3 min-w-0">
-            <button onClick={() => navigate(`/subject/${id}`)} className="p-1.5 rounded-lg text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors">
-              <ArrowLeft className="w-4 h-4" />
+            <button onClick={() => navigate(`/subject/${id}`)} className="min-w-[44px] min-h-[44px] flex items-center justify-center rounded-lg text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors">
+              <ArrowLeft className="w-5 h-5" />
             </button>
             <div className="min-w-0">
               <h1 className="text-sm font-semibold text-slate-800 dark:text-slate-200 truncate">{session?.title || '课次'}</h1>
@@ -183,7 +184,7 @@ export default function NoteDetail() {
           <div className="flex items-center gap-2">
             <div className="relative">
               <button onClick={() => exportTools.actions.setShowExportMenu(!exportTools.state.showExportMenu)}
-                className="flex items-center gap-1 px-2.5 py-1.5 text-xs text-slate-500 hover:text-blue-600 hover:bg-blue-50 dark:hover:bg-blue-900/20 rounded-lg transition-colors" title="导出">
+                className="flex items-center gap-1 px-3 py-2 text-sm text-slate-500 hover:text-blue-600 hover:bg-blue-50 dark:hover:bg-blue-900/20 rounded-lg transition-colors" title="导出">
                 <Download className="w-3.5 h-3.5" />
                 <ChevronDownIcon className="w-3 h-3" />
               </button>
@@ -200,7 +201,7 @@ export default function NoteDetail() {
                 </div>
               )}
             </div>
-            <button onClick={handleShareSession} className="flex items-center gap-1 px-2.5 py-1.5 text-xs text-slate-500 hover:text-blue-600 hover:bg-blue-50 dark:hover:bg-blue-900/20 rounded-lg transition-colors" title="分享">
+            <button onClick={handleShareSession} className="flex items-center gap-1 px-3 py-2 text-sm text-slate-500 hover:text-blue-600 hover:bg-blue-50 dark:hover:bg-blue-900/20 rounded-lg transition-colors" title="分享">
               <Share2 className="w-3.5 h-3.5" />
             </button>
             <ThemeToggle />
@@ -241,7 +242,7 @@ export default function NoteDetail() {
                   else if (recording.state.isRecording) recording.actions.pauseRecording();
                   else recording.actions.startRecording(transcript.actions.setTranscriptText);
                 }}
-                  className={`w-9 h-9 rounded-full text-white flex items-center justify-center shadow-lg hover:shadow-xl transition-all hover:scale-105 active:scale-95 ${
+                  className={`w-11 h-11 rounded-full text-white flex items-center justify-center shadow-lg hover:shadow-xl transition-all hover:scale-105 active:scale-95 ${
                     recording.state.isRecording ? 'bg-gradient-to-br from-amber-500 to-amber-600 shadow-amber-200' : 'bg-gradient-to-br from-blue-500 to-blue-600 shadow-blue-200'
                   }`}>
                   {recording.state.isRecording ? <Pause className="w-4 h-4" /> : <Play className="w-4 h-4 ml-0.5" />}
@@ -266,7 +267,7 @@ export default function NoteDetail() {
                 if (recording.state.isPaused) recording.actions.resumeRecording(transcript.actions.setTranscriptText);
                 else recording.actions.pauseRecording();
               }}
-                className="flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium rounded-md bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-400 hover:bg-amber-200 transition-colors">
+                className="flex items-center gap-1 px-3 py-2 text-sm font-medium rounded-md bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-400 hover:bg-amber-200 transition-colors min-h-[44px]">
                 {recording.state.isPaused ? <Play className="w-3 h-3" /> : <Square className="w-3 h-3" />}
                 {recording.state.isPaused ? '继续' : '暂停'}
               </button>
@@ -274,7 +275,7 @@ export default function NoteDetail() {
 
             {recording.state.isRecording && (
               <button onClick={() => recording.actions.stopRecording(transcript.actions.setTranscriptText)}
-                className="flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium rounded-md bg-red-100 dark:bg-red-900/30 text-red-600 dark:text-red-400 hover:bg-red-200 dark:hover:bg-red-900/50 transition-colors">
+                className="flex items-center gap-1 px-3 py-2 text-sm font-medium rounded-md bg-red-100 dark:bg-red-900/30 text-red-600 dark:text-red-400 hover:bg-red-200 dark:hover:bg-red-900/50 transition-colors min-h-[44px]">
                 <MicOff className="w-3.5 h-3.5" />
                 停止
               </button>
@@ -283,18 +284,18 @@ export default function NoteDetail() {
 
           <div className="flex items-center gap-1.5">
             <button onMouseDown={(e) => e.preventDefault()} onClick={() => applyFormat('bold')}
-              className="p-1.5 rounded-md text-slate-500 dark:text-slate-400 hover:bg-slate-100 hover:text-slate-700 transition-colors" title="加粗">
-              <Bold className="w-4 h-4" />
+              className="min-w-[44px] min-h-[44px] flex items-center justify-center rounded-md text-slate-500 dark:text-slate-400 hover:bg-slate-100 hover:text-slate-700 transition-colors" title="加粗">
+              <Bold className="w-5 h-5" />
             </button>
             <button onMouseDown={(e) => e.preventDefault()} onClick={() => applyFormat('insertUnorderedList')}
-              className="p-1.5 rounded-md text-slate-500 dark:text-slate-400 hover:bg-slate-100 hover:text-slate-700 transition-colors" title="列表">
-              <List className="w-4 h-4" />
+              className="min-w-[44px] min-h-[44px] flex items-center justify-center rounded-md text-slate-500 dark:text-slate-400 hover:bg-slate-100 hover:text-slate-700 transition-colors" title="列表">
+              <List className="w-5 h-5" />
             </button>
             <div className="w-px h-5 bg-slate-200 dark:bg-slate-600 mx-1" />
             <div className="flex items-center gap-1.5">
               {TEXT_COLORS.map((color) => (
                 <button key={color.value} onMouseDown={(e) => e.preventDefault()} onClick={() => applyFormat('foreColor', color.value)}
-                  className="w-5 h-5 rounded-full border-2 border-slate-300 dark:border-slate-500 hover:scale-125 hover:border-slate-400 transition-all"
+                  className="w-7 h-7 rounded-full border-2 border-slate-300 dark:border-slate-500 hover:scale-125 hover:border-slate-400 transition-all"
                   style={{ backgroundColor: color.value }} title={color.name} />
               ))}
             </div>
@@ -318,8 +319,17 @@ export default function NoteDetail() {
         </div>
       )}
 
-      {/* ---- Two-column layout ---- */}
+      {/* ---- Two-column layout (sidebar hidden on tablet, toggleable) ---- */}
       <div className="flex-1 flex overflow-hidden">
+        {!showSidebar && (
+          <button
+            onClick={() => setShowSidebar(true)}
+            className="lg:hidden fixed bottom-6 right-6 z-40 w-12 h-12 rounded-full bg-blue-500 text-white shadow-lg flex items-center justify-center hover:bg-blue-600 transition-colors"
+            title="显示PPT和笔记"
+          >
+            <FileText className="w-5 h-5" />
+          </button>
+        )}
         <main className="flex-1 overflow-y-auto bg-white/40 dark:bg-slate-900/40 backdrop-blur-sm">
           <div className="px-6 md:px-8 py-5">
             <div className="flex items-center justify-between mb-3">
@@ -337,7 +347,7 @@ export default function NoteDetail() {
                   if (recording.state.isPlayingAudio) { recording.refs.audioPlayerRef.current.pause(); recording.actions.setIsPlayingAudio(false); }
                   else { recording.refs.audioPlayerRef.current.play(); recording.actions.setIsPlayingAudio(true); }
                 }}
-                  className="w-7 h-7 rounded-full bg-blue-500 text-white flex items-center justify-center hover:bg-blue-600 transition-colors">
+                  className="min-w-[44px] min-h-[44px] rounded-full bg-blue-500 text-white flex items-center justify-center hover:bg-blue-600 transition-colors">
                   {recording.state.isPlayingAudio ? <Pause className="w-3.5 h-3.5" /> : <Play className="w-3.5 h-3.5 ml-0.5" />}
                 </button>
                 <span className="text-xs text-blue-600 dark:text-blue-400 flex-1">录音回放</span>
@@ -346,7 +356,7 @@ export default function NoteDetail() {
                   const ok = await deleteAudio(sessionId);
                   if (ok) { recording.actions.setAudioPlaybackUrl(null); recording.actions.setIsPlayingAudio(false); }
                 }}
-                  className="w-7 h-7 rounded-lg text-red-400 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-900/20 flex items-center justify-center transition-colors" title="删除录音">
+                  className="min-w-[44px] min-h-[44px] rounded-lg text-red-400 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-900/20 flex items-center justify-center transition-colors" title="删除录音">
                   <Trash2 className="w-3.5 h-3.5" />
                 </button>
                 <audio ref={recording.refs.audioPlayerRef} src={recording.state.audioPlaybackUrl} onEnded={() => recording.actions.setIsPlayingAudio(false)}
@@ -422,13 +432,17 @@ export default function NoteDetail() {
           </div>
         </main>
 
-        <aside className="w-72 flex-shrink-0 bg-white/60 dark:bg-slate-800/60 backdrop-blur-sm border-l border-slate-200/60 dark:border-slate-700/60 flex flex-col overflow-hidden">
+        <aside className={`${showSidebar ? 'fixed inset-0 z-50' : 'hidden'} lg:relative lg:flex lg:w-72 flex-shrink-0 bg-white/60 dark:bg-slate-800/60 backdrop-blur-sm border-l border-slate-200/60 dark:border-slate-700/60 flex flex-col overflow-hidden`}>
           <div className="flex-shrink-0 border-b border-slate-200/60 dark:border-slate-700/60">
             <div className="px-3 py-2 flex items-center justify-between">
               <div className="flex items-center gap-1.5">
                 <FileText className="w-3.5 h-3.5 text-blue-500" />
                 <h3 className="text-xs font-semibold text-slate-600 dark:text-slate-300">PPT</h3>
               </div>
+              {/* Close button (tablet only) */}
+              <button onClick={() => setShowSidebar(false)} className="lg:hidden min-w-[36px] min-h-[36px] flex items-center justify-center rounded-lg text-slate-400 hover:text-slate-600 hover:bg-slate-100 dark:hover:bg-slate-700 transition-colors">
+                <X className="w-4 h-4" />
+              </button>
               {ppt.state.slides.length > 0 && (
                 <div className="flex items-center gap-1">
                   <span className="text-xs text-slate-400 font-mono">{ppt.state.activeSlideIndex + 1}/{ppt.state.slides.length}</span>

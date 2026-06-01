@@ -30,10 +30,10 @@ export default function SessionCard({ session, notebookId }: SessionCardProps) {
       onClick={() => navigate(`/subject/${notebookId}/session/${session.id}`)}
       className="group relative bg-white dark:bg-slate-800 rounded-2xl border border-slate-200/80 dark:border-slate-700/80 shadow-sm hover:shadow-xl transition-all duration-300 cursor-pointer overflow-hidden hover:-translate-y-1"
     >
-      {/* 删除按钮 */}
+      {/* 删除按钮 — always visible on touch, hover on desktop */}
       <button
         onClick={handleDelete}
-        className="absolute top-3 right-3 p-1.5 rounded-lg text-slate-300 opacity-0 group-hover:opacity-100 hover:text-red-500 hover:bg-red-50 transition-all z-10"
+        className="absolute top-3 right-3 min-w-[36px] min-h-[36px] flex items-center justify-center rounded-lg text-slate-400 opacity-0 group-hover:opacity-100 [@media(hover:none)]:opacity-100 hover:text-red-500 hover:bg-red-50 transition-all z-10"
         title="删除课次"
       >
         <Trash2 className="w-4 h-4" />

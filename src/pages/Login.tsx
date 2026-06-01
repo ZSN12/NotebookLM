@@ -57,7 +57,7 @@ export default function Login() {
                 value={username}
                 onChange={(e) => setUsername(e.target.value)}
                 required
-                className="w-full px-3 py-2 rounded-xl border border-slate-200 dark:border-slate-600 bg-slate-50 dark:bg-slate-700 text-slate-800 dark:text-slate-200 text-sm focus:outline-none focus:ring-2 focus:ring-blue-300 dark:focus:ring-blue-600"
+                className="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-slate-600 bg-slate-50 dark:bg-slate-700 text-slate-800 dark:text-slate-200 text-base focus:outline-none focus:ring-2 focus:ring-blue-300 dark:focus:ring-blue-600 min-h-[48px]"
               />
             </div>
           )}
@@ -98,7 +98,7 @@ export default function Login() {
           <button
             type="submit"
             disabled={loading}
-            className="w-full py-2.5 rounded-xl bg-gradient-to-r from-blue-500 to-violet-500 text-white font-medium text-sm hover:from-blue-600 hover:to-violet-600 transition-all disabled:opacity-50 flex items-center justify-center gap-2 cursor-pointer"
+            className="w-full py-3 rounded-xl bg-gradient-to-r from-blue-500 to-violet-500 text-white font-medium text-base hover:from-blue-600 hover:to-violet-600 transition-all disabled:opacity-50 flex items-center justify-center gap-2 cursor-pointer min-h-[48px]"
           >
             {loading && <Loader2 className="w-4 h-4 animate-spin" />}
             {isRegister ? "注册并登录" : "登录"}

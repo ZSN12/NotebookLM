@@ -34,18 +34,18 @@ export default function NotebookCard({ notebook }: NotebookCardProps) {
       onClick={() => navigate(`/subject/${notebook.id}`)}
       className="group relative bg-white dark:bg-slate-800 rounded-2xl border border-slate-200/80 dark:border-slate-700/80 shadow-sm hover:shadow-xl transition-all duration-300 cursor-pointer overflow-hidden hover:-translate-y-1"
     >
-      {/* 操作按钮 */}
-      <div className="absolute top-3 right-3 flex gap-1 opacity-0 group-hover:opacity-100 transition-all z-10">
+      {/* 操作按钮 — always visible on touch, hover on desktop */}
+      <div className="absolute top-3 right-3 flex gap-1 opacity-0 group-hover:opacity-100 [@media(hover:none)]:opacity-100 transition-all z-10">
         <button
           onClick={handleEdit}
-          className="p-1.5 rounded-lg text-slate-300 hover:text-blue-500 hover:bg-blue-50 dark:hover:bg-blue-900/30 transition-all"
+          className="min-w-[36px] min-h-[36px] flex items-center justify-center rounded-lg text-slate-400 hover:text-blue-500 hover:bg-blue-50 dark:hover:bg-blue-900/30 transition-all"
           title="编辑学科"
         >
           <Edit3 className="w-4 h-4" />
         </button>
         <button
           onClick={handleDelete}
-          className="p-1.5 rounded-lg text-slate-300 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-900/30 transition-all"
+          className="min-w-[36px] min-h-[36px] flex items-center justify-center rounded-lg text-slate-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-900/30 transition-all"
           title="删除学科"
         >
           <Trash2 className="w-4 h-4" />

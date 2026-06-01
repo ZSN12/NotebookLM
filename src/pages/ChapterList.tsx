@@ -73,12 +73,12 @@ export default function ChapterList() {
             <div className="flex items-center gap-3">
               <button
                 onClick={() => navigate('/')}
-                className="p-1.5 rounded-lg text-slate-400 hover:text-slate-600 hover:bg-slate-100 transition-colors"
+                className="min-w-[44px] min-h-[44px] flex items-center justify-center rounded-lg text-slate-400 hover:text-slate-600 hover:bg-slate-100 transition-colors"
               >
                 <ArrowLeft className="w-5 h-5" />
               </button>
               <div className="flex items-center gap-2 text-sm text-slate-500">
-                <button onClick={() => navigate('/')} className="hover:text-slate-700 transition-colors">
+                <button onClick={() => navigate('/')} className="min-h-[44px] px-2 flex items-center hover:text-slate-700 transition-colors">
                   首页
                 </button>
                 <span className="text-slate-300">/</span>
@@ -88,20 +88,20 @@ export default function ChapterList() {
 
             <div className="flex items-center gap-2">
               <ThemeToggle />
-              <div className="hidden sm:flex items-center px-3 py-1.5 bg-slate-100 rounded-lg dark:bg-slate-800">
-                <Search className="w-4 h-4 text-slate-400 mr-2" />
+              <div className="hidden sm:flex items-center px-3 py-2 min-h-[44px] bg-slate-100 rounded-lg dark:bg-slate-800">
+                <Search className="w-5 h-5 text-slate-400 mr-2" />
                 <input
                   type="text"
                   placeholder="搜索课次..."
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
-                  className="bg-transparent text-sm text-slate-700 dark:text-slate-200 placeholder:text-slate-400 outline-none w-40"
+                  className="bg-transparent text-base text-slate-700 dark:text-slate-200 placeholder:text-slate-400 outline-none w-40"
                 />
               </div>
-              <button onClick={handleShare} className="p-1.5 rounded-lg text-slate-500 hover:bg-slate-100 transition-colors" title="复制链接">
+              <button onClick={handleShare} className="min-w-[44px] min-h-[44px] rounded-lg text-slate-500 hover:bg-slate-100 flex items-center justify-center transition-colors" title="复制链接">
                 <Share2 className="w-4 h-4" />
               </button>
-              <button onClick={handleDownload} className="p-1.5 rounded-lg text-slate-500 hover:bg-slate-100 transition-colors" title="下载全部">
+              <button onClick={handleDownload} className="min-w-[44px] min-h-[44px] rounded-lg text-slate-500 hover:bg-slate-100 flex items-center justify-center transition-colors" title="下载全部">
                 <Download className="w-4 h-4" />
               </button>
               {copyFeedback && <span className="text-xs text-green-500 font-medium">{copyFeedback}</span>}
