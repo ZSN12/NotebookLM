@@ -18,11 +18,13 @@ PPT_DIR = UPLOAD_DIR / "ppt"
 IMAGE_DIR = OUTPUT_DIR / "images"
 
 SLIDE_DIR = UPLOAD_DIR / "slides"  # PPT slide rendered images
+FONTS_DIR = BASE_DIR / "assets" / "fonts"  # Bundled CJK fonts for slide rendering
 
 AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 PPT_DIR.mkdir(parents=True, exist_ok=True)
 IMAGE_DIR.mkdir(parents=True, exist_ok=True)
 SLIDE_DIR.mkdir(parents=True, exist_ok=True)
+FONTS_DIR.mkdir(parents=True, exist_ok=True)
 
 MAX_AUDIO_SIZE = 200 * 1024 * 1024  # 200MB
 MAX_PPT_SIZE = 50 * 1024 * 1024  # 50MB
