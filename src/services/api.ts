@@ -342,19 +342,73 @@ export async function updateTranscript(sessionId: string, transcript: any[]): Pr
   }
 }
 
-export async function uploadAudio(file: File, sessionId: string): Promise<BackendNote> {
+export interface AudioUploadCallbacks {
+  onChunk: (text: string, window: number, total: number) => void;
+  onDone: (note: BackendNote | null) => void;
+  onError: (error: string) => void;
+}
+
+export function uploadAudio(
+  file: File,
+  sessionId: string,
+  callbacks: AudioUploadCallbacks,
+): { abort: () => void } {
   const formData = new FormData();
   formData.append('file', file);
-  const res = await fetch(`${API_BASE}/api/process/audio-batch?session_id=${sessionId}`, {
+  const controller = new AbortController();
+
+  fetch(`${API_BASE}/api/process/audio-batch?session_id=${sessionId}`, {
     method: 'POST',
     headers: authHeaders(),
     body: formData,
+    signal: controller.signal,
+  }).then(async (res) => {
+    if (!res.ok) {
+      const errorText = await res.text().catch(() => 'Unknown error');
+      callbacks.onError(`Audio upload failed: ${res.status} ${errorText}`);
+      return;
+    }
+
+    const reader = res.body?.getReader();
+    if (!reader) { callbacks.onError('No response body'); return; }
+
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      // Keep the last (potentially incomplete) line in buffer
+      buffer = lines.pop() || '';
+
+      for (const line of lines) {
+        if (line.startsWith('data: ')) {
+          try {
+            const event = JSON.parse(line.slice(6));
+            switch (event.type) {
+              case 'chunk':
+                callbacks.onChunk(event.text, event.window, event.total);
+                break;
+              case 'done':
+                callbacks.onDone(event.note || null);
+                break;
+              case 'error':
+                callbacks.onError(event.detail || 'Unknown error');
+                break;
+            }
+          } catch {}
+        }
+      }
+    }
+  }).catch((err) => {
+    if (err.name === 'AbortError') return;
+    callbacks.onError(err.message || 'Upload failed');
   });
-  if (!res.ok) {
-    const errorText = await res.text();
-    throw new Error(`Audio upload failed: ${res.status} ${errorText}`);
-  }
-  return res.json();
+
+  return { abort: () => controller.abort() };
 }
 
 // Import/Export API

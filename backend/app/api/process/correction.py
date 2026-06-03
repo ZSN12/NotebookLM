@@ -32,19 +32,23 @@ def correct_uncorrected_transcripts_from_data(
             print(f"[CORRECTION] Note not found for session {session_id}")
             return
 
-        # Collect ALL text from transcript — not just uncorrected
+        # Collect ALL text and timestamps from transcript
         all_texts = []
+        all_timestamps = []  # Collect all timestamps for audio positioning
         for entry in transcript_data:
             text = entry.get("text", "").strip()
             if text:
                 all_texts.append(text)
+            ts = entry.get("timestamps", [])
+            if ts:
+                all_timestamps.extend(ts)
 
         if not all_texts:
             print(f"[CORRECTION] No text found in transcript")
             return
 
         full_text = "\n".join(all_texts)
-        print(f"[CORRECTION] Total transcript length: {len(full_text)} chars, {len(all_texts)} segments")
+        print(f"[CORRECTION] Total transcript length: {len(full_text)} chars, {len(all_texts)} segments, {len(all_timestamps)} timestamps")
         print(f"[CORRECTION] Calling DeepSeek LLM for full restructure...")
 
         restructured = corrector.restructure_transcript(
@@ -60,17 +64,16 @@ def correct_uncorrected_transcripts_from_data(
         print(f"[CORRECTION] Restructured: {len(full_text)} → {len(restructured)} chars")
 
         # Replace all transcript entries with one restructured entry
-        # (keeps the original timestamps from the first entry for reference)
-        first_ts = transcript_data[0].get("timestamps", []) if transcript_data else []
+        # Keep all collected timestamps for audio positioning
         note.transcript = [{
             "chunk_index": 0,
             "text": restructured,
-            "timestamps": first_ts,
+            "timestamps": all_timestamps,  # Preserve all timestamps
             "is_corrected": True,
             "is_restructured": True,
         }]
         db.commit()
-        print(f"[CORRECTION] Successfully saved restructured transcript")
+        print(f"[CORRECTION] Successfully saved restructured transcript with {len(all_timestamps)} timestamps")
 
     except Exception as e:
         print(f"[CORRECTION] Restructure failed: {e}")

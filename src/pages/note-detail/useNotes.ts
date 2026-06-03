@@ -17,12 +17,16 @@ export function useNotes() {
     });
   }, []);
 
-  const parseNotesFromContent = useCallback((content: string) => {
+  const parseNotesFromContent = useCallback((content: string, hasTranscript: boolean = false) => {
     const transcriptSectionMatch = content.match(/^## 语音转文字\n\n([\s\S]*?)\n\n---\n\n([\s\S]*)$/);
     if (transcriptSectionMatch && transcriptSectionMatch[2].trim()) {
       return [{ type: 'text', content: transcriptSectionMatch[2].trim() }];
-    } else if (!content.startsWith('## 语音转文字\n\n')) {
-      return [{ type: 'text', content }];
+    }
+    // Only treat raw content as notes when there's genuinely no transcript.
+    // If transcript exists, raw content is old-format data (transcript saved
+    // directly to content without the ## header) and should be ignored.
+    if (!hasTranscript && !content.startsWith('## 语音转文字\n\n') && content.trim()) {
+      return [{ type: 'text', content: content.trim() }];
     }
     return [{ type: 'text', content: '' }];
   }, []);

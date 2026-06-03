@@ -10,24 +10,110 @@ export interface StudentNote {
   content: string;
 }
 
+export interface SentenceWithTime {
+  text: string;
+  startTime: number;
+  endTime: number;
+}
+
 export function useTranscript(
   sessionId: string | undefined,
   isRecording: boolean,
   slides: Slide[],
 ) {
   const [transcriptText, setTranscriptText] = useState('');
+  const [sentencesWithTime, setSentencesWithTime] = useState<SentenceWithTime[]>([]);
+  const [activeSentenceIndex, setActiveSentenceIndex] = useState<number | null>(null);
   const [isAiRestructuring, setIsAiRestructuring] = useState(false);
   const [isTranscribing, setIsTranscribing] = useState(false);
   const [contentBlocks, setContentBlocks] = useState<ContentBlock[]>([]);
   const [lastSaveTime, setLastSaveTime] = useState<number | null>(null);
+  const [loadedNote, setLoadedNote] = useState<any>(null);
   const prevTranscriptRef = useRef('');
+
+  const parseSentencesWithTime = useCallback((note: any): SentenceWithTime[] => {
+    if (!note?.transcript || !Array.isArray(note.transcript) || note.transcript.length === 0) return [];
+
+    const sortedChunks = note.transcript
+      .sort((a: any, b: any) => (a.chunk_index || 0) - (b.chunk_index || 0))
+      .filter((chunk: any) => chunk.text && chunk.text.trim());
+
+    if (sortedChunks.length === 0) return [];
+
+    const fullText = sortedChunks.map((chunk: any) => chunk.text || '').join(' ').trim();
+
+    // Build timestamp array with sequential position tracking to correctly handle
+    // duplicate words (e.g. "的", "是", "在" appear many times in Chinese text).
+    // Using indexOf(word, searchPos) ensures each occurrence maps to its actual position.
+    const allTimestamps: { text: string; start: number; end: number; pos: number }[] = [];
+    let searchPos = 0;
+    for (const chunk of sortedChunks) {
+      if (chunk.timestamps && Array.isArray(chunk.timestamps)) {
+        for (const ts of chunk.timestamps) {
+          const word = (ts.text || '').trim();
+          if (!word) continue;
+          const pos = fullText.indexOf(word, searchPos);
+          if (pos !== -1) {
+            allTimestamps.push({ text: word, start: ts.start || 0, end: ts.end || 0, pos });
+            searchPos = pos + word.length;
+          }
+        }
+      }
+    }
+
+    if (allTimestamps.length === 0) return [];
+
+    // Split full text into sentences
+    const sentenceRegex = /([^。！？.!?]+[。！？.!?]?)/g;
+    const sentences: { text: string; startIdx: number; endIdx: number }[] = [];
+    let match;
+    while ((match = sentenceRegex.exec(fullText)) !== null) {
+      const sentenceText = match[1].trim();
+      if (sentenceText) {
+        sentences.push({ text: sentenceText, startIdx: match.index, endIdx: match.index + match[1].length });
+      }
+    }
+
+    // Map each sentence to its time range using the position-matched timestamps
+    const result: SentenceWithTime[] = [];
+    for (const sentence of sentences) {
+      const wordsInRange = allTimestamps.filter(ts =>
+        ts.pos >= sentence.startIdx && ts.pos < sentence.endIdx
+      );
+
+      if (wordsInRange.length > 0) {
+        result.push({
+          text: sentence.text,
+          startTime: Math.min(...wordsInRange.map(w => w.start)),
+          endTime: Math.max(...wordsInRange.map(w => w.end)),
+        });
+      } else if (result.length > 0) {
+        // Fallback: estimate time range from previous sentence
+        const prev = result[result.length - 1];
+        result.push({
+          text: sentence.text,
+          startTime: prev.endTime,
+          endTime: prev.endTime + 2,
+        });
+      } else {
+        // First sentence(s) have no timestamp match — use the first available timestamp
+        result.push({
+          text: sentence.text,
+          startTime: allTimestamps[0]?.start ?? 0,
+          endTime: (allTimestamps[0]?.start ?? 0) + 2,
+        });
+      }
+    }
+
+    return result;
+  }, []);
 
   const appendTranscriptText = useCallback((newText: string) => {
     setTranscriptText(prev => {
       const trimmed = newText.trim();
       if (!trimmed) return prev;
       const prevTrimmed = prev.trim();
-      return prevTrimmed ? `${prevTrimmed} ${trimmed}` : trimmed;
+      return prevTrimmed ? `${prevTrimmed}\n\n${trimmed}` : trimmed;
     });
   }, []);
 
@@ -36,18 +122,31 @@ export function useTranscript(
     try {
       const note = await fetchNote(sessionId);
       if (note) {
+        setLoadedNote(note); // Share with parent so it can skip its own fetch
+        // Prefer user-edited transcript from note.content, fall back to
+        // machine-generated note.transcript (preserves edits across reload).
         let transcriptRestored = false;
-        if (note.transcript && Array.isArray(note.transcript) && note.transcript.length > 0) {
+        if (note.content) {
+          const match = note.content.match(/^## 语音转文字\n\n([\s\S]*?)(?:\n\n---\n\n[\s\S]*)?$/);
+          if (match && match[1].trim()) {
+            setTranscriptText(match[1].trim());
+            transcriptRestored = true;
+          }
+        }
+        if (!transcriptRestored && note.transcript && Array.isArray(note.transcript) && note.transcript.length > 0) {
           const fullTranscript = note.transcript
             .sort((a: any, b: any) => (a.chunk_index || 0) - (b.chunk_index || 0))
             .map((chunk: any) => chunk.text || '')
             .join(' ')
             .trim();
-          if (fullTranscript) { setTranscriptText(fullTranscript); transcriptRestored = true; }
+          if (fullTranscript) {
+            setTranscriptText(fullTranscript);
+          }
         }
-        if (!transcriptRestored && note.content) {
-          const match = note.content.match(/^## 语音转文字\n\n([\s\S]*?)(?:\n\n---\n\n[\s\S]*)?$/);
-          if (match && match[1].trim()) setTranscriptText(match[1].trim());
+        // Parse sentence-time mapping from transcript JSON (always needs note.transcript)
+        if (note.transcript && Array.isArray(note.transcript) && note.transcript.length > 0) {
+          const parsed = parseSentencesWithTime(note);
+          if (parsed.length > 0) setSentencesWithTime(parsed);
         }
         if (note.ppt_images && note.ppt_images.length > 0) {
           setTimeout(async () => {
@@ -61,7 +160,7 @@ export function useTranscript(
         }
       }
     } catch (error) { console.error('Failed to load history:', error); }
-  }, [sessionId]);
+  }, [sessionId, parseSentencesWithTime]);
 
   useEffect(() => { loadHistory(); }, [loadHistory]);
 
@@ -71,10 +170,18 @@ export function useTranscript(
     const now = Date.now();
     if (now - lastSaveRef.current < 3000) return;
     lastSaveRef.current = now;
-    const content = currentNotes.map(n => n.content).filter(Boolean).join('\n\n');
-    const fullContent = transcriptText.trim()
-      ? `## 语音转文字\n\n${transcriptText.trim()}\n\n---\n\n${content}`.trim()
-      : content;
+
+    // Normalize empty state (Chrome contentEditable leaves <br> when cleared)
+    const normalize = (s: string) => {
+      const t = s.trim();
+      return (t === '<br>' || t === '<br />') ? '' : t;
+    };
+    const cleanTranscript = normalize(transcriptText);
+    const notesContent = currentNotes.map(n => normalize(n.content)).filter(Boolean).join('\n\n');
+
+    const fullContent = cleanTranscript
+      ? `## 语音转文字\n\n${cleanTranscript}\n\n---\n\n${notesContent}`.trim()
+      : notesContent;
     if (fullContent || currentNotes.length > 0) {
       try { await apiUpdateNote(sessionId, fullContent); setLastSaveTime(Date.now()); }
       catch (error) { console.error('[NoteDetail] Failed to save content:', error); }
@@ -94,12 +201,16 @@ export function useTranscript(
           if (corrected.trim() && corrected.trim() !== transcriptText.trim()) {
             setTranscriptText(corrected);
             setIsAiRestructuring(false);
+            // Re-parse sentence-time mapping: AI restructured text changed,
+            // old sentence boundaries no longer match
+            const parsed = parseSentencesWithTime(note);
+            if (parsed.length > 0) setSentencesWithTime(parsed);
           }
         }
       } catch {}
     }, CORRECTION_POLL_MS);
     return () => clearInterval(interval);
-  }, [isRecording, sessionId, transcriptText]);
+  }, [isRecording, sessionId, transcriptText, parseSentencesWithTime]);
 
   useEffect(() => {
     if (!isRecording && sessionId && transcriptText) {
@@ -147,10 +258,13 @@ export function useTranscript(
   return {
     state: {
       transcriptText,
+      sentencesWithTime,
+      activeSentenceIndex,
       isAiRestructuring,
       isTranscribing,
       contentBlocks,
       lastSaveTime,
+      loadedNote,
     },
     actions: {
       setTranscriptText,
@@ -158,7 +272,10 @@ export function useTranscript(
       setIsAiRestructuring,
       setIsTranscribing,
       setContentBlocks,
+      setActiveSentenceIndex,
       saveContent,
+      parseSentencesWithTime,
+      setSentencesWithTime,
     },
   };
 }

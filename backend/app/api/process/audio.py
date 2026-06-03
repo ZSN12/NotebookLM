@@ -1,12 +1,16 @@
+import asyncio
+import json
 import os
+import shutil
+import subprocess
 import tempfile
 import wave
 
 from fastapi import APIRouter, UploadFile, File, HTTPException, Depends
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.api.schemas import NoteResponse
 from app.core.auth import get_current_user
 from app.models import Note, Session as DBSession, Notebook, User
 from app.services.transcriber import transcriber
@@ -19,6 +23,33 @@ MAX_FULL_AUDIO_SIZE = 500 * 1024 * 1024  # 500MB
 from app.api.process.correction import schedule_correction
 
 router = APIRouter()
+
+
+def _find_ffmpeg() -> str | None:
+    """Find ffmpeg executable, trying multiple known locations.
+
+    The ffmpeg bundled by imageio_ffmpeg lives deep in site-packages and is
+    typically not on the system PATH when running from a server subprocess.
+    """
+    candidates = [
+        "ffmpeg",  # hope PATH works
+        "ffmpeg.exe",
+    ]
+    # Add imageio_ffmpeg bundled binary if available
+    try:
+        import imageio_ffmpeg
+        p = imageio_ffmpeg.get_ffmpeg_exe()
+        if p:
+            candidates.append(p)
+    except Exception:
+        pass
+
+    for c in candidates:
+        if shutil.which(c):
+            return c
+        if os.path.isfile(c):
+            return c
+    return None
 
 
 def concatenate_wav_files(wav_paths: list[str], output_path: str) -> None:
@@ -325,18 +356,28 @@ def delete_audio(
     return {"status": "deleted", "files": len(deleted)}
 
 
-@router.post("/audio-batch", response_model=NoteResponse)
-async def process_audio_batch(
+@router.post("/audio-batch")
+async def process_audio_batch_stream(
     file: UploadFile = File(...),
     session_id: str = "",
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Process entire audio file at once (non-streaming fallback)."""
+    """Upload full audio file — stream correction results via SSE.
+
+    Each 30s time window is corrected and pushed to the frontend as soon
+    as it completes, so the transcript area fills in incrementally just
+    like real-time recording.
+
+    SSE events:
+      data: {"type":"chunk","text":"...","window":N,"total":M}
+      data: {"type":"done","note":{...}}
+      data: {"type":"error","detail":"..."}
+    """
     if not session_id:
         raise HTTPException(status_code=400, detail="session_id is required")
 
-    # Verify session exists and belongs to user
+    # Verify session exists and belongs to user (sync — use request db)
     session = db.query(DBSession).filter(
         DBSession.id == session_id
     ).join(Notebook).filter(
@@ -349,7 +390,7 @@ async def process_audio_batch(
     course_title = notebook.title if notebook else ""
     keywords = session.keywords or []
 
-    # Pre-check: avoid reading full file into memory
+    # Read file
     audio_bytes = await file.read()
     file_size = len(audio_bytes)
     if file_size > MAX_FULL_AUDIO_SIZE:
@@ -361,35 +402,195 @@ async def process_audio_batch(
         f.flush()
         temp_path = f.name
 
+    # Convert to WAV if needed (sync, run in thread to avoid blocking)
+    wav_path = None
+    process_path = temp_path
     try:
-        segments = transcriber.transcribe(temp_path)
+        supported_exts = {'.wav', '.flac', '.ogg'}
+        if file_ext.lower() not in supported_exts:
+            wav_path = temp_path + ".wav"
+            converted = False
+
+            try:
+                ffmpeg = _find_ffmpeg()
+                if ffmpeg:
+                    result = await asyncio.to_thread(
+                        lambda: subprocess.run(
+                            [ffmpeg, "-y", "-i", temp_path, "-ar", "16000", "-ac", "1", wav_path],
+                            capture_output=True, text=True, timeout=120,
+                        )
+                    )
+                    if result.returncode == 0 and os.path.exists(wav_path):
+                        process_path = wav_path
+                        converted = True
+                        print(f"[AUDIO-UPLOAD] ffmpeg converted {file_ext} to WAV")
+                    else:
+                        print(f"[AUDIO-UPLOAD] ffmpeg failed (rc={result.returncode}): {result.stderr[:300]}")
+                else:
+                    print("[AUDIO-UPLOAD] ffmpeg binary not found")
+            except Exception as e1:
+                print(f"[AUDIO-UPLOAD] ffmpeg subprocess failed: {e1}")
+
+            if not converted:
+                try:
+                    from pydub import AudioSegment
+                    def _pydub_convert():
+                        audio = AudioSegment.from_file(temp_path)
+                        audio = audio.set_frame_rate(16000).set_channels(1)
+                        audio.export(wav_path, format="wav")
+                    await asyncio.to_thread(_pydub_convert)
+                    process_path = wav_path
+                    converted = True
+                    print(f"[AUDIO-UPLOAD] pydub converted {file_ext} to WAV")
+                except Exception as e2:
+                    print(f"[AUDIO-UPLOAD] pydub conversion failed: {e2}")
+
+            if not converted:
+                print(f"[AUDIO-UPLOAD] All converters failed, trying original file directly")
+                process_path = temp_path
+
+        # Transcribe (CPU-heavy — run in thread)
+        segments: list = await asyncio.to_thread(transcriber.transcribe, process_path)
         if not segments:
             raise HTTPException(status_code=500, detail="Transcription failed")
 
-        raw_text = " ".join(seg.text for seg in segments)
+        # Split into time windows (~30s each)
+        TIME_WINDOW_MS = 30_000
+        windows: list[list] = []
+        current_window: list = []
+        current_window_start = segments[0].start_ms if segments else 0
 
-        corrected_text = corrector.restructure_transcript(
-            text=raw_text,
-            course_title=course_title,
-            keywords=keywords,
+        for seg in segments:
+            if seg.start_ms - current_window_start >= TIME_WINDOW_MS and current_window:
+                windows.append(current_window)
+                current_window = []
+                current_window_start = seg.start_ms
+            current_window.append(seg)
+        if current_window:
+            windows.append(current_window)
+
+        total_windows = len(windows)
+        all_timestamps = [seg.to_dict() for seg in segments]
+        print(f"[AUDIO-UPLOAD] {len(segments)} segments → {total_windows} time windows for streaming correction")
+
+        # Save persistent audio
+        try:
+            AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+            audio_output = AUDIO_DIR / f"{session_id}.wav"
+            def _copy_audio():
+                src_path = process_path if process_path == wav_path else temp_path
+                with open(src_path, "rb") as src, open(audio_output, "wb") as dst:
+                    dst.write(src.read())
+            await asyncio.to_thread(_copy_audio)
+            print(f"[AUDIO-UPLOAD] Saved audio to {audio_output}")
+        except Exception as save_err:
+            print(f"[AUDIO-UPLOAD] Failed to save persistent audio: {save_err}")
+
+        # ----------------------------------------------------------------
+        # SSE generator — streams each corrected window, then saves to DB
+        # ----------------------------------------------------------------
+        async def generate():
+            corrected_parts: list[str] = []
+
+            for i, window in enumerate(windows):
+                window_text = " ".join(seg.text for seg in window)
+                print(f"[AUDIO-UPLOAD] Correcting window {i + 1}/{total_windows} ({len(window_text)} chars)")
+
+                try:
+                    corrected = await asyncio.to_thread(
+                        corrector.restructure_transcript,
+                        text=window_text,
+                        course_title=course_title,
+                        keywords=keywords,
+                    )
+                except Exception:
+                    corrected = None
+
+                chunk_text = corrected if corrected else window_text
+                corrected_parts.append(chunk_text)
+
+                yield f"data: {json.dumps({'type': 'chunk', 'text': chunk_text, 'window': i + 1, 'total': total_windows}, ensure_ascii=False)}\n\n"
+
+            # All windows done — save to DB
+            corrected_text = "\n\n".join(corrected_parts)
+            transcript_data = [{
+                "chunk_index": 0,
+                "text": corrected_text,
+                "timestamps": all_timestamps,
+                "is_corrected": True,
+                "is_restructured": True,
+            }]
+
+            def _save():
+                from app.core.database import SessionLocal
+                sav_db = SessionLocal()
+                try:
+                    existing_note = sav_db.query(Note).filter(Note.session_id == session_id).first()
+                    if existing_note:
+                        # Only update transcript — never touch note.content
+                        existing_note.transcript = transcript_data
+                        sav_db.commit()
+                        sav_db.refresh(existing_note)
+                        return {
+                            "id": existing_note.id,
+                            "session_id": existing_note.session_id,
+                            "content": existing_note.content or "",
+                            "transcript": existing_note.transcript,
+                        }
+                    else:
+                        note = Note(
+                            session_id=session_id,
+                            content="",
+                            transcript=transcript_data,
+                            ppt_images=[],
+                            vocabulary=[],
+                        )
+                        sav_db.add(note)
+                        sav_db.commit()
+                        sav_db.refresh(note)
+                        return {
+                            "id": note.id,
+                            "session_id": note.session_id,
+                            "content": "",
+                            "transcript": note.transcript,
+                        }
+                finally:
+                    sav_db.close()
+
+            try:
+                saved_note = await asyncio.to_thread(_save)
+                print(f"[AUDIO-UPLOAD] Saved transcript, {len(corrected_text)} chars")
+                yield f"data: {json.dumps({'type': 'done', 'note': saved_note}, ensure_ascii=False)}\n\n"
+            except Exception as db_err:
+                print(f"[AUDIO-UPLOAD] DB save failed: {db_err}")
+                yield f"data: {json.dumps({'type': 'error', 'detail': f'Failed to save: {db_err}'})}\n\n"
+
+        return StreamingResponse(
+            generate(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+                "Connection": "keep-alive",
+            },
         )
-        if not corrected_text:
-            corrected_text = raw_text
 
-        transcript_data = [{"chunk_index": 0, "text": corrected_text, "timestamps": [seg.to_dict() for seg in segments], "is_corrected": True, "is_restructured": True}]
-
-        note = Note(
-            session_id=session_id,
-            content=corrected_text,
-            transcript=transcript_data,
-            ppt_images=[],
-            vocabulary=[],
-        )
-        db.add(note)
-        db.commit()
-        db.refresh(note)
-
-        return note
-
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[AUDIO-UPLOAD] Unexpected error: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Audio processing failed: {str(e)}")
     finally:
-        os.unlink(temp_path)
+        # Clean up temp files
+        try:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+        except Exception:
+            pass
+        if wav_path and os.path.exists(wav_path):
+            try:
+                os.unlink(wav_path)
+            except Exception:
+                pass

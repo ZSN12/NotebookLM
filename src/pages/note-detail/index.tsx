@@ -9,7 +9,7 @@ import { useState, useRef, useCallback, useEffect } from 'react';
 import { getProfile, getAvatarUrl } from '@/services/auth';
 import ThemeToggle from '@/components/ThemeToggle';
 import RichTextEditor from '@/components/RichTextEditor';
-import { API_BASE, deleteAudio, fetchNote, updateNote, uploadPPT, insertPPTIntoTranscript, uploadAudio } from '@/services/api';
+import { API_BASE, deleteAudio, uploadPPT, insertPPTIntoTranscript, uploadAudio } from '@/services/api';
 import { sanitizeHTML } from '@/lib/sanitize';
 
 import { useRecording } from './useRecording';
@@ -56,49 +56,42 @@ export default function NoteDetail() {
   const transcriptEditRef = useRef<HTMLDivElement>(null);
   const noteEditRef = useRef<HTMLDivElement>(null);
   const activeTextElRef = useRef<HTMLDivElement | null>(null);
-  const activeTextSetterRef = useRef<((text: string) => void) | null>(null);
+  const lastSentenceIdxRef = useRef(0);
+  const paragraphContainerRef = useRef<HTMLDivElement>(null);
 
   // ---- Load history ----
+  // Notes & PPT are restored reactively when the transcript hook finishes its
+  // single fetchNote, avoiding a duplicate network call.
   useEffect(() => {
     if (!sessionId) { setIsLoading(false); return; }
-    (async () => {
-      try {
-        const note = await fetchNote(sessionId);
-        if (note) {
-          let transcriptRestored = false;
-          if (note.transcript && Array.isArray(note.transcript) && note.transcript.length > 0) {
-            const fullTranscript = note.transcript
-              .sort((a: any, b: any) => (a.chunk_index || 0) - (b.chunk_index || 0))
-              .map((chunk: any) => chunk.text || '')
-              .join(' ')
-              .trim();
-            if (fullTranscript) { transcript.actions.setTranscriptText(fullTranscript); transcriptRestored = true; }
-          }
-          if (!transcriptRestored && note.content) {
-            const match = note.content.match(/^## 语音转文字\n\n([\s\S]*?)(?:\n\n---\n\n[\s\S]*)?$/);
-            if (match && match[1].trim()) transcript.actions.setTranscriptText(match[1].trim());
-          }
-          if (note.content) {
-            const parsed = notesHook.actions.parseNotesFromContent(note.content);
-            if (parsed.length > 0) notesHook.actions.setNotes(parsed);
-          }
-          if (note.ppt_images && note.ppt_images.length > 0) {
-            const lastPpt = note.ppt_images[note.ppt_images.length - 1];
-            if (lastPpt.slides) ppt.actions.setSlides(lastPpt.slides);
-            setTimeout(async () => {
-              try {
-                const blocks = await insertPPTIntoTranscript(sessionId);
-                if (blocks.blocks?.some((b: ContentBlock) => b.type === 'image')) {
-                  transcript.actions.setContentBlocks(blocks.blocks);
-                }
-              } catch {}
-            }, 500);
-          }
-        }
-      } catch (error) { console.error('Failed to load history:', error); }
-      finally { setIsLoading(false); }
-    })();
+    // useTranscript.loadHistory fires independently and sets loadedNote.
+    // We wait for it rather than calling fetchNote ourselves.
   }, [sessionId]);
+
+  // React to loadedNote from useTranscript (single source of truth for history load)
+  const loadedNote = transcript.state.loadedNote;
+  useEffect(() => {
+    if (!loadedNote || !sessionId) return;
+    // Restore notes
+    if (loadedNote.content) {
+      const hasTranscript = loadedNote.transcript && Array.isArray(loadedNote.transcript) && loadedNote.transcript.length > 0;
+      const parsed = notesHook.actions.parseNotesFromContent(loadedNote.content, hasTranscript);
+      if (parsed.length > 0) notesHook.actions.setNotes(parsed);
+    }
+    if (loadedNote.ppt_images && loadedNote.ppt_images.length > 0) {
+      const lastPpt = loadedNote.ppt_images[loadedNote.ppt_images.length - 1];
+      if (lastPpt.slides) ppt.actions.setSlides(lastPpt.slides);
+      setTimeout(async () => {
+        try {
+          const blocks = await insertPPTIntoTranscript(sessionId);
+          if (blocks.blocks?.some((b: ContentBlock) => b.type === 'image')) {
+            transcript.actions.setContentBlocks(blocks.blocks);
+          }
+        } catch {}
+      }, 500);
+    }
+    setIsLoading(false);
+  }, [loadedNote, sessionId]);
 
   // ---- Auto-save ----
   useEffect(() => {
@@ -166,6 +159,7 @@ export default function NoteDetail() {
   };
 
   const audioInputRef = useRef<HTMLInputElement>(null);
+  const audioUploadAbortRef = useRef<(() => void) | null>(null);
 
   const handleAudioUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -174,33 +168,34 @@ export default function NoteDetail() {
     setIsUploadingAudio(true);
     setAudioUploadError(null);
 
-    try {
-      const note = await uploadAudio(file, sessionId);
-      if (note && note.content) {
-        const transcriptRestored = false;
-        if (!transcriptRestored && note.content) {
-          const match = note.content.match(/^## 语音转文字\n\n([\s\S]*?)(?:\n\n---\n\n[\s\S]*)?$/);
-          if (match && match[1].trim()) transcript.actions.setTranscriptText(match[1].trim());
+    // Clear transcript before streaming new content
+    transcript.actions.setTranscriptText('');
+
+    const { abort } = uploadAudio(file, sessionId, {
+      onChunk: (text) => {
+        transcript.actions.appendTranscriptText(text);
+      },
+      onDone: (note) => {
+        setIsUploadingAudio(false);
+        if (audioInputRef.current) audioInputRef.current.value = '';
+        audioUploadAbortRef.current = null;
+        // Parse sentence-time mapping and update the view
+        if (note) {
+          const sentences = transcript.actions.parseSentencesWithTime(note);
+          if (sentences.length > 0) {
+            transcript.actions.setSentencesWithTime(sentences);
+          }
         }
-        if (note.transcript && Array.isArray(note.transcript) && note.transcript.length > 0) {
-          const fullTranscript = note.transcript
-            .sort((a: any, b: any) => (a.chunk_index || 0) - (b.chunk_index || 0))
-            .map((chunk: any) => chunk.text || '')
-            .join(' ')
-            .trim();
-          if (fullTranscript) transcript.actions.setTranscriptText(fullTranscript);
-        }
-        if (note.content) {
-          const parsed = notesHook.actions.parseNotesFromContent(note.content);
-          if (parsed.length > 0) notesHook.actions.setNotes(parsed);
-        }
-      }
-    } catch (error: any) {
-      setAudioUploadError(error.message || '上传失败，请重试');
-    } finally {
-      setIsUploadingAudio(false);
-      if (audioInputRef.current) audioInputRef.current.value = '';
-    }
+      },
+      onError: (errMsg) => {
+        setAudioUploadError(errMsg);
+        setIsUploadingAudio(false);
+        if (audioInputRef.current) audioInputRef.current.value = '';
+        audioUploadAbortRef.current = null;
+      },
+    });
+
+    audioUploadAbortRef.current = abort;
   };
 
   if (isLoading) {
@@ -212,7 +207,7 @@ export default function NoteDetail() {
   }
 
   return (
-    <div className="min-h-screen flex flex-col bg-slate-50 dark:bg-slate-950">
+    <div className="h-screen flex flex-col bg-slate-50 dark:bg-slate-950">
       {/* ---- Top Nav ---- */}
       <nav className="flex-shrink-0 bg-white/70 dark:bg-slate-900/70 backdrop-blur-md border-b border-slate-200/60 dark:border-slate-800/60">
         <div className="px-3 py-2 flex items-center justify-between">
@@ -479,7 +474,6 @@ export default function NoteDetail() {
                 onChange={(text) => notesHook.actions.updateNote(0, text)}
                 onFocus={() => {
                   activeTextElRef.current = noteEditRef.current;
-                  activeTextSetterRef.current = (text: string) => notesHook.actions.updateNote(0, text);
                 }}
                 placeholder="在此记录随堂思考与重难点..."
                 className="rich-text-editor w-full p-2.5 text-sm text-slate-600 dark:text-slate-300 bg-white dark:bg-slate-700 border border-slate-200 dark:border-slate-600 rounded-lg focus:outline-none focus:ring-2 focus:ring-amber-200 leading-relaxed"
@@ -489,8 +483,8 @@ export default function NoteDetail() {
         </aside>
 
         {/* ---- Right (2/3): Transcript ---- */}
-        <main className="w-7/12 overflow-y-auto bg-white/40 dark:bg-slate-900/40 backdrop-blur-sm">
-          <div className="px-4 md:px-6 py-4">
+        <main className="w-7/12 flex flex-col min-h-0 bg-white/40 dark:bg-slate-900/40 backdrop-blur-sm">
+          <div className="flex-shrink-0 px-4 md:px-6 py-4">
             <div className="flex items-center justify-between mb-3">
               <h2 className="text-sm font-semibold text-slate-600 dark:text-slate-300 flex items-center gap-2">
                 {recording.state.isRecording ? <span className="w-2 h-2 rounded-full bg-red-400 animate-pulse" /> : <span className="w-2 h-2 rounded-full bg-slate-400" />}
@@ -512,16 +506,43 @@ export default function NoteDetail() {
                 <span className="text-xs text-blue-600 dark:text-blue-400 flex-1">录音回放</span>
                 <button onClick={async () => {
                   if (!sessionId || !window.confirm('确定要删除录音文件吗？')) return;
-                  const ok = await deleteAudio(sessionId);
-                  if (ok) { recording.actions.setAudioPlaybackUrl(null); recording.actions.setIsPlayingAudio(false); }
+                  await deleteAudio(sessionId);
                 }}
                   className="min-w-[44px] min-h-[44px] rounded-lg text-red-400 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-900/20 flex items-center justify-center transition-colors" title="删除录音">
                   <Trash2 className="w-3.5 h-3.5" />
                 </button>
-                <audio ref={recording.refs.audioPlayerRef} src={recording.state.audioPlaybackUrl} onEnded={() => recording.actions.setIsPlayingAudio(false)}
-                  onPause={() => recording.actions.setIsPlayingAudio(false)} onPlay={() => recording.actions.setIsPlayingAudio(true)} className="hidden" />
+                <audio ref={recording.refs.audioPlayerRef} src={recording.state.audioPlaybackUrl}
+                  onEnded={() => { recording.actions.setIsPlayingAudio(false); transcript.actions.setActiveSentenceIndex(null); lastSentenceIdxRef.current = 0; }}
+                  onPause={() => { recording.actions.setIsPlayingAudio(false); }}
+                  onPlay={() => { recording.actions.setIsPlayingAudio(true); lastSentenceIdxRef.current = 0; }}
+                  onTimeUpdate={(e) => {
+                    const currentTime = (e.target as HTMLAudioElement).currentTime;
+                    const sentences = transcript.state.sentencesWithTime;
+                    if (sentences.length === 0) return;
+                    // Start scanning from last matched index (audio usually goes forward)
+                    let idx = lastSentenceIdxRef.current;
+                    if (idx >= sentences.length || currentTime < sentences[idx].startTime) {
+                      idx = 0; // user seeked backward, restart from beginning
+                    }
+                    for (let i = idx; i < sentences.length; i++) {
+                      if (currentTime >= sentences[i].startTime && currentTime < sentences[i].endTime) {
+                        lastSentenceIdxRef.current = i;
+                        transcript.actions.setActiveSentenceIndex(i);
+                        return;
+                      }
+                    }
+                    if (currentTime >= sentences[sentences.length - 1].startTime) {
+                      lastSentenceIdxRef.current = sentences.length - 1;
+                      transcript.actions.setActiveSentenceIndex(sentences.length - 1);
+                    }
+                  }}
+                  className="hidden" />
               </div>
             )}
+          </div>
+
+          {/* 转写内容滚动区域 */}
+          <div className="flex-1 overflow-y-auto px-4 md:px-6 pb-4">
 
             {transcript.state.transcriptText === '' && !recording.state.isRecording && !recording.state.isProcessing ? (
               <div className="flex flex-col items-center justify-center py-20 text-slate-400 dark:text-slate-500">
@@ -530,6 +551,33 @@ export default function NoteDetail() {
                 </div>
                 <p className="text-sm">点击录制按钮开始录音</p>
                 <p className="text-xs mt-1 text-slate-300 dark:text-slate-600">录音将实时转写，PPT 自动对齐插入</p>
+              </div>
+            ) : transcript.state.sentencesWithTime.length > 0 ? (
+              <div className="space-y-1">
+                {transcript.state.sentencesWithTime.map((sentence, idx) => {
+                  const hasAudio = !!recording.state.audioPlaybackUrl;
+                  return (
+                  <span
+                    key={idx}
+                    onClick={hasAudio ? () => {
+                      if (recording.refs.audioPlayerRef.current) {
+                        recording.refs.audioPlayerRef.current.currentTime = sentence.startTime;
+                        recording.refs.audioPlayerRef.current.play();
+                        recording.actions.setIsPlayingAudio(true);
+                      }
+                    } : undefined}
+                    className={`inline px-0.5 py-0.5 rounded transition-colors ${
+                      transcript.state.activeSentenceIndex === idx
+                        ? 'bg-blue-200 dark:bg-blue-700 text-blue-900 dark:text-blue-100'
+                        : hasAudio
+                          ? 'cursor-pointer hover:bg-slate-100 dark:hover:bg-slate-700'
+                          : ''
+                    }`}
+                  >
+                    {sentence.text}
+                  </span>
+                  );
+                })}
               </div>
             ) : transcript.state.contentBlocks.length > 0 ? (
               <div className="space-y-3">
@@ -560,7 +608,10 @@ export default function NoteDetail() {
                             const pageIdx = (imageBlock.page || 1) - 1;
                             if (pageIdx >= 0 && pageIdx < ppt.state.slides.length) {
                               ppt.actions.setActiveSlideIndex(pageIdx);
-                              setShowLeftPanel(true);
+                              // 只在移动端（平板/手机）才需要点击后显示左侧面板
+                              if (window.innerWidth < 1024) {
+                                setShowLeftPanel(true);
+                              }
                             }
                           }}
                         >
@@ -588,14 +639,15 @@ export default function NoteDetail() {
                               const newBlocks = [...blocks];
                               const textBlockIndex = blocks.indexOf(textBlock);
                               if (textBlockIndex !== -1) {
-                                newBlocks[textBlockIndex] = { ...newBlocks[textBlockIndex], content: e.currentTarget.textContent || '' };
+                                const html = e.currentTarget.innerHTML;
+                                const normalized = (html === '<br>' || html === '<br />') ? '' : html;
+                                newBlocks[textBlockIndex] = { ...newBlocks[textBlockIndex], content: normalized };
                                 transcript.actions.setContentBlocks(newBlocks);
                               }
                             }}
-                            className="p-4 text-sm text-slate-600 dark:text-slate-300 leading-relaxed whitespace-pre-wrap focus:outline-none min-h-[60px]"
-                          >
-                            {textBlock.content || ''}
-                          </div>
+                            className="p-4 text-sm text-slate-600 dark:text-slate-300 leading-relaxed whitespace-pre-line focus:outline-none min-h-[60px]"
+                            dangerouslySetInnerHTML={{ __html: sanitizeHTML(textBlock.content || '') as unknown as string }}
+                          />
                         </div>
                       );
                     } else if (group.type === 'text' && group.textBlock) {
@@ -609,14 +661,15 @@ export default function NoteDetail() {
                             const newBlocks = [...blocks];
                             const textBlockIndex = blocks.indexOf(textBlock);
                             if (textBlockIndex !== -1) {
-                              newBlocks[textBlockIndex] = { ...newBlocks[textBlockIndex], content: e.currentTarget.textContent || '' };
+                              const html = e.currentTarget.innerHTML;
+                              const normalized = (html === '<br>' || html === '<br />') ? '' : html;
+                              newBlocks[textBlockIndex] = { ...newBlocks[textBlockIndex], content: normalized };
                               transcript.actions.setContentBlocks(newBlocks);
                             }
                           }}
-                          className="w-full p-4 text-sm text-slate-600 dark:text-slate-300 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-600 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-200 leading-relaxed whitespace-pre-wrap min-h-[60px]"
-                        >
-                          {textBlock.content || ''}
-                        </div>
+                          className="w-full p-4 text-sm text-slate-600 dark:text-slate-300 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-600 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-200 leading-relaxed whitespace-pre-line min-h-[60px]"
+                          dangerouslySetInnerHTML={{ __html: sanitizeHTML(textBlock.content || '') as unknown as string }}
+                        />
                       );
                     }
                     return null;
@@ -631,7 +684,6 @@ export default function NoteDetail() {
                   onChange={(text) => { transcript.actions.setTranscriptText(text); }}
                   onFocus={() => {
                     activeTextElRef.current = transcriptEditRef.current;
-                    activeTextSetterRef.current = (text: string) => transcript.actions.setTranscriptText(text);
                   }}
                   placeholder="正在转录中，可直接编辑修改..."
                   className="rich-text-editor w-full p-4 text-sm text-slate-600 dark:text-slate-300 bg-white dark:bg-slate-800 border border-blue-200 dark:border-blue-700 rounded-xl min-h-[300px] focus:outline-none focus:ring-2 focus:ring-blue-200 leading-relaxed"
@@ -640,25 +692,51 @@ export default function NoteDetail() {
                   <div className="flex items-center gap-2 text-slate-400 text-sm"><Loader2 className="w-4 h-4 animate-spin" />初始化录音...</div>
                 )}
               </div>
-            ) : (
-              <div className="space-y-2">
-                <RichTextEditor
-                  ref={transcriptEditRef}
-                  value={transcript.state.transcriptText}
-                  onChange={(text) => { transcript.actions.setTranscriptText(text); }}
-                  onFocus={() => {
-                    activeTextElRef.current = transcriptEditRef.current;
-                    activeTextSetterRef.current = (text: string) => transcript.actions.setTranscriptText(text);
-                  }}
-                  onBlur={() => {
-                    if (activeTextElRef.current === transcriptEditRef.current) {
-                      activeTextElRef.current = null;
-                      activeTextSetterRef.current = null;
+            ) : transcript.state.transcriptText ? (
+              /* Paragraph view — each paragraph is contentEditable.
+                 Split by double newlines, render HTML (preserves formatting from toolbar:
+                 bold, colors, etc.), onBlur rebuilds transcriptText. */
+              (() => {
+                const paragraphs = transcript.state.transcriptText.split('\n\n').filter(p => p.trim());
+                const syncParagraphs = () => {
+                  if (!paragraphContainerRef.current) return;
+                  const parts: string[] = [];
+                  for (const child of paragraphContainerRef.current.children) {
+                    const html = (child as HTMLElement).innerHTML;
+                    if (html && html !== '<br>' && html !== '<br />') {
+                      parts.push(html);
                     }
-                  }}
-                  placeholder={recording.state.isRecording ? '正在转录...' : '转录内容将显示在这里，可直接编辑修改...'}
-                  className="rich-text-editor w-full p-4 text-sm text-slate-600 dark:text-slate-300 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-600 rounded-xl min-h-[300px] focus:outline-none focus:ring-2 focus:ring-blue-200 leading-relaxed"
-                />
+                  }
+                  transcript.actions.setTranscriptText(parts.join('\n\n'));
+                  // Clear sentence-time mapping because the edited text no longer
+                  // matches the original timestamps from the audio transcript
+                  if (transcript.state.sentencesWithTime.length > 0) {
+                    transcript.actions.setSentencesWithTime([]);
+                    transcript.actions.setActiveSentenceIndex(null);
+                  }
+                };
+                return (
+                  <div ref={paragraphContainerRef} className="space-y-4">
+                    {paragraphs.map((para, i) => (
+                      <p
+                        key={i}
+                        contentEditable
+                        suppressContentEditableWarning
+                        dangerouslySetInnerHTML={{ __html: sanitizeHTML(para.trim()) as unknown as string }}
+                        onBlur={syncParagraphs}
+                        onFocus={(e) => { activeTextElRef.current = e.currentTarget; }}
+                        className="text-sm text-slate-600 dark:text-slate-300 leading-relaxed pl-3 border-l-2 border-blue-200 dark:border-blue-700 hover:border-blue-400 dark:hover:border-blue-500 focus:border-blue-400 focus:bg-blue-50/30 dark:focus:bg-blue-900/10 transition-colors outline-none"
+                      />
+                    ))}
+                  </div>
+                );
+              })()
+            ) : (
+              <div className="flex flex-col items-center justify-center py-20 text-slate-400 dark:text-slate-500">
+                <div className="w-16 h-16 rounded-full bg-slate-100 dark:bg-slate-800 flex items-center justify-center mb-4">
+                  <Mic className="w-6 h-6 text-slate-300 dark:text-slate-600" />
+                </div>
+                <p className="text-sm">转录内容将显示在这里</p>
               </div>
             )}
           </div>
