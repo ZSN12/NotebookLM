@@ -1,6 +1,6 @@
 import { useState } from 'react';
-import html2pdf from 'html2pdf.js';
-import { exportNotebook } from '@/services/api';
+import { exportNotebook, getMediaUrl } from '@/services/api';
+import type { NoteLayoutBlock } from '@/lib/noteLayout';
 
 interface Session {
   id?: string;
@@ -18,29 +18,105 @@ export function useExport(session: Session | undefined, notebook: Notebook | und
   const [isExportingPDF, setIsExportingPDF] = useState(false);
   const [isExportingPackage, setIsExportingPackage] = useState(false);
 
-  const exportMarkdown = (transcriptText: string, notes: Array<{ type: string; content: string }>) => {
+  const exportMarkdown = (
+    transcriptText: string,
+    notes: Array<{ type: string; content: string }>,
+    layoutBlocks?: NoteLayoutBlock[],
+  ) => {
     if (!session || !notebook) return;
     let md = `# ${session.title}\n\n> 所属科目：${notebook.title}\n`;
     if (session.duration) md += `> 课程时长：${session.duration}\n`;
     md += `> 导出时间：${new Date().toLocaleString('zh-CN')}\n\n`;
-    md += `## 语音转文字\n\n${transcriptText.trim()}\n\n---\n\n`;
-    if (notes.some(n => n.content.trim())) {
-      md += `## 随堂笔记\n\n`;
-      notes.filter(n => n.content.trim()).forEach((note, idx) => md += `### 笔记 ${idx + 1}\n\n${note.content}\n\n`);
+
+    if (layoutBlocks && layoutBlocks.length > 0) {
+      // Export using layout blocks order
+      for (const block of layoutBlocks) {
+        switch (block.type) {
+          case 'transcript':
+            if (block.content?.trim()) {
+              md += `${block.content.trim()}\n\n`;
+            }
+            break;
+          case 'ppt':
+            if (block.src) {
+              const imgSrc = block.src.startsWith('data:') ? block.src : getMediaUrl(block.src);
+              md += `![PPT 第 ${block.page || '?'} 页${block.title ? ' · ' + block.title : ''}](${imgSrc})\n\n`;
+            }
+            break;
+          case 'note':
+            if (block.content?.trim()) {
+              md += `## 随堂笔记\n\n${block.content.trim()}\n\n`;
+            }
+            break;
+        }
+      }
+    } else {
+      // Fallback: old-style export
+      md += `## 语音转文字\n\n${transcriptText.trim()}\n\n---\n\n`;
+      if (notes.some(n => n.content.trim())) {
+        md += `## 随堂笔记\n\n`;
+        notes.filter(n => n.content.trim()).forEach((note, idx) => md += `### 笔记 ${idx + 1}\n\n${note.content}\n\n`);
+      }
     }
+
     const blob = new Blob([md], { type: 'text/markdown' });
-    const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `${session.title}.md`; a.click();
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `${session.title}.md`;
+    a.click();
     URL.revokeObjectURL(a.href);
     setShowExportMenu(false);
   };
 
-  const exportPDF = async (transcriptText: string, notes: Array<{ type: string; content: string }>) => {
+  const exportPDF = async (
+    transcriptText: string,
+    notes: Array<{ type: string; content: string }>,
+    layoutBlocks?: NoteLayoutBlock[],
+  ) => {
     if (!session || !notebook) return;
     setIsExportingPDF(true);
     try {
-      const notesHtml = notes.filter(n => n.content.trim()).map((n, i) =>
-        `<div style="margin-bottom:12px"><h4 style="color:#475569;margin:0 0 4px">笔记 ${i + 1}</h4><div>${n.content}</div></div>`
-      ).join('');
+      const html2pdf = (await import('html2pdf.js')).default;
+      let bodyHtml = '';
+
+      if (layoutBlocks && layoutBlocks.length > 0) {
+        // Export using layout blocks order
+        for (const block of layoutBlocks) {
+          switch (block.type) {
+            case 'transcript':
+              if (block.content?.trim()) {
+                bodyHtml += `<div style="margin-bottom:12px;line-height:1.8">${block.content.trim()}</div>`;
+              }
+              break;
+            case 'ppt':
+              if (block.src) {
+                const imgSrc = block.src.startsWith('data:') ? block.src : getMediaUrl(block.src);
+                bodyHtml += `<div style="margin-bottom:16px;border:1px solid #e2e8f0;border-radius:8px;overflow:hidden">`;
+                bodyHtml += `<div style="padding:8px 12px;background:#f8fafc;font-size:11px;color:#64748b">PPT 第 ${block.page || '?'} 页${block.title ? ' · ' + block.title : ''}</div>`;
+                bodyHtml += `<img src="${imgSrc}" style="width:100%;max-height:400px;object-fit:contain" />`;
+                bodyHtml += `</div>`;
+              }
+              break;
+            case 'note':
+              if (block.content?.trim()) {
+                bodyHtml += `<div style="margin-bottom:16px;padding:12px;background:#fffbeb;border:1px solid #fde68a;border-radius:8px">`;
+                bodyHtml += `<h4 style="margin:0 0 8px;color:#92400e;font-size:12px">随堂笔记</h4>`;
+                bodyHtml += `<div style="line-height:1.8">${block.content.trim()}</div>`;
+                bodyHtml += `</div>`;
+              }
+              break;
+          }
+        }
+      } else {
+        // Fallback: old-style export
+        bodyHtml += `<div style="white-space:pre-wrap;line-height:1.7">${transcriptText.trim()}</div>`;
+        if (notes.some(n => n.content.trim())) {
+          const notesHtml = notes.filter(n => n.content.trim()).map((n, i) =>
+            `<div style="margin-bottom:12px"><h4 style="color:#475569;margin:0 0 4px">笔记 ${i + 1}</h4><div>${n.content}</div></div>`
+          ).join('');
+          bodyHtml += `<h2 style="font-size:16px;border-bottom:2px solid #e2e8f0;padding-bottom:6px;margin:20px 0 12px;color:#1e293b">📖 随堂笔记</h2>${notesHtml}`;
+        }
+      }
 
       const container = document.createElement('div');
       container.style.position = 'absolute';
@@ -56,9 +132,8 @@ export function useExport(session: Session | undefined, notebook: Notebook | und
         <p style="color:#94a3b8;margin:0 0 16px;font-size:12px">
           ${notebook.title} &nbsp;|&nbsp; 时长 ${session.duration || '-'} &nbsp;|&nbsp; ${new Date().toLocaleString('zh-CN')}
         </p>
-        <h2 style="font-size:16px;border-bottom:2px solid #e2e8f0;padding-bottom:6px;margin:20px 0 12px;color:#1e293b">📝 语音转文字</h2>
-        <div style="white-space:pre-wrap">${transcriptText.trim()}</div>
-        ${notesHtml ? `<h2 style="font-size:16px;border-bottom:2px solid #e2e8f0;padding-bottom:6px;margin:20px 0 12px;color:#1e293b">📖 随堂笔记</h2>${notesHtml}` : ''}
+        <h2 style="font-size:16px;border-bottom:2px solid #e2e8f0;padding-bottom:6px;margin:20px 0 12px;color:#1e293b">📝 课堂记录</h2>
+        ${bodyHtml}
       `;
       document.body.appendChild(container);
 

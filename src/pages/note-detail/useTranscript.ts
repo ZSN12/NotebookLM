@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { fetchNote, updateNote as apiUpdateNote, insertPPTIntoTranscript, ContentBlock, Slide } from '@/services/api';
+import { contentBlocksFromLayout, layoutFromNoteParts, normalizeHtmlText } from '@/lib/noteLayout';
 
 const CORRECTION_POLL_MS = 12000;
 const PPT_INSERT_INITIAL_MS = 8000;
@@ -28,8 +29,70 @@ export function useTranscript(
   const [isTranscribing, setIsTranscribing] = useState(false);
   const [contentBlocks, setContentBlocks] = useState<ContentBlock[]>([]);
   const [lastSaveTime, setLastSaveTime] = useState<number | null>(null);
+  const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [isPptMatching, setIsPptMatching] = useState(false);
+  const [pptMatchMessage, setPptMatchMessage] = useState<string | null>(null);
+  const [pendingAiText, setPendingAiText] = useState<string | null>(null);
   const [loadedNote, setLoadedNote] = useState<any>(null);
+  const [isLoaded, setIsLoaded] = useState(false);
+  const [hasLocalChanges, setHasLocalChanges] = useState(false);
   const prevTranscriptRef = useRef('');
+  const userEditedRef = useRef(false);
+  const hasLocalChangesRef = useRef(false);
+
+  const markLocalChanged = useCallback((isUserEdit = true) => {
+    if (isUserEdit) userEditedRef.current = true;
+    hasLocalChangesRef.current = true;
+    setHasLocalChanges(true);
+    setSaveStatus('idle');
+  }, []);
+
+  const normalizeEditableHtml = useCallback((s: string) => normalizeHtmlText(s), []);
+
+  const cleanTranscriptText = useCallback((value: string) => {
+    return normalizeEditableHtml(value)
+      .replace(/^(##\s*语音转文字\s*)+/g, '')
+      .replace(/(?:\n\s*)?---+\s*$/g, '')
+      .replace(/^[-\s]+$/g, '')
+      .trim();
+  }, [normalizeEditableHtml]);
+
+  const transcriptFromBlocks = useCallback((blocks: ContentBlock[]) => {
+    return blocks
+      .filter((block) => block.type === 'text')
+      .map((block) => normalizeEditableHtml(block.content || ''))
+      .filter(Boolean)
+      .join('\n\n');
+  }, [normalizeEditableHtml]);
+
+  const getCurrentTranscript = useCallback(() => {
+    const blockText = transcriptFromBlocks(contentBlocks);
+    return cleanTranscriptText(blockText || transcriptText);
+  }, [cleanTranscriptText, contentBlocks, transcriptFromBlocks, transcriptText]);
+
+  const updateTranscriptText = useCallback((value: string, markUserEdit = true) => {
+    if (markUserEdit) markLocalChanged(true);
+    else setSaveStatus('idle');
+    setTranscriptText(value);
+  }, [markLocalChanged]);
+
+  const updateContentBlocks = useCallback((blocks: ContentBlock[], markUserEdit = true, markLocalChange = markUserEdit) => {
+    if (markLocalChange) markLocalChanged(markUserEdit);
+    else setSaveStatus('idle');
+    setContentBlocks(blocks);
+  }, [markLocalChanged]);
+
+  const receiveAiText = useCallback((value: string) => {
+    const nextText = value.trim();
+    if (!nextText) return;
+    if (userEditedRef.current) {
+      setPendingAiText(nextText);
+      return;
+    }
+    setTranscriptText(nextText);
+    markLocalChanged(false);
+  }, [markLocalChanged]);
 
   const parseSentencesWithTime = useCallback((note: any): SentenceWithTime[] => {
     if (!note?.transcript || !Array.isArray(note.transcript) || note.transcript.length === 0) return [];
@@ -109,16 +172,19 @@ export function useTranscript(
   }, []);
 
   const appendTranscriptText = useCallback((newText: string) => {
+    markLocalChanged(false);
     setTranscriptText(prev => {
       const trimmed = newText.trim();
       if (!trimmed) return prev;
       const prevTrimmed = prev.trim();
       return prevTrimmed ? `${prevTrimmed}\n\n${trimmed}` : trimmed;
     });
-  }, []);
+  }, [markLocalChanged]);
 
   const loadHistory = useCallback(async () => {
     if (!sessionId) return;
+    setIsLoaded(false);
+    setLoadedNote(null);
     try {
       const note = await fetchNote(sessionId);
       if (note) {
@@ -129,7 +195,7 @@ export function useTranscript(
         if (note.content) {
           const match = note.content.match(/^## 语音转文字\n\n([\s\S]*?)(?:\n\n---\n\n[\s\S]*)?$/);
           if (match && match[1].trim()) {
-            setTranscriptText(match[1].trim());
+            setTranscriptText(cleanTranscriptText(match[1]));
             transcriptRestored = true;
           }
         }
@@ -140,7 +206,7 @@ export function useTranscript(
             .join(' ')
             .trim();
           if (fullTranscript) {
-            setTranscriptText(fullTranscript);
+            setTranscriptText(cleanTranscriptText(fullTranscript));
           }
         }
         // Parse sentence-time mapping from transcript JSON (always needs note.transcript)
@@ -148,45 +214,63 @@ export function useTranscript(
           const parsed = parseSentencesWithTime(note);
           if (parsed.length > 0) setSentencesWithTime(parsed);
         }
-        if (note.ppt_images && note.ppt_images.length > 0) {
+        const restoredBlocks = contentBlocksFromLayout(note.layout_blocks);
+        if (restoredBlocks.length > 0) {
+          updateContentBlocks(restoredBlocks, false);
+          const layoutText = transcriptFromBlocks(restoredBlocks);
+          if (layoutText) setTranscriptText(cleanTranscriptText(layoutText));
+        } else if (note.ppt_images && note.ppt_images.length > 0) {
           setTimeout(async () => {
             try {
               const blocks = await insertPPTIntoTranscript(sessionId);
               if (blocks.blocks?.some((b: ContentBlock) => b.type === 'image')) {
-                setContentBlocks(blocks.blocks);
+                updateContentBlocks(blocks.blocks, false, false);
               }
             } catch {}
           }, 500);
         }
       }
     } catch (error) { console.error('Failed to load history:', error); }
-  }, [sessionId, parseSentencesWithTime]);
+    finally {
+      hasLocalChangesRef.current = false;
+      setHasLocalChanges(false);
+      setIsLoaded(true);
+    }
+  }, [cleanTranscriptText, sessionId, parseSentencesWithTime, transcriptFromBlocks, updateContentBlocks]);
 
   useEffect(() => { loadHistory(); }, [loadHistory]);
 
-  const lastSaveRef = useRef<number>(0);
-  const saveContent = useCallback(async (currentNotes: StudentNote[]) => {
-    if (!sessionId) return;
-    const now = Date.now();
-    if (now - lastSaveRef.current < 3000) return;
-    lastSaveRef.current = now;
-
-    // Normalize empty state (Chrome contentEditable leaves <br> when cleared)
-    const normalize = (s: string) => {
-      const t = s.trim();
-      return (t === '<br>' || t === '<br />') ? '' : t;
-    };
-    const cleanTranscript = normalize(transcriptText);
-    const notesContent = currentNotes.map(n => normalize(n.content)).filter(Boolean).join('\n\n');
+  const saveContent = useCallback(async (currentNotes: StudentNote[], forceRetry = false) => {
+    if (!sessionId) return false;
+    if (!forceRetry && !hasLocalChangesRef.current) return true;
+    const cleanTranscript = cleanTranscriptText(getCurrentTranscript());
+    const notesContent = currentNotes.map(n => normalizeEditableHtml(n.content)).filter(Boolean).join('\n\n');
 
     const fullContent = cleanTranscript
       ? `## 语音转文字\n\n${cleanTranscript}\n\n---\n\n${notesContent}`.trim()
       : notesContent;
+    const layoutBlocks = layoutFromNoteParts(cleanTranscript, contentBlocks, currentNotes);
     if (fullContent || currentNotes.length > 0) {
-      try { await apiUpdateNote(sessionId, fullContent); setLastSaveTime(Date.now()); }
-      catch (error) { console.error('[NoteDetail] Failed to save content:', error); }
+      setSaveStatus('saving');
+      setSaveError(null);
+      try {
+        await apiUpdateNote(sessionId, fullContent, layoutBlocks);
+        setLastSaveTime(Date.now());
+        setSaveStatus('saved');
+        hasLocalChangesRef.current = false;
+        setHasLocalChanges(false);
+        return true;
+      } catch (error: any) {
+        console.error('[NoteDetail] Failed to save content:', error);
+        setSaveStatus('error');
+        setSaveError(error?.message || '保存失败，请检查网络后重试');
+        return false;
+      }
     }
-  }, [sessionId, transcriptText]);
+    hasLocalChangesRef.current = false;
+    setHasLocalChanges(false);
+    return true;
+  }, [cleanTranscriptText, contentBlocks, getCurrentTranscript, normalizeEditableHtml, sessionId]);
 
   useEffect(() => {
     if (!isRecording || !sessionId) return;
@@ -199,7 +283,7 @@ export function useTranscript(
             .map((chunk: any) => chunk.text || '')
             .join(' ');
           if (corrected.trim() && corrected.trim() !== transcriptText.trim()) {
-            setTranscriptText(corrected);
+            receiveAiText(corrected);
             setIsAiRestructuring(false);
             // Re-parse sentence-time mapping: AI restructured text changed,
             // old sentence boundaries no longer match
@@ -210,7 +294,7 @@ export function useTranscript(
       } catch {}
     }, CORRECTION_POLL_MS);
     return () => clearInterval(interval);
-  }, [isRecording, sessionId, transcriptText, parseSentencesWithTime]);
+  }, [isRecording, sessionId, transcriptText, parseSentencesWithTime, receiveAiText]);
 
   useEffect(() => {
     if (!isRecording && sessionId && transcriptText) {
@@ -226,20 +310,38 @@ export function useTranscript(
       setIsTranscribing(false);
       // 转录重组完成，用干净文本重新匹配 PPT
       if (sessionId) {
+        setIsPptMatching(true);
+        setPptMatchMessage('正在重新匹配 PPT');
         insertPPTIntoTranscript(sessionId).then(result => {
-          if (result.blocks?.length > 0) setContentBlocks(result.blocks);
-        }).catch(() => {});
+          if (result.blocks?.length > 0) {
+            updateContentBlocks(result.blocks, false, true);
+            const count = result.blocks.filter((b) => b.type === 'image').length;
+            setPptMatchMessage(count > 0 ? `已匹配 ${count} 页 PPT` : '未匹配到 PPT 页面');
+          }
+        }).catch(() => {
+          setPptMatchMessage('PPT 匹配失败，可稍后重试');
+        }).finally(() => setIsPptMatching(false));
       }
     }
-  }, [isTranscribing, transcriptText, sessionId]);
+  }, [isTranscribing, transcriptText, sessionId, updateContentBlocks]);
 
   useEffect(() => {
     if (!isRecording || !sessionId || slides.length === 0) return;
     const doInsert = async () => {
+      setIsPptMatching(true);
+      setPptMatchMessage('正在匹配 PPT');
       try {
         const result = await insertPPTIntoTranscript(sessionId);
-        if (result.blocks?.length > 0) setContentBlocks(result.blocks);
-      } catch {}
+        if (result.blocks?.length > 0) {
+          updateContentBlocks(result.blocks, false, true);
+          const count = result.blocks.filter((b) => b.type === 'image').length;
+          setPptMatchMessage(count > 0 ? `已匹配 ${count} 页 PPT` : '未匹配到 PPT 页面');
+        }
+      } catch {
+        setPptMatchMessage('PPT 匹配失败，可稍后重试');
+      } finally {
+        setIsPptMatching(false);
+      }
     };
     const t1 = setTimeout(doInsert, PPT_INSERT_INITIAL_MS);
     const t2 = setInterval(doInsert, PPT_INSERT_INTERVAL_MS);
@@ -264,18 +366,40 @@ export function useTranscript(
       isTranscribing,
       contentBlocks,
       lastSaveTime,
+      saveStatus,
+      saveError,
+      isPptMatching,
+      pptMatchMessage,
+      pendingAiText,
       loadedNote,
+      isLoaded,
+      hasLocalChanges,
     },
     actions: {
       setTranscriptText,
+      updateTranscriptText,
+      receiveAiText,
       appendTranscriptText,
       setIsAiRestructuring,
       setIsTranscribing,
       setContentBlocks,
+      updateContentBlocks,
       setActiveSentenceIndex,
       saveContent,
       parseSentencesWithTime,
       setSentencesWithTime,
+      markUserEdited: () => markLocalChanged(true),
+      markLocalChanged: () => markLocalChanged(false),
+      applyPendingAiText: () => {
+        if (!pendingAiText) return;
+        userEditedRef.current = false;
+        setTranscriptText(pendingAiText);
+        setPendingAiText(null);
+        setSentencesWithTime([]);
+        setActiveSentenceIndex(null);
+        markLocalChanged(false);
+      },
+      dismissPendingAiText: () => setPendingAiText(null),
     },
   };
 }

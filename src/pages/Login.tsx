@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { login, register, resetPassword, isAuthenticated } from "@/services/auth";
+import { login, register, resetPassword } from "@/services/auth";
 import { BookOpen, Loader2, X } from "lucide-react";
 
 export default function Login() {
@@ -11,8 +11,6 @@ export default function Login() {
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
-
-  // Forgot password modal state
   const [showResetModal, setShowResetModal] = useState(false);
   const [resetEmail, setResetEmail] = useState("");
   const [resetNewPassword, setResetNewPassword] = useState("");
@@ -37,6 +35,13 @@ export default function Login() {
     }
   };
 
+  const closeResetModal = () => {
+    setShowResetModal(false);
+    setResetEmail("");
+    setResetNewPassword("");
+    setResetMessage("");
+  };
+
   const handleResetPassword = async (e: React.FormEvent) => {
     e.preventDefault();
     setResetMessage("");
@@ -46,12 +51,7 @@ export default function Login() {
     try {
       await resetPassword(resetEmail, resetNewPassword);
       setResetMessage("密码已重置，请登录");
-      setTimeout(() => {
-        setShowResetModal(false);
-        setResetEmail("");
-        setResetNewPassword("");
-        setResetMessage("");
-      }, 2000);
+      setTimeout(closeResetModal, 2000);
     } catch (err: any) {
       setError(err.message);
     } finally {
@@ -164,16 +164,15 @@ export default function Login() {
         </form>
       </div>
 
-      {/* Reset Password Modal */}
       {showResetModal && (
         <div
           className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm"
-          onClick={() => { setShowResetModal(false); setResetEmail(""); setResetNewPassword(""); setResetMessage(""); }}
+          onClick={closeResetModal}
         >
           <div className="bg-white dark:bg-slate-800 rounded-2xl shadow-xl p-6 w-full max-w-sm mx-4" onClick={(e) => e.stopPropagation()}>
             <div className="flex items-center justify-between mb-4">
               <h3 className="text-base font-semibold text-slate-800 dark:text-slate-200">重置密码</h3>
-              <button onClick={() => { setShowResetModal(false); setResetEmail(""); setResetNewPassword(""); setResetMessage(""); }} className="p-1 rounded-lg text-slate-400 hover:text-slate-600 hover:bg-slate-100 dark:hover:bg-slate-700 transition-colors cursor-pointer"><X className="w-4 h-4" /></button>
+              <button onClick={closeResetModal} className="p-1 rounded-lg text-slate-400 hover:text-slate-600 hover:bg-slate-100 dark:hover:bg-slate-700 transition-colors cursor-pointer"><X className="w-4 h-4" /></button>
             </div>
 
             {resetMessage && (
@@ -205,7 +204,7 @@ export default function Login() {
                   value={resetNewPassword}
                   onChange={(e) => setResetNewPassword(e.target.value)}
                   required
-                  minLength={6}
+                  minLength={8}
                   className="w-full px-3 py-2 rounded-xl border border-slate-200 dark:border-slate-600 bg-slate-50 dark:bg-slate-700 text-slate-800 dark:text-slate-200 text-sm focus:outline-none focus:ring-2 focus:ring-blue-300 dark:focus:ring-blue-600 min-h-[48px]"
                 />
               </div>

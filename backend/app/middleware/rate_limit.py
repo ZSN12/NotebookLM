@@ -14,6 +14,7 @@ RATE_LIMITS = [
     ("/api/sessions", 30, 60),                # 30 requests per minute
     ("/api/notes", 30, 60),                   # 30 requests per minute
     ("/api/auth/register", 5, 3600),          # 5 registrations per hour
+    ("/api/auth/reset-password", 5, 3600),    # 5 password reset attempts per hour
 ]
 
 

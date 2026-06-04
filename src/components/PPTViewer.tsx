@@ -1,6 +1,6 @@
 import { useState, useCallback, useEffect } from 'react';
 import { ChevronUp, ChevronDown, FileText, X } from 'lucide-react';
-import { API_BASE, Slide } from '@/services/api';
+import { getMediaUrl, Slide } from '@/services/api';
 
 interface PPTViewerProps {
   slides: Slide[];
@@ -13,7 +13,7 @@ interface PPTViewerProps {
 function slideImageUrl(slide: Slide, sessionId?: string): string | null {
   // New format: image served from disk via API
   if (slide.image_path && sessionId) {
-    return `${API_BASE}/api/media/slides/${sessionId}/${slide.image_path}`;
+    return getMediaUrl(`/api/media/slides/${sessionId}/${slide.image_path}`);
   }
   // Legacy format: inline base64
   if (slide.image_base64) {

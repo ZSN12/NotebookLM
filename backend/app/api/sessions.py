@@ -5,6 +5,7 @@ from app.core.auth import get_current_user
 from app.api.schemas import SessionCreate, SessionUpdate, SessionResponse
 from app.models import Session, Notebook, User
 from app.services.file_service import delete_session_files
+import secrets
 
 router = APIRouter(prefix="/api/sessions", tags=["sessions"])
 
@@ -99,3 +100,67 @@ def delete_session(
     db.delete(session)
     db.commit()
     return None
+
+
+# ── Share endpoints ──
+
+@router.post("/{session_id}/share/enable")
+def enable_share(
+    session_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Enable sharing for a session, generating a share token."""
+    session = db.query(Session).filter(
+        Session.id == session_id
+    ).join(Notebook).filter(Notebook.user_id == current_user.id).first()
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    token = secrets.token_urlsafe(24)
+    session.share_enabled = True
+    session.share_token = token
+    db.commit()
+
+    return {"share_enabled": True, "share_token": token,
+            "share_url": f"/share/{session_id}?token={token}"}
+
+
+@router.post("/{session_id}/share/disable")
+def disable_share(
+    session_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Disable sharing for a session."""
+    session = db.query(Session).filter(
+        Session.id == session_id
+    ).join(Notebook).filter(Notebook.user_id == current_user.id).first()
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    session.share_enabled = False
+    session.share_token = None
+    db.commit()
+
+    return {"share_enabled": False}
+
+
+@router.get("/{session_id}/share/status")
+def get_share_status(
+    session_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Get the current share status for a session."""
+    session = db.query(Session).filter(
+        Session.id == session_id
+    ).join(Notebook).filter(Notebook.user_id == current_user.id).first()
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    return {
+        "share_enabled": bool(session.share_enabled),
+        "share_token": session.share_token if session.share_enabled else None,
+        "share_url": f"/share/{session_id}?token={session.share_token}" if session.share_enabled and session.share_token else None,
+    }

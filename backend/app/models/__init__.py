@@ -1,4 +1,4 @@
-from sqlalchemy import Column, DateTime, String, Text, Integer, JSON, ForeignKey, Float
+from sqlalchemy import Column, DateTime, String, Text, Integer, JSON, ForeignKey, Float, Boolean, LargeBinary
 from sqlalchemy.orm import relationship, DeclarativeBase
 from sqlalchemy.sql import func
 import uuid
@@ -39,6 +39,8 @@ class Session(Base):
     keywords = Column(JSON, default=[])
     duration = Column(String(20))
     status = Column(String(20), default="pending")
+    share_enabled = Column(Boolean, default=False)
+    share_token = Column(String(64), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     notebook = relationship("Notebook", back_populates="sessions")
     notes = relationship("Note", back_populates="session", cascade="all, delete-orphan")
@@ -55,6 +57,27 @@ class Note(Base):
     vocabulary = Column(JSON)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     session = relationship("Session", back_populates="notes")
+
+    @property
+    def layout_blocks(self):
+        if not isinstance(self.vocabulary, list):
+            return None
+        for item in self.vocabulary:
+            if isinstance(item, dict) and item.get("kind") == "layout_blocks":
+                blocks = item.get("blocks")
+                return blocks if isinstance(blocks, list) else None
+        return None
+
+    @layout_blocks.setter
+    def layout_blocks(self, blocks):
+        existing = self.vocabulary if isinstance(self.vocabulary, list) else []
+        next_items = [
+            item for item in existing
+            if not (isinstance(item, dict) and item.get("kind") == "layout_blocks")
+        ]
+        if blocks is not None:
+            next_items.append({"kind": "layout_blocks", "blocks": blocks})
+        self.vocabulary = next_items
 
 class File(Base):
     __tablename__ = "files"
@@ -89,4 +112,19 @@ class Vocabulary(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     notebook = relationship("Notebook", back_populates="vocabulary")
 
-__all__ = ["Base", "User", "Notebook", "Session", "Note", "File", "Task", "Vocabulary"]
+class VectorChunk(Base):
+    __tablename__ = "vector_chunks"
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String(36), ForeignKey("users.id"), nullable=False, index=True)
+    notebook_id = Column(String(36), ForeignKey("notebooks.id"), nullable=False, index=True)
+    session_id = Column(String(36), ForeignKey("sessions.id"), nullable=False, index=True)
+    source_type = Column(String(20), nullable=False)  # transcript | note | ppt | layout
+    source_id = Column(String(36), nullable=True)
+    chunk_index = Column(Integer, default=0)
+    text = Column(Text, nullable=False)
+    chunk_meta = Column(JSON, default={})
+    embedding = Column(LargeBinary, nullable=True)  # packed float32 vector
+    content_hash = Column(String(64), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+__all__ = ["Base", "User", "Notebook", "Session", "Note", "File", "Task", "Vocabulary", "VectorChunk"]

@@ -107,6 +107,7 @@ class SessionResponse(BaseModel):
     keywords: list[str] = []
     duration: Optional[str] = None
     status: str = "pending"
+    share_enabled: bool = False
     created_at: datetime
 
     @field_validator("keywords", mode="before")
@@ -120,9 +121,11 @@ class NoteCreate(BaseModel):
     transcript: Optional[list] = None
     ppt_images: Optional[list] = None
     vocabulary: Optional[list[dict]] = None
+    layout_blocks: Optional[list[dict]] = None
 
 class NoteUpdate(BaseModel):
     content: Optional[str] = None
+    layout_blocks: Optional[list[dict]] = None
 
 class NoteResponse(BaseModel):
     model_config = {"from_attributes": True}
@@ -132,6 +135,7 @@ class NoteResponse(BaseModel):
     transcript: Optional[list] = None
     ppt_images: Optional[list] = None
     vocabulary: Optional[list[dict]] = None
+    layout_blocks: Optional[list[dict]] = None
     created_at: datetime
 
 # File Schemas
@@ -193,6 +197,13 @@ class PasswordReset(BaseModel):
     email: str
     new_password: str
 
+    @field_validator("new_password")
+    @classmethod
+    def password_length(cls, v: str) -> str:
+        if len(v) < 8:
+            raise ValueError("Password must be at least 8 characters")
+        return v
+
 
 class UserProfileUpdate(BaseModel):
     username: Optional[str] = None
@@ -224,9 +235,10 @@ class SessionNoteBundle(BaseModel):
     content: Optional[str] = None
     transcript: Optional[list] = None
     ppt_images: Optional[list] = None
+    layout_blocks: Optional[list[dict]] = None
 
 
 class NotebookPackage(BaseModel):
-    format_version: int = 1
+    format_version: int = 2
     notebook: NotebookCreate
     sessions: list[SessionNoteBundle] = []

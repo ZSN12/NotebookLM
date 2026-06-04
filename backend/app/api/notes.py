@@ -45,6 +45,8 @@ def update_note(
         db.add(note)
     else:
         note.content = data.content or ""
+    if data.layout_blocks is not None:
+        note.layout_blocks = data.layout_blocks
     db.commit()
     db.refresh(note)
     return note

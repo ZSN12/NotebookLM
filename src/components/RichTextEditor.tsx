@@ -1,4 +1,5 @@
-import { useRef, useEffect, forwardRef, useState } from 'react';
+import { useRef, useEffect, forwardRef } from 'react';
+import { sanitizeHTML } from '@/lib/sanitize';
 
 interface RichTextEditorProps {
   value: string;
@@ -15,8 +16,9 @@ const RichTextEditor = forwardRef<HTMLDivElement, RichTextEditorProps>(
     const isInternalUpdate = useRef(false);
 
     useEffect(() => {
-      if (editorRef.current && !isInternalUpdate.current && editorRef.current.innerHTML !== value) {
-        editorRef.current.innerHTML = value;
+      const safeValue = sanitizeHTML(value || '') as unknown as string;
+      if (editorRef.current && !isInternalUpdate.current && editorRef.current.innerHTML !== safeValue) {
+        editorRef.current.innerHTML = safeValue;
       }
       isInternalUpdate.current = false;
     }, [value]);
@@ -24,7 +26,11 @@ const RichTextEditor = forwardRef<HTMLDivElement, RichTextEditorProps>(
     const handleInput = () => {
       if (editorRef.current) {
         isInternalUpdate.current = true;
-        onChange(editorRef.current.innerHTML);
+        const safeValue = sanitizeHTML(editorRef.current.innerHTML) as unknown as string;
+        if (editorRef.current.innerHTML !== safeValue) {
+          editorRef.current.innerHTML = safeValue;
+        }
+        onChange(safeValue);
       }
     };
 

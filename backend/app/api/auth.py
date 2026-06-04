@@ -111,6 +111,8 @@ def reset_password(data: PasswordReset, db: Session = Depends(get_db)):
 
     user.password_hash = hash_password(data.new_password)
     db.commit()
+    with _login_lock:
+        _failed_login_attempts.pop(data.email, None)
     return {"status": "ok", "message": "Password has been reset successfully"}
 
 
@@ -148,9 +150,9 @@ async def upload_avatar(file: UploadFile = File(...), current_user: User = Depen
     with open(filepath, "wb") as f:
         f.write(content)
 
-    current_user.avatar_url = f"/api/auth/avatar/{current_user.id}"
+    current_user.avatar_url = filename
     db.commit()
-    return {"status": "ok", "avatar_url": current_user.avatar_url}
+    return {"status": "ok", "avatar_url": f"/api/auth/avatar/{current_user.id}"}
 
 
 @router.get("/avatar/{user_id}")

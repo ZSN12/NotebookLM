@@ -1,16 +1,18 @@
 import { useParams, useNavigate } from 'react-router-dom';
 import {
   ArrowLeft, Play, Pause, ChevronUp, ChevronDown, Edit3, Loader2, AlertCircle, ImagePlus,
-  X, FileText, Square, Download, Bold, List, Share2, Trash2, Mic, MicOff,
-  ChevronDown as ChevronDownIcon
+  X, FileText, Square, Download, Bold, List, Share2, Trash2, Mic, MicOff, Search,
+  ChevronDown as ChevronDownIcon, Database, RefreshCw
 } from 'lucide-react';
 import { useStore } from '@/store/useStore';
-import { useState, useRef, useCallback, useEffect } from 'react';
+import { useState, useRef, useCallback, useEffect, useMemo } from 'react';
 import { getProfile, getAvatarUrl } from '@/services/auth';
 import ThemeToggle from '@/components/ThemeToggle';
 import RichTextEditor from '@/components/RichTextEditor';
-import { API_BASE, deleteAudio, uploadPPT, insertPPTIntoTranscript, uploadAudio } from '@/services/api';
+import { API_BASE, deleteAudio, uploadPPT, insertPPTIntoTranscript, uploadAudio, getMediaUrl, fetchNotebookDetail, fetchSessionById, enableShare, disableShare, getShareStatus, rebuildSessionVectorIndex, getSessionVectorStatus, searchVectors, VectorIndexStatus, VectorSearchResult } from '@/services/api';
 import { sanitizeHTML } from '@/lib/sanitize';
+import { layoutFromNoteParts } from '@/lib/noteLayout';
+import type { Notebook, Session } from '@/types';
 
 import { useRecording } from './useRecording';
 import { useTranscript, StudentNote } from './useTranscript';
@@ -33,24 +35,62 @@ export default function NoteDetail() {
 
   const notebook = notebooks.find((n) => n.id === id);
   const session = sessions.find((s) => s.id === sessionId);
+  const [fallbackNotebook, setFallbackNotebook] = useState<Notebook | null>(null);
+  const [fallbackSession, setFallbackSession] = useState<Session | null>(null);
+  const displayNotebook = notebook || fallbackNotebook;
+  const displaySession = session || fallbackSession;
   const [profile, setProfile] = useState<any>(null);
 
   useEffect(() => { getProfile().then(setProfile).catch(() => {}); }, []);
+
+  useEffect(() => {
+    if (!id || notebook) return;
+    fetchNotebookDetail(id).then((data) => {
+      if (!data) return;
+      setFallbackNotebook({
+        id: data.id,
+        title: data.title,
+        description: data.description || '',
+        icon: data.icon || 'BookOpen',
+        color: data.color || 'from-blue-500 to-blue-600',
+        sessionCount: data.session_count,
+        updatedAt: data.created_at.split('T')[0],
+        createdAt: data.created_at.split('T')[0],
+      });
+    }).catch(() => {});
+  }, [id, notebook]);
+
+  useEffect(() => {
+    if (!sessionId || session) return;
+    fetchSessionById(sessionId).then(setFallbackSession).catch(() => {});
+  }, [sessionId, session]);
 
   // ---- Hooks ----
   const recording = useRecording(sessionId);
   const ppt = usePPT(sessionId);
   const notesHook = useNotes();
   const transcript = useTranscript(sessionId, recording.state.isRecording, ppt.state.slides);
-  const exportTools = useExport(session, notebook);
+  const exportTools = useExport(displaySession, displayNotebook);
 
   const [isLoading, setIsLoading] = useState(true);
   const [showShareModal, setShowShareModal] = useState(false);
   const [shareLink, setShareLink] = useState('');
+  const [shareToken, setShareToken] = useState('');
+  const [shareEnabled, setShareEnabled] = useState(false);
+  const [shareLoading, setShareLoading] = useState(false);
   const [copySuccess, setCopySuccess] = useState(false);
   const [showLeftPanel, setShowLeftPanel] = useState(false); // tablet sidebar
   const [isUploadingAudio, setIsUploadingAudio] = useState(false);
   const [audioUploadError, setAudioUploadError] = useState<string | null>(null);
+
+  // Vector index state
+  const [vectorStatus, setVectorStatus] = useState<VectorIndexStatus | null>(null);
+  const [isRebuilding, setIsRebuilding] = useState(false);
+  const [showSearch, setShowSearch] = useState(false);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [searchResults, setSearchResults] = useState<VectorSearchResult[]>([]);
+  const [isSearching, setIsSearching] = useState(false);
+  const [searchScope, setSearchScope] = useState<'session' | 'notebook'>('session');
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const transcriptEditRef = useRef<HTMLDivElement>(null);
@@ -71,7 +111,11 @@ export default function NoteDetail() {
   // React to loadedNote from useTranscript (single source of truth for history load)
   const loadedNote = transcript.state.loadedNote;
   useEffect(() => {
-    if (!loadedNote || !sessionId) return;
+    if (!sessionId || !transcript.state.isLoaded) return;
+    if (!loadedNote) {
+      setIsLoading(false);
+      return;
+    }
     // Restore notes
     if (loadedNote.content) {
       const hasTranscript = loadedNote.transcript && Array.isArray(loadedNote.transcript) && loadedNote.transcript.length > 0;
@@ -81,26 +125,82 @@ export default function NoteDetail() {
     if (loadedNote.ppt_images && loadedNote.ppt_images.length > 0) {
       const lastPpt = loadedNote.ppt_images[loadedNote.ppt_images.length - 1];
       if (lastPpt.slides) ppt.actions.setSlides(lastPpt.slides);
-      setTimeout(async () => {
-        try {
-          const blocks = await insertPPTIntoTranscript(sessionId);
-          if (blocks.blocks?.some((b: ContentBlock) => b.type === 'image')) {
-            transcript.actions.setContentBlocks(blocks.blocks);
-          }
-        } catch {}
-      }, 500);
+      // Only auto-insert PPT if we don't have saved layout_blocks
+      const hasLayoutBlocks = loadedNote.layout_blocks && Array.isArray(loadedNote.layout_blocks) && loadedNote.layout_blocks.length > 0;
+      if (!hasLayoutBlocks) {
+        setTimeout(async () => {
+          try {
+            const blocks = await insertPPTIntoTranscript(sessionId);
+            if (blocks.blocks?.some((b: ContentBlock) => b.type === 'image')) {
+              transcript.actions.updateContentBlocks(blocks.blocks, false, false);
+            }
+          } catch {}
+        }, 500);
+      }
     }
     setIsLoading(false);
-  }, [loadedNote, sessionId]);
+  }, [loadedNote, sessionId, transcript.state.isLoaded]);
 
   // ---- Auto-save ----
   useEffect(() => {
-    if (!sessionId) return;
+    if (!sessionId || !transcript.state.isLoaded || !transcript.state.hasLocalChanges) return;
     const timer = setTimeout(() => {
       transcript.actions.saveContent(notesHook.state.notes);
     }, 3000);
     return () => clearTimeout(timer);
-  }, [transcript.state.transcriptText, notesHook.state.notes]);
+  }, [
+    sessionId,
+    transcript.state.isLoaded,
+    transcript.state.hasLocalChanges,
+    transcript.state.transcriptText,
+    transcript.state.contentBlocks,
+    notesHook.state.notes,
+    transcript.actions.saveContent,
+  ]);
+
+  const workflowStatus = useMemo(() => {
+    if (ppt.state.isUploadingPPT) return { tone: 'blue', text: '正在上传并解析 PPT' };
+    if (isUploadingAudio) return { tone: 'blue', text: '正在上传录音并转写' };
+    if (recording.state.isProcessing) return { tone: 'blue', text: '正在初始化录音设备' };
+    if (recording.state.isRecording && recording.state.isPaused) return { tone: 'amber', text: '录音已暂停' };
+    if (recording.state.isRecording) return { tone: 'red', text: `录音中 ${recording.state.currentTime}` };
+    if (transcript.state.isAiRestructuring) return { tone: 'violet', text: '正在整理转写并匹配 PPT' };
+    if (transcript.state.isTranscribing) return { tone: 'blue', text: '正在等待转写结果' };
+    if (transcript.state.isPptMatching) return { tone: 'blue', text: '正在匹配 PPT 页面' };
+    if (transcript.state.saveStatus === 'saving') return { tone: 'blue', text: '正在自动保存' };
+    if (transcript.state.saveStatus === 'error') return { tone: 'red', text: transcript.state.saveError || '保存失败' };
+    if (ppt.state.uploadMessage) return { tone: 'green', text: ppt.state.uploadMessage };
+    if (transcript.state.pptMatchMessage) return { tone: 'slate', text: transcript.state.pptMatchMessage };
+    if (transcript.state.lastSaveTime) {
+      const time = new Date(transcript.state.lastSaveTime).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+      return { tone: 'green', text: `已保存 ${time}` };
+    }
+    return { tone: 'slate', text: '准备记录' };
+  }, [
+    isUploadingAudio,
+    ppt.state.isUploadingPPT,
+    ppt.state.uploadMessage,
+    recording.state.currentTime,
+    recording.state.isPaused,
+    recording.state.isProcessing,
+    recording.state.isRecording,
+    transcript.state.isAiRestructuring,
+    transcript.state.isPptMatching,
+    transcript.state.isTranscribing,
+    transcript.state.lastSaveTime,
+    transcript.state.pptMatchMessage,
+    transcript.state.saveError,
+    transcript.state.saveStatus,
+  ]);
+
+  const statusClass = {
+    blue: 'bg-blue-50 text-blue-700 border-blue-200 dark:bg-blue-900/20 dark:text-blue-300 dark:border-blue-800',
+    green: 'bg-emerald-50 text-emerald-700 border-emerald-200 dark:bg-emerald-900/20 dark:text-emerald-300 dark:border-emerald-800',
+    amber: 'bg-amber-50 text-amber-700 border-amber-200 dark:bg-amber-900/20 dark:text-amber-300 dark:border-amber-800',
+    red: 'bg-red-50 text-red-700 border-red-200 dark:bg-red-900/20 dark:text-red-300 dark:border-red-800',
+    violet: 'bg-violet-50 text-violet-700 border-violet-200 dark:bg-violet-900/20 dark:text-violet-300 dark:border-violet-800',
+    slate: 'bg-slate-50 text-slate-600 border-slate-200 dark:bg-slate-800/60 dark:text-slate-300 dark:border-slate-700',
+  }[workflowStatus.tone];
 
   // ---- Format helpers ----
   const applyFormat = (formatType: string, value?: string) => {
@@ -139,13 +239,80 @@ export default function NoteDetail() {
   };
 
   // ---- Share ----
-  const handleShareSession = () => {
+  const handleShareSession = async () => {
     if (!sessionId) return;
-    const link = `${window.location.origin}/share/${sessionId}`;
-    setShareLink(link);
-    navigator.clipboard.writeText(link).then(() => setCopySuccess(true)).catch(() => {});
     setShowShareModal(true);
-    setTimeout(() => setCopySuccess(false), 3000);
+    setShareLoading(true);
+    try {
+      const status = await getShareStatus(sessionId);
+      if (status.share_enabled && status.share_url) {
+        setShareEnabled(true);
+        setShareToken(status.share_token || '');
+        setShareLink(`${window.location.origin}${status.share_url}`);
+      } else {
+        const result = await enableShare(sessionId);
+        setShareEnabled(true);
+        setShareToken(result.share_token);
+        setShareLink(`${window.location.origin}${result.share_url}`);
+      }
+    } catch (err: any) {
+      setShareEnabled(false);
+      setShareLink('');
+      setShareToken('');
+    } finally {
+      setShareLoading(false);
+    }
+  };
+
+  const handleDisableShare = async () => {
+    if (!sessionId || !window.confirm('关闭分享后，已分享的链接将失效。确定关闭？')) return;
+    setShareLoading(true);
+    try {
+      await disableShare(sessionId);
+      setShareEnabled(false);
+      setShareLink('');
+      setShareToken('');
+    } catch (err: any) {
+      alert(err.message || '关闭分享失败');
+    } finally {
+      setShareLoading(false);
+    }
+  };
+
+  // ---- Vector Index ----
+  useEffect(() => {
+    if (!sessionId) return;
+    getSessionVectorStatus(sessionId).then(setVectorStatus).catch(() => {});
+  }, [sessionId]);
+
+  const handleRebuildIndex = async () => {
+    if (!sessionId) return;
+    setIsRebuilding(true);
+    try {
+      const result = await rebuildSessionVectorIndex(sessionId);
+      setVectorStatus({ session_id: sessionId, chunk_count: result.chunk_count, has_content: true, status: 'indexed' });
+    } catch (err: any) {
+      alert(err.message || '建立索引失败');
+    } finally {
+      setIsRebuilding(false);
+    }
+  };
+
+  const handleSearch = async () => {
+    if (!searchQuery.trim()) return;
+    setIsSearching(true);
+    try {
+      const result = await searchVectors(
+        searchQuery,
+        searchScope === 'session' ? sessionId : undefined,
+        searchScope === 'notebook' ? displayNotebook?.id : undefined,
+      );
+      setSearchResults(result.results);
+    } catch {
+      setSearchResults([]);
+    } finally {
+      setIsSearching(false);
+    }
   };
 
   // ---- PPT ----
@@ -169,7 +336,7 @@ export default function NoteDetail() {
     setAudioUploadError(null);
 
     // Clear transcript before streaming new content
-    transcript.actions.setTranscriptText('');
+    transcript.actions.updateTranscriptText('', false);
 
     const { abort } = uploadAudio(file, sessionId, {
       onChunk: (text) => {
@@ -188,7 +355,7 @@ export default function NoteDetail() {
         }
       },
       onError: (errMsg) => {
-        setAudioUploadError(errMsg);
+        setAudioUploadError(errMsg || '录音上传失败，请确认格式或稍后重试');
         setIsUploadingAudio(false);
         if (audioInputRef.current) audioInputRef.current.value = '';
         audioUploadAbortRef.current = null;
@@ -216,8 +383,8 @@ export default function NoteDetail() {
               <ArrowLeft className="w-5 h-5" />
             </button>
             <div className="min-w-0">
-              <h1 className="text-sm font-semibold text-slate-800 dark:text-slate-200 truncate">{session?.title || '课次'}</h1>
-              <p className="text-xs text-slate-400 truncate">{notebook?.title}</p>
+              <h1 className="text-sm font-semibold text-slate-800 dark:text-slate-200 truncate">{displaySession?.title || '课次'}</h1>
+              <p className="text-xs text-slate-400 truncate">{displayNotebook?.title}</p>
             </div>
           </div>
           <div className="flex items-center gap-2">
@@ -229,11 +396,17 @@ export default function NoteDetail() {
               </button>
               {exportTools.state.showExportMenu && (
                 <div className="absolute right-0 top-full mt-1 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg shadow-lg py-1 z-50 min-w-[140px]">
-                  <button onClick={() => exportTools.actions.exportMarkdown(transcript.state.transcriptText, notesHook.state.notes)}
+                  <button onClick={() => {
+                    const blocks = layoutFromNoteParts(transcript.state.transcriptText, transcript.state.contentBlocks, notesHook.state.notes);
+                    exportTools.actions.exportMarkdown(transcript.state.transcriptText, notesHook.state.notes, blocks);
+                  }}
                     className="w-full text-left px-3 py-2 text-xs text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700 transition-colors">
                     📝 导出 Markdown
                   </button>
-                  <button onClick={() => exportTools.actions.exportPDF(transcript.state.transcriptText, notesHook.state.notes)} disabled={exportTools.state.isExportingPDF}
+                  <button onClick={() => {
+                    const blocks = layoutFromNoteParts(transcript.state.transcriptText, transcript.state.contentBlocks, notesHook.state.notes);
+                    exportTools.actions.exportPDF(transcript.state.transcriptText, notesHook.state.notes, blocks);
+                  }} disabled={exportTools.state.isExportingPDF}
                     className="w-full text-left px-3 py-2 text-xs text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700 transition-colors disabled:opacity-50">
                     {exportTools.state.isExportingPDF ? '⏳ 导出中...' : '📄 导出 PDF'}
                   </button>
@@ -247,6 +420,37 @@ export default function NoteDetail() {
             <button onClick={handleShareSession} className="flex items-center gap-1 px-3 py-2 text-sm text-slate-500 hover:text-blue-600 hover:bg-blue-50 dark:hover:bg-blue-900/20 rounded-lg transition-colors" title="分享">
               <Share2 className="w-3.5 h-3.5" />
             </button>
+            <button onClick={() => setShowSearch(!showSearch)} className={`flex items-center gap-1 px-3 py-2 text-sm rounded-lg transition-colors ${showSearch ? 'text-blue-600 bg-blue-50 dark:bg-blue-900/20' : 'text-slate-500 hover:text-blue-600 hover:bg-blue-50 dark:hover:bg-blue-900/20'}`} title="搜索">
+              <Search className="w-3.5 h-3.5" />
+            </button>
+            <div className="flex items-center gap-1 px-2 py-1 text-xs rounded-lg bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700">
+              {vectorStatus?.status === 'indexed' ? (
+                <>
+                  <Database className="w-3 h-3 text-green-500" />
+                  <span className="text-green-600 dark:text-green-400">已索引 {vectorStatus.chunk_count}条</span>
+                  <button onClick={handleRebuildIndex} disabled={isRebuilding} className="ml-1 text-slate-400 hover:text-blue-500" title="重建索引">
+                    <RefreshCw className={`w-3 h-3 ${isRebuilding ? 'animate-spin' : ''}`} />
+                  </button>
+                </>
+              ) : vectorStatus?.status === 'stale' ? (
+                <>
+                  <Database className="w-3 h-3 text-amber-500" />
+                  <span className="text-amber-600 dark:text-amber-400">内容已变化</span>
+                  <button onClick={handleRebuildIndex} disabled={isRebuilding} className="ml-1 text-amber-500 hover:text-blue-500 font-medium" title="重建索引">
+                    {isRebuilding ? <Loader2 className="w-3 h-3 animate-spin" /> : '重建'}
+                  </button>
+                </>
+              ) : vectorStatus?.status === 'not_indexed' ? (
+                <>
+                  <Database className="w-3 h-3 text-slate-400" />
+                  <button onClick={handleRebuildIndex} disabled={isRebuilding} className="text-slate-500 hover:text-blue-500" title="建立索引">
+                    {isRebuilding ? <Loader2 className="w-3 h-3 animate-spin" /> : '建立索引'}
+                  </button>
+                </>
+              ) : (
+                <span className="text-slate-400">无内容</span>
+              )}
+            </div>
             <ThemeToggle />
             <button onClick={() => navigate('/profile')} className="cursor-pointer">
               {profile?.avatar_url ? (
@@ -289,7 +493,7 @@ export default function NoteDetail() {
                 </button>
               ) : recording.state.isError ? (
                 <button onClick={() => {
-                  if (recording.state.isRecording) recording.actions.stopRecording(transcript.actions.appendTranscriptText);
+                  if (recording.state.isRecording) recording.actions.stopRecording(transcript.actions.receiveAiText);
                 }}
                   className="w-9 h-9 rounded-full bg-gradient-to-br from-red-500 to-red-600 text-white flex items-center justify-center shadow-lg hover:shadow-xl transition-all hover:scale-105 active:scale-95">
                   <AlertCircle className="w-4 h-4" />
@@ -332,7 +536,7 @@ export default function NoteDetail() {
             )}
 
             {recording.state.isRecording && (
-              <button onClick={() => recording.actions.stopRecording(transcript.actions.appendTranscriptText)}
+              <button onClick={() => recording.actions.stopRecording(transcript.actions.receiveAiText)}
                 className="flex items-center gap-1 px-3 py-2 text-sm font-medium rounded-md bg-red-100 dark:bg-red-900/30 text-red-600 dark:text-red-400 hover:bg-red-200 dark:hover:bg-red-900/50 transition-colors min-h-[44px]">
                 <MicOff className="w-3.5 h-3.5" />
                 停止
@@ -361,12 +565,35 @@ export default function NoteDetail() {
         </div>
       </div>
 
+      <div className={`flex-shrink-0 mx-4 mt-3 px-3 py-2 border rounded-xl flex items-center gap-2 text-xs ${statusClass}`}>
+        {(ppt.state.isUploadingPPT || isUploadingAudio || recording.state.isProcessing || transcript.state.isPptMatching || transcript.state.saveStatus === 'saving') && (
+          <Loader2 className="w-3.5 h-3.5 animate-spin flex-shrink-0" />
+        )}
+        <span className="flex-1">{workflowStatus.text}</span>
+        {transcript.state.saveStatus === 'error' && (
+          <button
+            onClick={() => transcript.actions.saveContent(notesHook.state.notes, true)}
+            className="px-2 py-1 rounded-md bg-white/70 dark:bg-slate-900/60 hover:bg-white text-xs font-medium"
+          >
+            重试保存
+          </button>
+        )}
+      </div>
+
       {recording.state.isError && recording.state.errorMessage && (
         <div className="flex-shrink-0 mx-4 mt-3 p-3 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-xl flex items-start gap-2">
           <AlertCircle className="w-4 h-4 text-red-500 flex-shrink-0 mt-0.5" />
           <div className="flex-1"><p className="text-xs text-red-600 dark:text-red-400">{recording.state.errorMessage}</p></div>
           <button onClick={() => { recording.actions.setIsError(false); recording.actions.setErrorMessage(''); }}
             className="p-0.5 text-red-400 hover:text-red-600"><X className="w-3.5 h-3.5" /></button>
+        </div>
+      )}
+
+      {ppt.state.uploadError && (
+        <div className="flex-shrink-0 mx-4 mt-3 p-3 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-xl flex items-start gap-2">
+          <AlertCircle className="w-4 h-4 text-red-500 flex-shrink-0 mt-0.5" />
+          <div className="flex-1"><p className="text-xs text-red-600 dark:text-red-400">{ppt.state.uploadError}</p></div>
+          <button onClick={() => ppt.actions.setUploadError(null)} className="text-red-400 hover:text-red-600"><X className="w-4 h-4" /></button>
         </div>
       )}
 
@@ -383,6 +610,17 @@ export default function NoteDetail() {
         <div className="flex-shrink-0 mx-4 mt-2 flex items-center gap-2 px-3 py-2 bg-blue-50 dark:bg-blue-900/20 border border-blue-100 dark:border-blue-800 rounded-lg text-xs text-blue-600 dark:text-blue-400">
           <Loader2 className="w-3 h-3 animate-spin" />
           AI 正在整理文本...
+        </div>
+      )}
+
+      {transcript.state.pendingAiText && (
+        <div className="flex-shrink-0 mx-4 mt-3 p-3 bg-violet-50 dark:bg-violet-900/20 border border-violet-200 dark:border-violet-800 rounded-xl flex items-start gap-2">
+          <FileText className="w-4 h-4 text-violet-500 flex-shrink-0 mt-0.5" />
+          <div className="flex-1">
+            <p className="text-xs text-violet-700 dark:text-violet-300">有 AI 整理版本可应用，当前编辑内容不会被自动覆盖。</p>
+          </div>
+          <button onClick={transcript.actions.applyPendingAiText} className="px-2 py-1 rounded-md bg-violet-500 text-white text-xs font-medium hover:bg-violet-600">应用</button>
+          <button onClick={transcript.actions.dismissPendingAiText} className="text-violet-400 hover:text-violet-600"><X className="w-4 h-4" /></button>
         </div>
       )}
 
@@ -442,7 +680,7 @@ export default function NoteDetail() {
                   {(() => {
                     const s = ppt.state.slides[ppt.state.activeSlideIndex];
                     const src = s.image_path
-                      ? `${API_BASE}/api/media/slides/${sessionId}/${s.image_path}`
+                      ? getMediaUrl(`/api/media/slides/${sessionId}/${s.image_path}`)
                       : s.image_base64 || '';
                     return src ? (
                       <img src={src} alt={`Slide ${s.page}`}
@@ -471,7 +709,10 @@ export default function NoteDetail() {
               <RichTextEditor
                 ref={noteEditRef}
                 value={notesHook.state.notes.length > 0 ? notesHook.state.notes[0].content : ''}
-                onChange={(text) => notesHook.actions.updateNote(0, text)}
+                onChange={(text) => {
+                  transcript.actions.markUserEdited();
+                  notesHook.actions.updateNote(0, text);
+                }}
                 onFocus={() => {
                   activeTextElRef.current = noteEditRef.current;
                 }}
@@ -616,7 +857,7 @@ export default function NoteDetail() {
                           }}
                         >
                           <img
-                            src={imageBlock.src?.startsWith('data:') ? imageBlock.src : `${API_BASE}${imageBlock.src}`}
+                            src={imageBlock.src?.startsWith('data:') ? imageBlock.src : imageBlock.src ? getMediaUrl(imageBlock.src) : ''}
                             alt={`PPT 第 ${imageBlock.page} 页`}
                             className="w-16 h-12 object-cover rounded-md border border-slate-100 dark:border-slate-600 flex-shrink-0 hover:scale-105 transition-transform"
                             onError={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }}
@@ -630,6 +871,18 @@ export default function NoteDetail() {
                             </div>
                             <p className="text-xs text-slate-400 mt-0.5">点击查看大图</p>
                           </div>
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              const imageBlockIndex = blocks.indexOf(imageBlock);
+                              const nextBlocks = blocks.filter((_, blockIndex) => blockIndex !== imageBlockIndex);
+                              transcript.actions.updateContentBlocks(nextBlocks);
+                            }}
+                            className="min-w-[32px] min-h-[32px] rounded-md text-slate-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20 flex items-center justify-center transition-colors"
+                            title="移除此 PPT 插入"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
                           <ChevronUp className="w-4 h-4 text-slate-400 rotate-90 flex-shrink-0" />
                         </div>
                           <div
@@ -642,7 +895,7 @@ export default function NoteDetail() {
                                 const html = e.currentTarget.innerHTML;
                                 const normalized = (html === '<br>' || html === '<br />') ? '' : html;
                                 newBlocks[textBlockIndex] = { ...newBlocks[textBlockIndex], content: normalized };
-                                transcript.actions.setContentBlocks(newBlocks);
+                                transcript.actions.updateContentBlocks(newBlocks);
                               }
                             }}
                             className="p-4 text-sm text-slate-600 dark:text-slate-300 leading-relaxed whitespace-pre-line focus:outline-none min-h-[60px]"
@@ -664,7 +917,7 @@ export default function NoteDetail() {
                               const html = e.currentTarget.innerHTML;
                               const normalized = (html === '<br>' || html === '<br />') ? '' : html;
                               newBlocks[textBlockIndex] = { ...newBlocks[textBlockIndex], content: normalized };
-                              transcript.actions.setContentBlocks(newBlocks);
+                              transcript.actions.updateContentBlocks(newBlocks);
                             }
                           }}
                           className="w-full p-4 text-sm text-slate-600 dark:text-slate-300 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-600 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-200 leading-relaxed whitespace-pre-line min-h-[60px]"
@@ -681,7 +934,7 @@ export default function NoteDetail() {
                 <RichTextEditor
                   ref={transcriptEditRef}
                   value={transcript.state.transcriptText}
-                  onChange={(text) => { transcript.actions.setTranscriptText(text); }}
+                  onChange={(text) => { transcript.actions.updateTranscriptText(text); }}
                   onFocus={() => {
                     activeTextElRef.current = transcriptEditRef.current;
                   }}
@@ -707,7 +960,7 @@ export default function NoteDetail() {
                       parts.push(html);
                     }
                   }
-                  transcript.actions.setTranscriptText(parts.join('\n\n'));
+                  transcript.actions.updateTranscriptText(parts.join('\n\n'));
                   // Clear sentence-time mapping because the edited text no longer
                   // matches the original timestamps from the audio transcript
                   if (transcript.state.sentencesWithTime.length > 0) {
@@ -743,6 +996,67 @@ export default function NoteDetail() {
         </main>
       </div>
 
+      {showSearch && (
+        <div className="fixed inset-0 z-50 flex items-start justify-center pt-20 bg-black/30 backdrop-blur-sm" onClick={() => setShowSearch(false)}>
+          <div className="bg-white dark:bg-slate-800 rounded-2xl shadow-xl w-full max-w-lg mx-4 overflow-hidden" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center gap-2 p-4 border-b border-slate-200 dark:border-slate-700">
+              <Search className="w-4 h-4 text-slate-400" />
+              <input
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Enter') handleSearch(); }}
+                placeholder="搜索关键词..."
+                className="flex-1 text-sm bg-transparent outline-none text-slate-700 dark:text-slate-200 placeholder:text-slate-400"
+                autoFocus
+              />
+              <div className="flex items-center rounded-lg border border-slate-200 dark:border-slate-600 overflow-hidden">
+                <button onClick={() => setSearchScope('session')} className={`px-2 py-1 text-[10px] font-medium transition-colors ${searchScope === 'session' ? 'bg-blue-500 text-white' : 'text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-700'}`}>本课次</button>
+                <button onClick={() => setSearchScope('notebook')} className={`px-2 py-1 text-[10px] font-medium transition-colors ${searchScope === 'notebook' ? 'bg-blue-500 text-white' : 'text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-700'}`}>本课程</button>
+              </div>
+              <button onClick={handleSearch} disabled={isSearching} className="px-3 py-1.5 text-xs font-medium text-white bg-blue-500 rounded-lg hover:bg-blue-600 disabled:opacity-50">
+                {isSearching ? '...' : '搜索'}
+              </button>
+            </div>
+            <div className="max-h-80 overflow-y-auto">
+              {searchResults.length > 0 ? (
+                <div className="divide-y divide-slate-100 dark:divide-slate-700">
+                  {searchResults.map((r) => (
+                    <button
+                      key={r.chunk_id}
+                      onClick={() => {
+                        if (r.session_id !== sessionId) {
+                          navigate(`/subject/${r.notebook_id}/session/${r.session_id}`);
+                        }
+                        setShowSearch(false);
+                      }}
+                      className="w-full text-left px-4 py-3 hover:bg-slate-50 dark:hover:bg-slate-700/50 transition-colors"
+                    >
+                      <div className="flex items-center gap-2 mb-1">
+                        <span className={`text-[10px] px-1.5 py-0.5 rounded font-medium ${
+                          r.source_type === 'transcript' ? 'bg-blue-50 text-blue-600 dark:bg-blue-900/30 dark:text-blue-400' :
+                          r.source_type === 'ppt' ? 'bg-purple-50 text-purple-600 dark:bg-purple-900/30 dark:text-purple-400' :
+                          r.source_type === 'note' ? 'bg-amber-50 text-amber-600 dark:bg-amber-900/30 dark:text-amber-400' :
+                          'bg-slate-50 text-slate-600 dark:bg-slate-700 dark:text-slate-400'
+                        }`}>
+                          {r.source_type === 'transcript' ? '转写' : r.source_type === 'ppt' ? 'PPT' : r.source_type === 'note' ? '笔记' : r.source_type}
+                        </span>
+                        <span className="text-xs text-slate-500 dark:text-slate-400 truncate">{r.session_title}</span>
+                        <span className="ml-auto text-[10px] text-slate-400">{(r.score * 100).toFixed(0)}%</span>
+                      </div>
+                      <p className="text-xs text-slate-600 dark:text-slate-300 line-clamp-2">{r.snippet}</p>
+                    </button>
+                  ))}
+                </div>
+              ) : searchQuery && !isSearching ? (
+                <div className="px-4 py-8 text-center text-xs text-slate-400">未找到相关内容</div>
+              ) : (
+                <div className="px-4 py-8 text-center text-xs text-slate-400">输入关键词搜索{searchScope === 'session' ? '当前课次' : '当前课程'}</div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
       {showShareModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm" onClick={() => setShowShareModal(false)}>
           <div className="bg-white dark:bg-slate-800 rounded-2xl shadow-xl p-6 w-full max-w-md mx-4" onClick={(e) => e.stopPropagation()}>
@@ -750,11 +1064,31 @@ export default function NoteDetail() {
               <h3 className="text-base font-semibold text-slate-800 dark:text-slate-200">分享课次</h3>
               <button onClick={() => setShowShareModal(false)} className="p-1 rounded-lg text-slate-400 hover:text-slate-600 hover:bg-slate-100 dark:hover:bg-slate-700 transition-colors"><X className="w-4 h-4" /></button>
             </div>
-            <div className="flex items-center gap-2 mb-4">
-              <input readOnly value={shareLink} className="flex-1 px-3 py-2 text-sm border border-slate-200 dark:border-slate-600 rounded-lg bg-slate-50 dark:bg-slate-900 text-slate-600 dark:text-slate-300" />
-              <button onClick={() => { navigator.clipboard.writeText(shareLink); setCopySuccess(true); setTimeout(() => setCopySuccess(false), 3000); }}
-                className="px-3 py-2 text-sm font-medium text-white bg-blue-500 rounded-lg hover:bg-blue-600 transition-colors">{copySuccess ? '已复制' : '复制'}</button>
-            </div>
+            {shareLoading ? (
+              <div className="flex items-center justify-center py-8">
+                <Loader2 className="w-5 h-5 animate-spin text-slate-400" />
+              </div>
+            ) : shareEnabled && shareLink ? (
+              <>
+                <div className="flex items-center gap-2 mb-3">
+                  <span className="w-2 h-2 rounded-full bg-green-400" />
+                  <span className="text-xs text-green-600 dark:text-green-400">分享已开启</span>
+                </div>
+                <div className="flex items-center gap-2 mb-4">
+                  <input readOnly value={shareLink} className="flex-1 px-3 py-2 text-sm border border-slate-200 dark:border-slate-600 rounded-lg bg-slate-50 dark:bg-slate-900 text-slate-600 dark:text-slate-300" />
+                  <button onClick={() => { navigator.clipboard.writeText(shareLink); setCopySuccess(true); setTimeout(() => setCopySuccess(false), 3000); }}
+                    className="px-3 py-2 text-sm font-medium text-white bg-blue-500 rounded-lg hover:bg-blue-600 transition-colors">{copySuccess ? '已复制' : '复制'}</button>
+                </div>
+                <button onClick={handleDisableShare} className="w-full py-2 text-sm text-red-500 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-900/20 rounded-lg transition-colors">
+                  关闭分享
+                </button>
+              </>
+            ) : (
+              <div className="text-center py-4">
+                <p className="text-sm text-slate-500 dark:text-slate-400 mb-4">开启分享失败，请重试</p>
+                <button onClick={handleShareSession} className="px-4 py-2 text-sm font-medium text-white bg-blue-500 rounded-lg hover:bg-blue-600 transition-colors">重试</button>
+              </div>
+            )}
           </div>
         </div>
       )}

@@ -155,7 +155,7 @@ async def upload_ppt(
                 detail=f"PPT file too large: {file_size} bytes (max {MAX_PPT_FILE_SIZE} bytes)"
             )
 
-        ppt_path = save_file("ppt", session_id, file.filename, file_bytes)
+        ppt_path = save_file("ppt", session_id, file.filename or f"upload{file_ext}", file_bytes)
         ppt_path_str = str(ppt_path)
 
         # Render slides to disk files (not base64 in DB)
@@ -229,6 +229,14 @@ def align_ppt_with_text(
     """
     if not session_id or not text:
         raise HTTPException(status_code=400, detail="session_id and text are required")
+
+    session = db.query(DBSession).filter(
+        DBSession.id == session_id
+    ).join(Notebook).filter(
+        Notebook.user_id == current_user.id
+    ).first()
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
 
     # Get note with PPT data
     note = db.query(Note).filter(Note.session_id == session_id).first()

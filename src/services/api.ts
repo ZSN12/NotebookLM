@@ -1,11 +1,21 @@
 import type { Notebook, Session } from '@/types';
 import { getToken, clearToken } from './auth';
 import { API_BASE } from '@/config';
+import type { NoteLayoutBlock } from '@/lib/noteLayout';
 export { API_BASE };
 
 function authHeaders(): Record<string, string> {
   const token = getToken();
   return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
+export function getMediaUrl(pathOrUrl: string): string {
+  const token = getToken();
+  const url = pathOrUrl.startsWith('http') ? new URL(pathOrUrl) : new URL(`${API_BASE}${pathOrUrl}`);
+  if (token) {
+    url.searchParams.set('token', token);
+  }
+  return url.toString();
 }
 
 export interface BackendNotebook {
@@ -36,6 +46,7 @@ export interface BackendNote {
   transcript: any[] | null;
   ppt_images: any[] | null;
   vocabulary: any[] | null;
+  layout_blocks?: NoteLayoutBlock[] | null;
   created_at: string;
 }
 
@@ -163,6 +174,13 @@ export async function fetchSessionDetail(notebookId: string): Promise<BackendSes
     const data = await request<BackendSession[]>(`/api/sessions?notebook_id=${notebookId}`);
     return data;
   } catch { return []; }
+}
+
+export async function fetchSessionById(sessionId: string): Promise<Session | null> {
+  try {
+    const data = await request<BackendSession>(`/api/sessions/${sessionId}`);
+    return mapBackendSession(data);
+  } catch { return null; }
 }
 
 export async function createSession(notebookId: string, title: string): Promise<Session> {
@@ -296,11 +314,11 @@ export async function fetchNote(sessionId: string): Promise<BackendNote | null> 
   } catch { return null; }
 }
 
-export async function updateNote(sessionId: string, content: string): Promise<BackendNote | null> {
+export async function updateNote(sessionId: string, content: string, layoutBlocks?: NoteLayoutBlock[]): Promise<BackendNote | null> {
   try {
     const data = await request<BackendNote>(`/api/notes/session/${sessionId}`, {
       method: 'PUT',
-      body: JSON.stringify({ content }),
+      body: JSON.stringify({ content, layout_blocks: layoutBlocks }),
     });
     return data;
   } catch { return null; }
@@ -319,7 +337,7 @@ export async function finishRecording(sessionId: string): Promise<{ status: stri
 }
 
 export function getAudioUrl(sessionId: string): string {
-  return `${API_BASE}/api/media/audio/${sessionId}.wav`;
+  return getMediaUrl(`/api/media/audio/${sessionId}.wav`);
 }
 
 export async function deleteAudio(sessionId: string): Promise<boolean> {
@@ -436,4 +454,94 @@ export async function exportNotebook(notebookId: string): Promise<any> {
     throw new Error(err.detail || '导出失败');
   }
   return res.json();
+}
+
+// Share API
+export async function enableShare(sessionId: string): Promise<{ share_enabled: boolean; share_token: string; share_url: string }> {
+  const token = getToken();
+  const res = await fetch(`${API_BASE}/api/sessions/${sessionId}/share/enable`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: '开启分享失败' }));
+    throw new Error(err.detail || '开启分享失败');
+  }
+  return res.json();
+}
+
+export async function disableShare(sessionId: string): Promise<{ share_enabled: boolean }> {
+  const token = getToken();
+  const res = await fetch(`${API_BASE}/api/sessions/${sessionId}/share/disable`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: '关闭分享失败' }));
+    throw new Error(err.detail || '关闭分享失败');
+  }
+  return res.json();
+}
+
+export async function getShareStatus(sessionId: string): Promise<{ share_enabled: boolean; share_token: string | null; share_url: string | null }> {
+  const token = getToken();
+  const res = await fetch(`${API_BASE}/api/sessions/${sessionId}/share/status`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: '获取分享状态失败' }));
+    throw new Error(err.detail || '获取分享状态失败');
+  }
+  return res.json();
+}
+
+export function getShareMediaUrl(pathOrUrl: string, shareToken: string): string {
+  if (pathOrUrl.startsWith('data:')) return pathOrUrl;
+  const url = pathOrUrl.replace('/api/media/slides/', '/api/public/media/slides/');
+  const fullUrl = new URL(url.startsWith('http') ? url : `${API_BASE}${url}`);
+  fullUrl.searchParams.set('token', shareToken);
+  return fullUrl.toString();
+}
+
+// Vector API
+export interface VectorIndexStatus {
+  session_id: string;
+  chunk_count: number;
+  has_content: boolean;
+  status: 'indexed' | 'not_indexed' | 'empty' | 'stale';
+}
+
+export interface VectorSearchResult {
+  chunk_id: string;
+  notebook_id: string;
+  notebook_title: string;
+  session_id: string;
+  session_title: string;
+  source_type: string;
+  snippet: string;
+  score: number;
+  metadata: Record<string, any>;
+}
+
+export async function rebuildSessionVectorIndex(sessionId: string): Promise<{ session_id: string; chunk_count: number; status: string }> {
+  const res = await request<any>(`/api/vector/session/${sessionId}/rebuild`, { method: 'POST' });
+  return res;
+}
+
+export async function rebuildNotebookVectorIndex(notebookId: string): Promise<{ notebook_id: string; chunk_count: number; status: string }> {
+  const res = await request<any>(`/api/vector/notebook/${notebookId}/rebuild`, { method: 'POST' });
+  return res;
+}
+
+export async function getSessionVectorStatus(sessionId: string): Promise<VectorIndexStatus> {
+  const res = await request<any>(`/api/vector/session/${sessionId}/status`);
+  return res;
+}
+
+export async function searchVectors(query: string, sessionId?: string, notebookId?: string, limit: number = 20): Promise<{ results: VectorSearchResult[]; total: number }> {
+  const res = await request<any>('/api/vector/search', {
+    method: 'POST',
+    body: JSON.stringify({ query, session_id: sessionId, notebook_id: notebookId, limit }),
+  });
+  return res;
 }

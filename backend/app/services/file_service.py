@@ -4,13 +4,24 @@ import os
 from pathlib import Path
 from app.config import AUDIO_DIR, PPT_DIR, IMAGE_DIR, MAX_AUDIO_SIZE, MAX_PPT_SIZE
 
+def _safe_upload_name(file_name: str) -> str:
+    """Return a filesystem-safe basename for an uploaded file."""
+    original = Path(file_name or "upload").name
+    safe_name = "".join(ch if ch.isalnum() or ch in "._- " else "_" for ch in original).strip()
+    return safe_name or "upload"
+
 def get_upload_path(file_type: str, session_id: str, file_name: str) -> Path:
     """Get the absolute upload path for a file."""
-    if file_type == "audio":
-        return AUDIO_DIR / f"{session_id}_{file_name}"
-    elif file_type == "ppt":
-        return PPT_DIR / f"{session_id}_{file_name}"
-    raise ValueError(f"Invalid file type: {file_type}")
+    safe_name = _safe_upload_name(file_name)
+    directory = AUDIO_DIR if file_type == "audio" else PPT_DIR if file_type == "ppt" else None
+    if directory is None:
+        raise ValueError(f"Invalid file type: {file_type}")
+
+    target = (directory / f"{session_id}_{uuid.uuid4().hex}_{safe_name}").resolve()
+    base = directory.resolve()
+    if not target.is_relative_to(base):
+        raise ValueError("Invalid upload path")
+    return target
 
 def get_image_dir(session_id: str) -> Path:
     """Get the image output directory for a session."""

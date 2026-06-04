@@ -46,7 +46,8 @@ export interface SessionNoteBundle {
   keywords?: string[];
   content?: string;
   transcript?: any[];
-  ppt_images?: string[];
+  ppt_images?: any[];
+  layout_blocks?: import('@/lib/noteLayout').NoteLayoutBlock[];
 }
 
 export interface NotebookPackage {

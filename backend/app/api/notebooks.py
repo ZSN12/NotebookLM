@@ -117,10 +117,12 @@ def export_notebook(
             bundle["content"] = note.content
             bundle["transcript"] = note.transcript
             bundle["ppt_images"] = note.ppt_images
+            bundle["layout_blocks"] = note.layout_blocks
         else:
             bundle["content"] = None
             bundle["transcript"] = None
             bundle["ppt_images"] = None
+            bundle["layout_blocks"] = None
 
         sessions_data.append(bundle)
 
@@ -132,7 +134,7 @@ def export_notebook(
     }
 
     return {
-        "format_version": 1,
+        "format_version": 2,
         "notebook": notebook_create,
         "sessions": sessions_data,
     }
@@ -144,7 +146,7 @@ def import_notebook(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    if data.format_version != 1:
+    if data.format_version not in (1, 2):
         raise HTTPException(status_code=400, detail="Unsupported notebook package version")
 
     notebook = Notebook(user_id=current_user.id, **data.notebook.model_dump())
@@ -157,8 +159,10 @@ def import_notebook(
         db.flush()
         notebook.session_count += 1
 
-        if sess_data.content or sess_data.transcript or sess_data.ppt_images:
+        if sess_data.content or sess_data.transcript or sess_data.ppt_images or sess_data.layout_blocks:
             note = Note(session_id=session.id, content=sess_data.content or "", transcript=sess_data.transcript, ppt_images=sess_data.ppt_images)
+            if sess_data.layout_blocks is not None:
+                note.layout_blocks = sess_data.layout_blocks
             db.add(note)
 
     db.commit()
