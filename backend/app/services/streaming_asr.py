@@ -181,7 +181,7 @@ class StreamingRecognizer:
                     self.keywords,
                 )
                 ai_text = (ai_text or "").strip()
-                if ai_text and corrector.preserves_source_content(local_display, ai_text, min_ratio=0.65):
+                if ai_text and corrector.preserves_source_content(local_display, ai_text, min_ratio=0.50):
                     display_text = corrector.clean_transcript_for_display(ai_text).strip() or ai_text
                     is_ai_corrected = True
                 else:

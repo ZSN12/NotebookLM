@@ -103,10 +103,14 @@ def correct_uncorrected_transcripts_from_data(
             keywords=keywords,
             ppt_slides=ppt_slides,
         )
+        logger.info(
+            "transcript_correction_llm_raw session_id=%s input_len=%s output_len=%s output_preview=%r",
+            session_id, len(full_text), len(corrected or ""), (corrected or "")[:120],
+        )
 
         base_for_display = full_text
         if corrected and corrected != full_text:
-            if corrector.preserves_source_content(full_text, corrected, min_ratio=0.70):
+            if corrector.preserves_source_content(full_text, corrected, min_ratio=0.50):
                 logger.info(
                     "transcript_correction_llm_accepted session_id=%s source_chars=%s corrected_chars=%s",
                     session_id,

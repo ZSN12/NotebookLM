@@ -613,6 +613,7 @@ export default function NoteDetail() {
   const audioUploadAbortRef = useRef<(() => void) | null>(null);
 
   const handleAudioUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    console.log('[handleAudioUpload] called', e.target.files?.[0]?.name);
     const file = e.target.files?.[0];
     if (!file || !sessionId) return;
 
@@ -806,7 +807,7 @@ export default function NoteDetail() {
             {ppt.state.slides.length > 0 && <span className="text-xs text-slate-400">{ppt.state.slides.length} 页</span>}
 
             <input ref={audioInputRef} type="file" accept=".wav,.mp3,.webm,.m4a,.ogg,.flac" onChange={handleAudioUpload} className="hidden" />
-            <button onClick={() => audioInputRef.current?.click()} disabled={isUploadingAudio}
+            <button onClick={() => { if (audioInputRef.current) audioInputRef.current.value = ''; audioInputRef.current?.click(); }} disabled={isUploadingAudio}
               className="flex items-center gap-1 px-2.5 py-1.5 text-xs text-slate-600 dark:text-slate-300 bg-white dark:bg-slate-700 border border-slate-200 dark:border-slate-600 rounded-lg hover:border-green-300 hover:text-green-600 transition-all disabled:opacity-50">
               {isUploadingAudio ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Mic className="w-3.5 h-3.5" />}
               {isUploadingAudio ? '上传中...' : '上传录音'}

@@ -1,8 +1,12 @@
 import re
+import time
+import logging
 from difflib import SequenceMatcher
 from typing import List, Optional
 from app.config import DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL
 from app.services.prompt_loader import load_prompt
+
+logger = logging.getLogger(__name__)
 
 
 _REPEATED_COMMA = re.compile(r'(，\s*){2,}')
@@ -14,12 +18,16 @@ class TermCorrector:
 
     def __init__(self):
         self._client = None
+        logger.info("termcorrector_init api_key_present=%s base_url=%s", bool(DEEPSEEK_API_KEY), DEEPSEEK_BASE_URL)
         if DEEPSEEK_API_KEY:
             try:
                 from openai import OpenAI
                 self._client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
-            except ImportError:
-                pass
+                logger.info("termcorrector_init openai_client_created")
+            except Exception as exc:
+                logger.warning("termcorrector_init openai_client_failed error=%s", exc)
+        else:
+            logger.warning("termcorrector_init no_api_key")
 
     @property
     def has_llm(self) -> bool:
@@ -135,7 +143,14 @@ class TermCorrector:
         )
 
         result = self._call_llm(prompt, prompt_template.system, temperature=0.2)
-        return result if result and result.strip() else text
+        if not result or not result.strip():
+            logger.info("restructure_transcript_llm_empty_return course=%s text_len=%s", course_title, len(text))
+            return text
+        logger.info(
+            "restructure_transcript_done course=%s input_len=%s output_len=%s changed=%s",
+            course_title, len(text), len(result), result.strip() != text.strip(),
+        )
+        return result
 
     def correct_segments(
         self, text: str, course_title: str, keywords: Optional[List[str]] = None,
@@ -637,12 +652,27 @@ class TermCorrector:
     # Content preservation — now uses deduped baseline, not raw
     # ──────────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _core_terms(text: str) -> set[str]:
+        """Extract content-bearing terms for overlap checking."""
+        # Chinese characters (2+) and alphanumeric sequences
+        terms = re.findall(r'[a-zA-Z0-9]+|[一-鿿]{2,}', text or "")
+        # Exclude common oral fillers that carry no knowledge
+        fillers = {
+            '我们', '你们', '大家', '这个', '那个', '就是', '然后', '那么',
+            '因为', '所以', '但是', '不过', '如果', '什么', '怎么', '一个',
+            '可以', '就是', '这样', '那样', '现在', '今天', '这边',
+        }
+        return {t for t in terms if t not in fillers}
+
     @classmethod
     def preserves_source_content(cls, raw_source: str, candidate: str, min_ratio: float = 0.80) -> bool:
         """Check that candidate didn't delete real content vs raw_source.
 
         Uses the *deterministically cleaned* version of raw_source as the
         baseline so filler removal & dedup don't falsely trigger rejection.
+        Also checks core-term coverage so legitimate corrections that drop
+        fillers aren't rejected.
         """
         if cls.looks_like_summary(candidate, raw_source):
             return False
@@ -658,7 +688,21 @@ class TermCorrector:
             return False
         if baseline_len < 30:
             return candidate_len >= max(1, int(baseline_len * 0.6))
-        return candidate_len >= int(baseline_len * min_ratio)
+
+        # Primary: length ratio (already accounts for filler removal)
+        length_ok = candidate_len >= int(baseline_len * min_ratio)
+
+        # Secondary: core term coverage — if length is short, check that
+        # most content-bearing terms (Chinese words + English/code) survived
+        core_baseline = cls._core_terms(baseline)
+        core_candidate = cls._core_terms(candidate or "")
+        if core_baseline:
+            covered = len(core_baseline & core_candidate) / len(core_baseline)
+            core_ok = covered >= 0.75  # 75% core terms must survive
+        else:
+            core_ok = True
+
+        return length_ok or core_ok
 
     @staticmethod
     def looks_like_summary(candidate: str, source: str = "") -> bool:
@@ -685,6 +729,13 @@ class TermCorrector:
     # ──────────────────────────────────────────────────────────────────
 
     def _call_llm(self, prompt: str, system_msg: str, temperature: float = 0.2) -> str:
+        import logging
+        _logger = logging.getLogger(__name__)
+        _logger.info(
+            "termcorrector_llm_call model=%s prompt_len=%s system_len=%s",
+            DEEPSEEK_MODEL, len(prompt), len(system_msg),
+        )
+        t0 = time.time()
         response = self._client.chat.completions.create(
             model=DEEPSEEK_MODEL,
             messages=[
@@ -693,9 +744,14 @@ class TermCorrector:
             ],
             temperature=temperature,
         )
+        elapsed = time.time() - t0
         content = response.choices[0].message.content.strip()
         content = re.sub(r'^```(?:\w+)?\n', '', content, flags=re.MULTILINE)
         content = re.sub(r'\n?```\s*$', '', content, flags=re.MULTILINE)
+        _logger.info(
+            "termcorrector_llm_response elapsed=%.2fs content_len=%s content_preview=%r",
+            elapsed, len(content), content[:120],
+        )
         return content.strip()
 
 

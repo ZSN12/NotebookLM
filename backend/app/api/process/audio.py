@@ -72,6 +72,10 @@ async def _correct_window_for_stream(
         }
 
     try:
+        logger.info(
+            "correct_window_llm_start text_len=%s course=%s keywords=%s",
+            len(local_text), course_title, len(keywords),
+        )
         ai_text = await asyncio.wait_for(
             asyncio.to_thread(
                 corrector.restructure_transcript,
@@ -83,11 +87,15 @@ async def _correct_window_for_stream(
             timeout=timeout_seconds,
         )
         ai_text = (ai_text or "").strip()
+        logger.info(
+            "correct_window_llm_done text_len=%s ai_len=%s",
+            len(local_text), len(ai_text),
+        )
         if not ai_text:
             raise ValueError("DeepSeek returned empty text")
 
         ai_display = corrector.clean_transcript_for_display(ai_text).strip() or ai_text
-        if not corrector.preserves_source_content(local_text, ai_display, min_ratio=0.60):
+        if not corrector.preserves_source_content(local_text, ai_display, min_ratio=0.50):
             return {
                 "text": local_text,
                 "raw_text": cleaned,
@@ -178,7 +186,7 @@ async def _finalize_display_text_for_stream(
             raise ValueError("DeepSeek returned empty final text")
 
         ai_display = corrector.clean_transcript_for_display(ai_text).strip() or ai_text
-        if not corrector.preserves_source_content(local_display, ai_display, min_ratio=0.65):
+        if not corrector.preserves_source_content(local_display, ai_display, min_ratio=0.50):
             return {
                 "text": local_display,
                 "is_ai_corrected": False,
@@ -574,6 +582,8 @@ async def process_audio_batch_stream(
     notebook = db.query(Notebook).filter(Notebook.id == session.notebook_id).first()
     course_title = notebook.title if notebook else ""
     keywords = session.keywords or []
+
+    print(f"[AUDIO-BATCH] session_id={session_id} course={course_title} keywords={keywords} file={file.filename}", flush=True)
 
     # Read file
     audio_bytes = await file.read()

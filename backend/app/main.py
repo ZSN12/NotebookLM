@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 from pathlib import Path
 import jwt
@@ -15,6 +16,14 @@ from app.middleware.rate_limit import RateLimitMiddleware
 from app.middleware.csrf import CSRFMiddleware
 from app.models import Base, Notebook, Session as DBSession, User
 from app.config import SLIDE_DIR, AUDIO_DIR, ALLOWED_ORIGINS, ADMIN_DEFAULT_EMAIL, ADMIN_DEFAULT_PASSWORD, SECRET_KEY, ALGORITHM
+
+# ── Logging ──
+_LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, _LOG_LEVEL, logging.INFO),
+    format="%(asctime)s %(levelname)-5s [%(name)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
 
 app = FastAPI(title="AI Notebook", version="0.1.0")
 
