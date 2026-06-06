@@ -8,6 +8,8 @@ export interface StudentNote {
 export interface TranscriptEntry {
   chunk_index: number;
   text: string;
+  raw_text?: string;
+  display_text?: string;
   timestamps: any[];
   is_corrected?: boolean;
   is_restructured?: boolean;

@@ -1,57 +1,85 @@
-# React + TypeScript + Vite
+# Nootbook
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+AI-assisted course notebook for recording lectures, transcribing audio, aligning PPT slides, searching course content, sharing sessions, and generating knowledge mind maps.
 
-Currently, two official plugins are available:
+## Tech Stack
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Babel](https://babeljs.io/) for Fast Refresh
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/) for Fast Refresh
+- Frontend: React 18, TypeScript, Vite, Tailwind CSS
+- Backend: FastAPI, SQLAlchemy, SQLite by default
+- AI/audio: FunASR, OpenAI-compatible DeepSeek API, local lightweight vector search
 
-## Expanding the ESLint configuration
+## Quick Start
 
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
+Install frontend dependencies:
 
-```js
-export default tseslint.config({
-  extends: [
-    // Remove ...tseslint.configs.recommended and replace with this
-    ...tseslint.configs.recommendedTypeChecked,
-    // Alternatively, use this for stricter rules
-    ...tseslint.configs.strictTypeChecked,
-    // Optionally, add this for stylistic rules
-    ...tseslint.configs.stylisticTypeChecked,
-  ],
-  languageOptions: {
-    // other options...
-    parserOptions: {
-      project: ['./tsconfig.node.json', './tsconfig.app.json'],
-      tsconfigRootDir: import.meta.dirname,
-    },
-  },
-})
+```bash
+npm install
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+Install backend dependencies:
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
-
-export default tseslint.config({
-  extends: [
-    // other configs...
-    // Enable lint rules for React
-    reactX.configs['recommended-typescript'],
-    // Enable lint rules for React DOM
-    reactDom.configs.recommended,
-  ],
-  languageOptions: {
-    // other options...
-    parserOptions: {
-      project: ['./tsconfig.node.json', './tsconfig.app.json'],
-      tsconfigRootDir: import.meta.dirname,
-    },
-  },
-})
+```bash
+cd backend
+pip install -r requirements.txt
 ```
+
+Create a `.env` file for backend settings as needed:
+
+```bash
+SECRET_KEY=replace-with-at-least-32-characters
+ADMIN_DEFAULT_EMAIL=admin
+ADMIN_DEFAULT_PASSWORD=admin123
+DATABASE_URL=sqlite:///./nootbook.db
+DEEPSEEK_API_KEY=your-key
+DEEPSEEK_BASE_URL=https://api.deepseek.com
+DEEPSEEK_MODEL=deepseek-chat
+```
+
+Run the backend:
+
+```bash
+cd backend
+uvicorn app.main:app --reload
+```
+
+Run the frontend in another terminal:
+
+```bash
+npm run dev
+```
+
+## Useful Commands
+
+Frontend checks:
+
+```bash
+npm run build
+npm run check
+npm run lint
+```
+
+Backend tests:
+
+```bash
+python -m pytest backend/tests
+```
+
+On this Windows workspace, use the installed Python 3.10 directly if the WindowsApps Python launcher is first on `PATH`:
+
+```bash
+C:\Users\root\AppData\Local\Programs\Python\Python310\python.exe -m pytest backend/tests
+```
+
+## Common Issues
+
+- Mind map generation stays in progress: confirm `DEEPSEEK_API_KEY`, `DEEPSEEK_BASE_URL`, and network access. The API is asynchronous, so the frontend polls until `ready` or `error`.
+- Audio upload fails: confirm microphone permission, file size limits, and that FFmpeg or pydub can convert uploaded audio formats.
+- PPT upload fails: confirm the uploaded file is a valid `.pptx` and backend dependencies are installed.
+- Search returns no results: rebuild the vector index for the session after editing transcript, notes, or PPT content.
+- Login fails in local tests: the app creates the default admin user from `ADMIN_DEFAULT_EMAIL` and `ADMIN_DEFAULT_PASSWORD` during startup.
+
+## Notes
+
+- Generated media is stored under backend asset directories configured in `app.config`.
+- Knowledge mind maps are stored inside the note vocabulary JSON as `kind="mind_map"`.
+- Vector search is local and lightweight; it does not require an external vector database.

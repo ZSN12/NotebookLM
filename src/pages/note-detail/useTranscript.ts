@@ -3,6 +3,8 @@ import { fetchNote, updateNote as apiUpdateNote, insertPPTIntoTranscript, Conten
 import { contentBlocksFromLayout, layoutFromNoteParts, normalizeHtmlText } from '@/lib/noteLayout';
 
 const CORRECTION_POLL_MS = 12000;
+const FINAL_CORRECTION_POLL_MS = 2500;
+const FINAL_CORRECTION_MAX_ATTEMPTS = 18;
 const PPT_INSERT_INITIAL_MS = 8000;
 const PPT_INSERT_INTERVAL_MS = 12000;
 
@@ -37,9 +39,12 @@ export function useTranscript(
   const [loadedNote, setLoadedNote] = useState<any>(null);
   const [isLoaded, setIsLoaded] = useState(false);
   const [hasLocalChanges, setHasLocalChanges] = useState(false);
+  const [partialText, setPartialText] = useState('');
+  const [streamingFinals, setStreamingFinals] = useState<string[]>([]);
   const prevTranscriptRef = useRef('');
   const userEditedRef = useRef(false);
   const hasLocalChangesRef = useRef(false);
+  const streamChunksRef = useRef<Map<string, string>>(new Map());
 
   const markLocalChanged = useCallback((isUserEdit = true) => {
     if (isUserEdit) userEditedRef.current = true;
@@ -49,6 +54,26 @@ export function useTranscript(
   }, []);
 
   const normalizeEditableHtml = useCallback((s: string) => normalizeHtmlText(s), []);
+
+  const dedupeKey = useCallback((value: string) => {
+    return normalizeEditableHtml(value)
+      .toLowerCase()
+      .replace(/[\s，。！？,.!?；;：:、"'“”‘’（）()《》<>【】\[\]\-—_]+/g, '');
+  }, [normalizeEditableHtml]);
+
+  const isRepeatedText = useCallback((candidate: string, previous: string) => {
+    const cand = dedupeKey(candidate);
+    const prev = dedupeKey(previous);
+    if (cand.length < 6 || prev.length < 6) return false;
+    if (cand === prev) return true;
+    const [shorter, longer] = cand.length <= prev.length ? [cand, prev] : [prev, cand];
+    if (shorter.length >= 8 && longer.includes(shorter)) {
+      return shorter.length / longer.length >= 0.55 || longer.length - shorter.length <= 10;
+    }
+    const overlap = Array.from(shorter).filter((char) => longer.includes(char)).length / shorter.length;
+    if (shorter.length <= 20) return overlap >= 0.78;
+    return overlap >= 0.88;
+  }, [dedupeKey]);
 
   const cleanTranscriptText = useCallback((value: string) => {
     return normalizeEditableHtml(value)
@@ -77,33 +102,116 @@ export function useTranscript(
     setTranscriptText(value);
   }, [markLocalChanged]);
 
+  const clearStreamingTranscriptChunks = useCallback(() => {
+    streamChunksRef.current.clear();
+  }, []);
+
+  const upsertStreamingTranscriptChunk = useCallback((chunkId: string, text: string) => {
+    const cleaned = text.trim();
+    if (!chunkId || !cleaned) return;
+    markLocalChanged(false);
+    setSentencesWithTime([]);
+    setActiveSentenceIndex(null);
+    streamChunksRef.current.set(chunkId, cleaned);
+    const dedupedParts: string[] = [];
+    for (const part of Array.from(streamChunksRef.current.values()).filter(Boolean)) {
+      if (dedupedParts.some(prev => isRepeatedText(part, prev))) continue;
+      dedupedParts.push(part);
+    }
+    setTranscriptText(dedupedParts.join('\n\n'));
+  }, [isRepeatedText, markLocalChanged]);
+
   const updateContentBlocks = useCallback((blocks: ContentBlock[], markUserEdit = true, markLocalChange = markUserEdit) => {
     if (markLocalChange) markLocalChanged(markUserEdit);
     else setSaveStatus('idle');
     setContentBlocks(blocks);
   }, [markLocalChanged]);
 
-  const receiveAiText = useCallback((value: string) => {
+  const clearDerivedTranscriptViews = useCallback((keepPptBlocks = false) => {
+    setSentencesWithTime([]);
+    setActiveSentenceIndex(null);
+    if (!keepPptBlocks) {
+      setContentBlocks([]);
+    }
+  }, []);
+
+  // ── WebSocket streaming actions ──
+  const receivePartial = useCallback((text: string) => {
+    setPartialText(text);
+  }, []);
+
+  const receiveFinal = useCallback((text: string) => {
+    setPartialText('');
+    const trimmed = text.trim();
+    if (!trimmed) return;
+    setTranscriptText(prev => {
+      const prevTrimmed = prev.trim();
+      if (!prevTrimmed) return trimmed;
+      // Light dedup: skip if exact duplicate of the most recent paragraph
+      const recentParts = prevTrimmed.split(/\n{2,}/).filter(Boolean).slice(-2);
+      for (const part of recentParts) {
+        const p = part.trim().replace(/\s/g, '');
+        const t = trimmed.replace(/\s/g, '');
+        if (p.length >= 6 && t.length >= 6 && (p === t || p.includes(t) || t.includes(p))) {
+          return prev;
+        }
+      }
+      return `${prevTrimmed}\n\n${trimmed}`;
+    });
+    setStreamingFinals(prev => [...prev, trimmed]);
+    markLocalChanged(false);
+    setSentencesWithTime([]);
+    setActiveSentenceIndex(null);
+  }, [markLocalChanged]);
+
+  const clearStreamingState = useCallback(() => {
+    setPartialText('');
+    setStreamingFinals([]);
+  }, []);
+
+  const receiveAiText = useCallback((value: string, options?: { force?: boolean }) => {
     const nextText = value.trim();
     if (!nextText) return;
-    if (userEditedRef.current) {
+    if (userEditedRef.current && !options?.force) {
       setPendingAiText(nextText);
       return;
     }
-    setTranscriptText(nextText);
-    markLocalChanged(false);
-  }, [markLocalChanged]);
+    // Decide whether to replace UI text with corrected DB text.
+    // Correction often changes individual characters (length ≈ same)
+    // while restructure adds human-friendly formatting (length grows).
+    // Previously the 1.1× length gate rejected same-length corrections.
+    setTranscriptText(prev => {
+      const prevTrimmed = prev.trim();
+      if (!prevTrimmed || options?.force) {
+        clearDerivedTranscriptViews();
+        markLocalChanged(false);
+        return nextText;
+      }
+      // If lengths are close (within ±15%), it's a correction — accept.
+      // If DB is longer, it's a restructure — accept.
+      // If DB is significantly shorter, reject (stale snapshot).
+      if (nextText.length >= prevTrimmed.length * 0.85) {
+        // Replace UI text but keep PPT image blocks alive
+        clearDerivedTranscriptViews(true);
+        markLocalChanged(false);
+        return nextText;
+      }
+      // DB text is much shorter — stale snapshot, keep live UI text
+      return prev;
+    });
+  }, [clearDerivedTranscriptViews, markLocalChanged]);
 
   const parseSentencesWithTime = useCallback((note: any): SentenceWithTime[] => {
     if (!note?.transcript || !Array.isArray(note.transcript) || note.transcript.length === 0) return [];
 
+    const transcriptSourceText = (chunk: any) => chunk.raw_text || chunk.text || '';
     const sortedChunks = note.transcript
       .sort((a: any, b: any) => (a.chunk_index || 0) - (b.chunk_index || 0))
-      .filter((chunk: any) => chunk.text && chunk.text.trim());
+      .filter((chunk: any) => transcriptSourceText(chunk).trim());
 
     if (sortedChunks.length === 0) return [];
 
-    const fullText = sortedChunks.map((chunk: any) => chunk.text || '').join(' ').trim();
+    const fullText = sortedChunks.map(transcriptSourceText).join(' ').trim();
 
     // Build timestamp array with sequential position tracking to correctly handle
     // duplicate words (e.g. "的", "是", "在" appear many times in Chinese text).
@@ -171,15 +279,43 @@ export function useTranscript(
     return result;
   }, []);
 
+  const transcriptTextFromNote = useCallback((note: any) => {
+    if (!note?.transcript || !Array.isArray(note.transcript) || note.transcript.length === 0) return '';
+    return [...note.transcript]
+      .sort((a: any, b: any) => (a.chunk_index || 0) - (b.chunk_index || 0))
+      .map((chunk: any) => chunk.display_text || chunk.text || chunk.raw_text || '')
+      .filter(Boolean)
+      .join('\n\n')
+      .trim();
+  }, []);
+
   const appendTranscriptText = useCallback((newText: string) => {
     markLocalChanged(false);
+    setSentencesWithTime([]);
+    setActiveSentenceIndex(null);
     setTranscriptText(prev => {
       const trimmed = newText.trim();
       if (!trimmed) return prev;
       const prevTrimmed = prev.trim();
+
+      // Sentence-level dedup against recent chunks, not just paragraph-level.
+      // ASR can emit the same sentence twice inside adjacent windows.
+      const prevSentences = prevTrimmed
+        .split(/(?<=[。！？.!?\n])/)
+        .map(s => s.trim())
+        .filter(Boolean)
+        .slice(-8);
+      if (prevSentences.some(s => isRepeatedText(trimmed, s))) {
+        return prev;
+      }
+
+      const recentParts = prevTrimmed.split(/\n{2,}/).filter(Boolean).slice(-3);
+      if (recentParts.some((part) => isRepeatedText(trimmed, part))) {
+        return prev;
+      }
       return prevTrimmed ? `${prevTrimmed}\n\n${trimmed}` : trimmed;
     });
-  }, [markLocalChanged]);
+  }, [isRepeatedText, markLocalChanged]);
 
   const loadHistory = useCallback(async () => {
     if (!sessionId) return;
@@ -189,22 +325,32 @@ export function useTranscript(
       const note = await fetchNote(sessionId);
       if (note) {
         setLoadedNote(note); // Share with parent so it can skip its own fetch
-        // Prefer user-edited transcript from note.content, fall back to
-        // machine-generated note.transcript (preserves edits across reload).
+        // Prefer user-edited transcript from note.content, but if a final
+        // backend transcript exists and content looks like stale noisy ASR,
+        // restore the final transcript instead.
         let transcriptRestored = false;
+        const backendTranscript = transcriptTextFromNote(note);
+        const hasFinalTranscript = note.transcript?.some?.(
+          (chunk: any) => chunk.correction_stage === 'final' || chunk.is_corrected,
+        );
         if (note.content) {
           const match = note.content.match(/^## 语音转文字\n\n([\s\S]*?)(?:\n\n---\n\n[\s\S]*)?$/);
-          if (match && match[1].trim()) {
-            setTranscriptText(cleanTranscriptText(match[1]));
+          const contentTranscript = match?.[1]?.trim() ? cleanTranscriptText(match[1]) : '';
+          const useBackendFinal = Boolean(
+            hasFinalTranscript
+            && backendTranscript
+            && (!contentTranscript || contentTranscript.length > backendTranscript.length * 1.35),
+          );
+          if (useBackendFinal) {
+            setTranscriptText(cleanTranscriptText(backendTranscript));
+            transcriptRestored = true;
+          } else if (contentTranscript) {
+            setTranscriptText(contentTranscript);
             transcriptRestored = true;
           }
         }
         if (!transcriptRestored && note.transcript && Array.isArray(note.transcript) && note.transcript.length > 0) {
-          const fullTranscript = note.transcript
-            .sort((a: any, b: any) => (a.chunk_index || 0) - (b.chunk_index || 0))
-            .map((chunk: any) => chunk.text || '')
-            .join(' ')
-            .trim();
+          const fullTranscript = backendTranscript;
           if (fullTranscript) {
             setTranscriptText(cleanTranscriptText(fullTranscript));
           }
@@ -236,7 +382,7 @@ export function useTranscript(
       setHasLocalChanges(false);
       setIsLoaded(true);
     }
-  }, [cleanTranscriptText, sessionId, parseSentencesWithTime, transcriptFromBlocks, updateContentBlocks]);
+  }, [cleanTranscriptText, sessionId, parseSentencesWithTime, transcriptFromBlocks, transcriptTextFromNote, updateContentBlocks]);
 
   useEffect(() => { loadHistory(); }, [loadHistory]);
 
@@ -278,10 +424,7 @@ export function useTranscript(
       try {
         const note = await fetchNote(sessionId);
         if (note?.transcript && Array.isArray(note.transcript) && note.transcript.length > 0) {
-          const corrected = note.transcript
-            .sort((a: any, b: any) => (a.chunk_index || 0) - (b.chunk_index || 0))
-            .map((chunk: any) => chunk.text || '')
-            .join(' ');
+          const corrected = transcriptTextFromNote(note);
           if (corrected.trim() && corrected.trim() !== transcriptText.trim()) {
             receiveAiText(corrected);
             setIsAiRestructuring(false);
@@ -294,7 +437,7 @@ export function useTranscript(
       } catch {}
     }, CORRECTION_POLL_MS);
     return () => clearInterval(interval);
-  }, [isRecording, sessionId, transcriptText, parseSentencesWithTime, receiveAiText]);
+  }, [isRecording, sessionId, transcriptText, parseSentencesWithTime, receiveAiText, transcriptTextFromNote]);
 
   useEffect(() => {
     if (!isRecording && sessionId && transcriptText) {
@@ -302,6 +445,49 @@ export function useTranscript(
       setIsTranscribing(true);
     }
   }, [isRecording, sessionId]);
+
+  useEffect(() => {
+    if (!isTranscribing || isRecording || !sessionId) return;
+
+    let attempts = 0;
+    let stopped = false;
+
+    const pollFinalTranscript = async () => {
+      if (stopped) return;
+      attempts += 1;
+      try {
+        const note = await fetchNote(sessionId);
+        const corrected = transcriptTextFromNote(note);
+        const hasFinalTranscript = note?.transcript?.some?.(
+          (chunk: any) => chunk.correction_stage === 'final',
+        );
+
+        if (hasFinalTranscript) {
+          stopped = true;
+          if (corrected && corrected.trim() && corrected.trim() !== prevTranscriptRef.current.trim()) {
+            receiveAiText(corrected, { force: true });
+            const parsed = parseSentencesWithTime(note);
+            if (parsed.length > 0) setSentencesWithTime(parsed);
+          } else {
+            setIsTranscribing(false);
+          }
+          return;
+        }
+      } catch {}
+
+      if (attempts >= FINAL_CORRECTION_MAX_ATTEMPTS) {
+        stopped = true;
+        setIsTranscribing(false);
+      }
+    };
+
+    const interval = setInterval(pollFinalTranscript, FINAL_CORRECTION_POLL_MS);
+    pollFinalTranscript();
+    return () => {
+      stopped = true;
+      clearInterval(interval);
+    };
+  }, [isTranscribing, isRecording, sessionId, parseSentencesWithTime, receiveAiText, transcriptTextFromNote]);
 
   useEffect(() => {
     if (!isTranscribing) return;
@@ -313,7 +499,7 @@ export function useTranscript(
         setIsPptMatching(true);
         setPptMatchMessage('正在重新匹配 PPT');
         insertPPTIntoTranscript(sessionId).then(result => {
-          if (result.blocks?.length > 0) {
+          if (result.blocks?.some((b: ContentBlock) => b.type === 'image')) {
             updateContentBlocks(result.blocks, false, true);
             const count = result.blocks.filter((b) => b.type === 'image').length;
             setPptMatchMessage(count > 0 ? `已匹配 ${count} 页 PPT` : '未匹配到 PPT 页面');
@@ -332,7 +518,7 @@ export function useTranscript(
       setPptMatchMessage('正在匹配 PPT');
       try {
         const result = await insertPPTIntoTranscript(sessionId);
-        if (result.blocks?.length > 0) {
+        if (result.blocks?.some((b: ContentBlock) => b.type === 'image')) {
           updateContentBlocks(result.blocks, false, true);
           const count = result.blocks.filter((b) => b.type === 'image').length;
           setPptMatchMessage(count > 0 ? `已匹配 ${count} 页 PPT` : '未匹配到 PPT 页面');
@@ -374,12 +560,16 @@ export function useTranscript(
       loadedNote,
       isLoaded,
       hasLocalChanges,
+      partialText,
+      streamingFinals,
     },
     actions: {
       setTranscriptText,
       updateTranscriptText,
       receiveAiText,
       appendTranscriptText,
+      upsertStreamingTranscriptChunk,
+      clearStreamingTranscriptChunks,
       setIsAiRestructuring,
       setIsTranscribing,
       setContentBlocks,
@@ -388,6 +578,10 @@ export function useTranscript(
       saveContent,
       parseSentencesWithTime,
       setSentencesWithTime,
+      clearDerivedTranscriptViews,
+      receivePartial,
+      receiveFinal,
+      clearStreamingState,
       markUserEdited: () => markLocalChanged(true),
       markLocalChanged: () => markLocalChanged(false),
       applyPendingAiText: () => {

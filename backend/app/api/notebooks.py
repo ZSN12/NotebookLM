@@ -3,7 +3,7 @@ from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.core.auth import get_current_user
 from app.api.schemas import NotebookCreate, NotebookUpdate, NotebookResponse, NotebookPackage, NoteCreate
-from app.models import Notebook, User, Session, Note
+from app.models import Notebook, User, Session as DBSession, Note
 from app.services.file_service import delete_notebook_files
 
 router = APIRouter(prefix="/api/notebooks", tags=["notebooks"])
@@ -100,9 +100,9 @@ def export_notebook(
         raise HTTPException(status_code=404, detail="Notebook not found")
 
     sessions_data = []
-    sessions = db.query(Session).filter(
-        Session.notebook_id == notebook_id
-    ).order_by(Session.created_at.asc()).all()
+    sessions = db.query(DBSession).filter(
+        DBSession.notebook_id == notebook_id
+    ).order_by(DBSession.created_at.asc()).all()
 
     for sess in sessions:
         note = db.query(Note).filter(Note.session_id == sess.id).first()
@@ -154,7 +154,7 @@ def import_notebook(
     db.flush()
 
     for sess_data in data.sessions:
-        session = Session(notebook_id=notebook.id, title=sess_data.title, summary=sess_data.summary, keywords=sess_data.keywords or [])
+        session = DBSession(notebook_id=notebook.id, title=sess_data.title, summary=sess_data.summary, keywords=sess_data.keywords or [])
         db.add(session)
         db.flush()
         notebook.session_count += 1

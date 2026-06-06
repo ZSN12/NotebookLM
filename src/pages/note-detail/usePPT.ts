@@ -15,7 +15,7 @@ export function usePPT(sessionId: string | undefined) {
     setUploadMessage(null);
     try {
       const result = await uploadPPT(file, sessionId);
-      if (result.slides?.length > 0) {
+      if (result.slides && result.slides.length > 0) {
         setSlides(result.slides);
         setActiveSlideIndex(0);
         setUploadMessage(`PPT 上传成功，共 ${result.slides.length} 页`);

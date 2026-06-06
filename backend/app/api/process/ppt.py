@@ -20,20 +20,33 @@ router = APIRouter()
 def get_transcript_text(note) -> str:
     """Extract full transcript text from a note.
 
-    Tries note.content first (manual notes), falls back to transcript array (streaming ASR).
+    Prioritise transcript array (latest ASR data), then fall back to
+    stripping "## 语音转文字" sections from note.content.
     """
-    if note.content and note.content.strip():
-        return note.content
+    # 1) Prefer latest transcript chunks (sorted by chunk_index)
     if note.transcript:
         texts = []
-        for seg in note.transcript:
+        for seg in sorted(
+            note.transcript,
+            key=lambda s: s.get("chunk_index", 0) if isinstance(s, dict) else 0,
+        ):
             if isinstance(seg, dict):
                 text = seg.get("text", "")
             else:
                 text = str(seg)
             if text:
                 texts.append(text)
-        return " ".join(texts)
+        joined = " ".join(texts).strip()
+        if joined:
+            return joined
+
+    # 2) Fall back to note.content, stripping markdown wrapper
+    if note.content and note.content.strip():
+        import re
+        clean = re.sub(r'^##\s*语音转文字\s*\n*', '', note.content.strip())
+        clean = re.sub(r'\n*---\s*$', '', clean)
+        return clean.strip()
+
     return ""
 
 
@@ -82,17 +95,37 @@ def insert_ppt_into_transcript(
     request_aligner = SlideAligner()
     request_aligner.set_slides(slides)
 
-    # Split transcript into sentences/paragraphs for matching
+    # Split transcript into sentences for matching
     sentences = re.split(r'(?<=[。！？\n])', transcript)
     sentences = [s.strip() for s in sentences if s.strip()]
 
-    # Build result blocks
-    blocks = []
-    matched_pages = set()
+    if not sentences:
+        return {"blocks": [{"type": "text", "content": transcript.strip()}]}
 
-    for sentence in sentences:
-        # Try to match this sentence to a PPT slide
-        matched_idx = request_aligner.match(sentence, threshold=0.12)
+    # ── Build result blocks with sliding-window PPT matching ──
+    # Single-short-sentence matching (e.g. "图书馆中饰 / 设计模式的分析")
+    # often lacks enough signal to cross the alignment threshold. Using a
+    # 2–4 sentence sliding window gives the aligner richer context.
+    WINDOW_MIN = 2   # minimum sentences per match window
+    WINDOW_MAX = 4   # maximum sentences per match window
+
+    blocks: list[dict] = []
+    matched_pages: set[int] = set()
+    seg_idx = 0
+
+    while seg_idx < len(sentences):
+        # Expand window until we have WINDOW_MAX sentences or reach end
+        window_end = min(seg_idx + WINDOW_MAX, len(sentences))
+        window_text = "".join(sentences[seg_idx:window_end])
+
+        # Try matching the full window first
+        matched_idx = request_aligner.match(window_text, threshold=0.10)
+
+        if matched_idx is None and window_end - seg_idx >= WINDOW_MIN:
+            # Also try a shorter window (min size) — long windows can dilute signal
+            short_end = min(seg_idx + WINDOW_MIN, len(sentences))
+            short_text = "".join(sentences[seg_idx:short_end])
+            matched_idx = request_aligner.match(short_text, threshold=0.12)
 
         if matched_idx is not None and matched_idx not in matched_pages:
             matched_pages.add(matched_idx)
@@ -104,21 +137,16 @@ def insert_ppt_into_transcript(
                     "page": slide["page"],
                     "title": slide.get("title", ""),
                 })
-            else:
-                # No image, just mark the page
-                blocks.append({
-                    "type": "marker",
-                    "page": slide["page"],
-                    "title": slide.get("title", ""),
-                })
 
-        # Always add the text block
-        if sentence:
-            # Check if last block is already text, merge to avoid fragmentation
+        # Push the matched sentences as text; merge with previous text block
+        first_sentence = sentences[seg_idx]
+        if first_sentence:
             if blocks and blocks[-1]["type"] == "text":
-                blocks[-1]["content"] += " " + sentence
+                blocks[-1]["content"] += " " + first_sentence
             else:
-                blocks.append({"type": "text", "content": sentence})
+                blocks.append({"type": "text", "content": first_sentence})
+
+        seg_idx += 1
 
     return {"blocks": blocks}
 

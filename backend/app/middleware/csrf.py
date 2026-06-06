@@ -54,7 +54,7 @@ class CSRFMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
 
         origin = extract_origin(request)
-        if origin and origin not in self._allowed_origins:
+        if not origin or origin not in self._allowed_origins:
             return Response(
                 content='{"detail": "CSRF validation failed: invalid origin"}',
                 status_code=403,

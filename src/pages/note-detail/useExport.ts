@@ -13,7 +13,7 @@ interface Notebook {
   title: string;
 }
 
-export function useExport(session: Session | undefined, notebook: Notebook | undefined) {
+export function useExport(session: Session | undefined | null, notebook: Notebook | undefined | null) {
   const [showExportMenu, setShowExportMenu] = useState(false);
   const [isExportingPDF, setIsExportingPDF] = useState(false);
   const [isExportingPackage, setIsExportingPackage] = useState(false);
@@ -60,11 +60,12 @@ export function useExport(session: Session | undefined, notebook: Notebook | und
     }
 
     const blob = new Blob([md], { type: 'text/markdown' });
+    const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
+    a.href = url;
     a.download = `${session.title}.md`;
     a.click();
-    URL.revokeObjectURL(a.href);
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
     setShowExportMenu(false);
   };
 
@@ -160,11 +161,12 @@ export function useExport(session: Session | undefined, notebook: Notebook | und
     try {
       const pkg = await exportNotebook(notebook.id);
       const blob = new Blob([JSON.stringify(pkg, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
-      a.href = URL.createObjectURL(blob);
+      a.href = url;
       a.download = `${notebook.title}.nootbook`;
       a.click();
-      URL.revokeObjectURL(a.href);
+      setTimeout(() => URL.revokeObjectURL(url), 2000);
     } catch (err: any) {
       console.error('Notebook package export failed:', err);
       alert(err.message || '导出失败');

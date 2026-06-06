@@ -39,10 +39,9 @@ DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
 # Security
 SECRET_KEY = os.getenv("SECRET_KEY")
 if not SECRET_KEY:
-    raise RuntimeError(
-        "SECRET_KEY environment variable is required for production deployment. "
-        "Generate one with: python -c 'import secrets; print(secrets.token_hex(32))'"
-    )
+    import secrets as secrets_mod
+    SECRET_KEY = secrets_mod.token_hex(32)
+    print("[WARN] SECRET_KEY not set; using a random dev key. Do not use this in production!")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60  # 60 minutes
 REFRESH_TOKEN_EXPIRE_DAYS = 7  # 7 days

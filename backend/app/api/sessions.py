@@ -3,7 +3,7 @@ from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.core.auth import get_current_user
 from app.api.schemas import SessionCreate, SessionUpdate, SessionResponse
-from app.models import Session, Notebook, User
+from app.models import Session as DBSession, Notebook, User
 from app.services.file_service import delete_session_files
 import secrets
 
@@ -23,9 +23,9 @@ def list_sessions(
     if not notebook:
         raise HTTPException(status_code=404, detail="Notebook not found")
 
-    return db.query(Session).filter(
-        Session.notebook_id == notebook_id
-    ).order_by(Session.created_at.desc()).all()
+    return db.query(DBSession).filter(
+        DBSession.notebook_id == notebook_id
+    ).order_by(DBSession.created_at.desc()).all()
 
 
 @router.post("/", response_model=SessionResponse, status_code=status.HTTP_201_CREATED)
@@ -41,7 +41,7 @@ def create_session(
     ).first()
     if not notebook:
         raise HTTPException(status_code=404, detail="Notebook not found")
-    session = Session(notebook_id=notebook_id, **data.model_dump())
+    session = DBSession(notebook_id=notebook_id, **data.model_dump())
     db.add(session)
     notebook.session_count += 1
     db.commit()
@@ -55,8 +55,8 @@ def get_session(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    session = db.query(Session).filter(
-        Session.id == session_id
+    session = db.query(DBSession).filter(
+        DBSession.id == session_id
     ).join(Notebook).filter(Notebook.user_id == current_user.id).first()
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -70,8 +70,8 @@ def update_session(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    session = db.query(Session).filter(
-        Session.id == session_id
+    session = db.query(DBSession).filter(
+        DBSession.id == session_id
     ).join(Notebook).filter(Notebook.user_id == current_user.id).first()
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -88,8 +88,8 @@ def delete_session(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    session = db.query(Session).filter(
-        Session.id == session_id
+    session = db.query(DBSession).filter(
+        DBSession.id == session_id
     ).join(Notebook).filter(Notebook.user_id == current_user.id).first()
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -111,8 +111,8 @@ def enable_share(
     current_user: User = Depends(get_current_user),
 ):
     """Enable sharing for a session, generating a share token."""
-    session = db.query(Session).filter(
-        Session.id == session_id
+    session = db.query(DBSession).filter(
+        DBSession.id == session_id
     ).join(Notebook).filter(Notebook.user_id == current_user.id).first()
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -133,8 +133,8 @@ def disable_share(
     current_user: User = Depends(get_current_user),
 ):
     """Disable sharing for a session."""
-    session = db.query(Session).filter(
-        Session.id == session_id
+    session = db.query(DBSession).filter(
+        DBSession.id == session_id
     ).join(Notebook).filter(Notebook.user_id == current_user.id).first()
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -153,8 +153,8 @@ def get_share_status(
     current_user: User = Depends(get_current_user),
 ):
     """Get the current share status for a session."""
-    session = db.query(Session).filter(
-        Session.id == session_id
+    session = db.query(DBSession).filter(
+        DBSession.id == session_id
     ).join(Notebook).filter(Notebook.user_id == current_user.id).first()
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")

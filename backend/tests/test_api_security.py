@@ -30,7 +30,10 @@ def auth_headers(client: TestClient) -> dict[str, str]:
         json={"email": "admin", "password": "admin123"},
     )
     assert resp.status_code == 200
-    return {"Authorization": f"Bearer {resp.json()['access_token']}"}
+    return {
+        "Authorization": f"Bearer {resp.json()['access_token']}",
+        "Origin": "http://localhost:5173",
+    }
 
 
 def test_health_and_login():

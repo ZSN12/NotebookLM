@@ -46,6 +46,7 @@ export default function ChapterList() {
   };
 
   const handleDownload = () => {
+    if (!notebook) return;
     const content = notebookSessions.map(s => `# ${s.title}\n${s.summary}`).join('\n\n');
     const blob = new Blob([content], { type: 'text/markdown' });
     const url = URL.createObjectURL(blob);
@@ -53,7 +54,7 @@ export default function ChapterList() {
     a.href = url;
     a.download = `${notebook.title}.md`;
     a.click();
-    URL.revokeObjectURL(url);
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
   };
 
   if (!notebook) {

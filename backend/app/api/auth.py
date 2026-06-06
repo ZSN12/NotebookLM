@@ -4,15 +4,17 @@ import time
 import threading
 import os
 import uuid
+from pathlib import Path
 from app.core.database import get_db
 from app.core.auth import hash_password, verify_password, create_access_token, create_refresh_token, decode_refresh_token, get_current_user
 from app.api.schemas import UserCreate, UserLogin, UserResponse, Token, TokenRefresh, TokenRefreshResponse, PasswordReset, UserProfileUpdate, PasswordChange
 from app.models import User
+from app.config import BASE_DIR
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
-AVATAR_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))), "uploads", "avatars")
-os.makedirs(AVATAR_DIR, exist_ok=True)
+AVATAR_DIR = BASE_DIR / "uploads" / "avatars"
+AVATAR_DIR.mkdir(parents=True, exist_ok=True)
 ALLOWED_AVATAR_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
 MAX_AVATAR_SIZE = 5 * 1024 * 1024  # 5MB
 
@@ -146,7 +148,7 @@ async def upload_avatar(file: UploadFile = File(...), current_user: User = Depen
         raise HTTPException(status_code=413, detail=f"File too large: {len(content)} bytes (max {MAX_AVATAR_SIZE} bytes)")
 
     filename = f"{current_user.id}_{uuid.uuid4().hex[:8]}{ext}"
-    filepath = os.path.join(AVATAR_DIR, filename)
+    filepath = AVATAR_DIR / filename
     with open(filepath, "wb") as f:
         f.write(content)
 
@@ -163,8 +165,8 @@ def get_avatar(user_id: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Avatar not found")
 
     filename = os.path.basename(user.avatar_url)
-    filepath = os.path.join(AVATAR_DIR, filename)
-    if not os.path.exists(filepath):
+    filepath = (AVATAR_DIR / filename).resolve()
+    if not filepath.is_relative_to(AVATAR_DIR.resolve()) or not filepath.is_file():
         raise HTTPException(status_code=404, detail="Avatar file not found")
 
     return FileResponse(filepath)

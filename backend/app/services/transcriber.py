@@ -1,19 +1,25 @@
 import os
 import tempfile
+import logging
 from typing import List, Optional
+import numpy as np
 from app.config import DASHSCOPE_API_KEY
+
+logger = logging.getLogger(__name__)
 
 try:
     from funasr import AutoModel
     _FUNASR_AVAILABLE = True
 except ImportError:
     _FUNASR_AVAILABLE = False
+    logger.warning("FunASR not available, will use cloud ASR fallback")
 
 try:
     from dashscope.audio import asr
     _DASHSCOPE_ASR_AVAILABLE = True
 except ImportError:
     _DASHSCOPE_ASR_AVAILABLE = False
+    logger.warning("DashScope ASR not available")
 
 
 class ASRSegment:
@@ -37,6 +43,8 @@ class Transcriber:
     def __init__(self):
         self._model = None
         self._model_loaded = False
+        self._streaming_model = None
+        self._streaming_model_loaded = False
 
     def _load_model(self):
         if self._model_loaded:
@@ -49,11 +57,27 @@ class Transcriber:
                     punc_model="ct-punc",
                     disable_update=True,
                 )
-                print("[INFO] FunASR model loaded successfully")
+                logger.info("FunASR model loaded successfully")
                 self._model_loaded = True
             except Exception as e:
-                print(f"[ERROR] FunASR model load failed: {e}")
+                logger.error(f"FunASR model load failed: {e}", exc_info=True)
                 self._model = None
+
+    def _load_streaming_model(self):
+        """Lazy-load the streaming (online) model for real-time ASR."""
+        if self._streaming_model_loaded:
+            return
+        if _FUNASR_AVAILABLE:
+            try:
+                self._streaming_model = AutoModel(
+                    model="paraformer-zh-streaming",
+                    disable_update=True,
+                )
+                logger.info("FunASR streaming model loaded successfully")
+                self._streaming_model_loaded = True
+            except Exception as e:
+                logger.error(f"FunASR streaming model load failed: {e}", exc_info=True)
+                self._streaming_model = None
 
     def _transcribe_with_funasr(self, audio_path: str) -> List[ASRSegment]:
         """Use local FunASR model for transcription."""
@@ -71,6 +95,17 @@ class Transcriber:
             batch_size_s=120,
         )
 
+        # Debug: log raw FunASR result structure
+        if isinstance(result, list) and result:
+            sample = result[0]
+            ts = sample.get("timestamp", [])
+            logger.info("FunASR raw result: text=%r, timestamp_len=%d, first_ts=%r",
+                        sample.get("text", "")[:50], len(ts), ts[:3] if ts else None)
+        elif isinstance(result, dict):
+            ts = result.get("timestamp", [])
+            logger.info("FunASR raw result: text=%r, timestamp_len=%d, first_ts=%r",
+                        result.get("text", "")[:50], len(ts), ts[:3] if ts else None)
+
         segments = []
         if isinstance(result, list):
             for item in result:
@@ -83,7 +118,7 @@ class Transcriber:
     def _transcribe_with_dashscope(self, audio_path: str) -> List[ASRSegment]:
         """Use DashScope cloud ASR API for transcription."""
         if not DASHSCOPE_API_KEY:
-            print("[WARN] DASHSCOPE_API_KEY not configured, skipping cloud ASR fallback")
+            logger.warning("DASHSCOPE_API_KEY not configured, skipping cloud ASR fallback")
             return []
 
         try:
@@ -106,7 +141,7 @@ class Transcriber:
                         segments.append(ASRSegment(text=text, start_ms=start_ms, end_ms=end_ms))
                 return segments
         except Exception as e:
-            print(f"[ERROR] DashScope ASR failed: {e}")
+            logger.error(f"DashScope ASR failed: {e}", exc_info=True)
         return []
 
     def _transcribe_with_whisper_api(self, audio_path: str) -> List[ASRSegment]:
@@ -142,7 +177,7 @@ class Transcriber:
 
             return segments
         except Exception as e:
-            print(f"[ERROR] Whisper API transcription failed: {e}")
+            logger.error(f"Whisper API transcription failed: {e}", exc_info=True)
         return []
 
     def transcribe(self, audio_path: str) -> List[ASRSegment]:
@@ -157,75 +192,193 @@ class Transcriber:
             List of ASRSegment with text and time info.
         """
         if not os.path.exists(audio_path):
-            print(f"[ERROR] Audio file not found: {audio_path}")
+            logger.error(f"Audio file not found: {audio_path}")
             return []
 
         # Try FunASR first
         if _FUNASR_AVAILABLE:
-            print("[DEBUG] Trying FunASR local model...")
+            logger.debug("Trying FunASR local model...")
             segments = self._transcribe_with_funasr(audio_path)
             if segments:
                 return segments
-            print("[DEBUG] FunASR returned no results")
+            logger.debug("FunASR returned no results")
 
         # Try DashScope cloud API
         if DASHSCOPE_API_KEY:
-            print("[DEBUG] Trying DashScope cloud ASR...")
+            logger.debug("Trying DashScope cloud ASR...")
             segments = self._transcribe_with_dashscope(audio_path)
             if segments:
                 return segments
-            print("[DEBUG] DashScope ASR returned no results")
+            logger.debug("DashScope ASR returned no results")
 
-            print("[DEBUG] Trying DashScope Whisper-compatible API...")
+            logger.debug("Trying DashScope Whisper-compatible API...")
             segments = self._transcribe_with_whisper_api(audio_path)
             if segments:
                 return segments
 
-        print("[ERROR] All transcription methods failed")
+        logger.error("All transcription methods failed")
         return []
 
     def _parse_funasr_result(self, item: dict) -> List[ASRSegment]:
-        """Parse FunASR result dict into ASRSegment list."""
+        """Parse FunASR result dict into ASRSegment list.
+
+        FunASR returns timestamps in two shapes:
+        - [[start, end, text], ...] → each entry has its own text; emit per-entry.
+        - [[start, end], ...]       → only time info; emit a single segment for
+          the whole utterance to avoid duplicating ``item["text"]`` N times.
+        """
         segments = []
         text = item.get("text", "")
         timestamp = item.get("timestamp", [])
 
-        if timestamp:
+        if not timestamp:
+            segments.append(ASRSegment(text=text, start_ms=0, end_ms=0))
+            return segments
+
+        # Detect whether each timestamp entry carries its own text token.
+        has_per_entry_text = all(len(ts) > 2 for ts in timestamp)
+
+        if has_per_entry_text:
             for ts in timestamp:
-                seg = ASRSegment(
-                    text=ts[2] if len(ts) > 2 else text,
+                seg_text = ts[2] if len(ts) > 2 else ""
+                segments.append(ASRSegment(
+                    text=seg_text,
                     start_ms=int(ts[0]),
                     end_ms=int(ts[1]),
-                )
-                segments.append(seg)
+                ))
         else:
-            segments.append(ASRSegment(text=text, start_ms=0, end_ms=0))
+            # Binary timestamps: single segment covering the full text.
+            start_ms = int(timestamp[0][0])
+            end_ms = int(timestamp[-1][1])
+            segments.append(ASRSegment(text=text, start_ms=start_ms, end_ms=end_ms))
 
         return segments
 
-    def transcribe_from_bytes(self, audio_bytes: bytes, file_ext: str = ".wav") -> List[ASRSegment]:
-        """Transcribe from in-memory audio bytes.
+    def create_streaming_session(self) -> "StreamingASRSession":
+        """Create a new real-time streaming ASR session.
 
-        Args:
-            audio_bytes: Raw audio data.
-            file_ext: File extension for temp file (default .wav).
-
-        Returns:
-            List of ASRSegment.
+        Uses ``paraformer-zh-streaming`` with incremental decode and a
+        persistent ``cache`` so the model never re-emits already-output text.
         """
-        tmp_path = None
+        self._load_streaming_model()
+        if not self._streaming_model:
+            raise RuntimeError("Streaming model not available")
+        return StreamingASRSession(self._streaming_model)
+
+
+class StreamingASRSession:
+    """Per-connection streaming ASR using FunASR online model.
+
+    Buffers incoming PCM frames (int16 @ 16kHz) until a full chunk stride
+    (600 ms) is reached, then feeds it to the streaming model.  The model
+    ``cache`` is kept alive for the lifetime of the session so text is never
+    duplicated across chunks.
+    """
+
+    # 600 ms @ 16 kHz, int16 = 2 bytes / sample
+    CHUNK_STRIDE_SAMPLES = 9600
+    BYTES_PER_CHUNK = CHUNK_STRIDE_SAMPLES * 2
+    # If no new text arrives for this long, treat accumulated text as a final segment.
+    SILENCE_FINALIZE_MS = 800
+
+    def __init__(self, model):
+        self._model = model
+        self._cache = {}
+        self._buffer = bytearray()
+        self._accumulated_text = ""
+        self._last_text_at_ms = 0.0
+        self._session_start_ms = 0.0
+        self._total_ms = 0.0
+        self._final_segments: list[ASRSegment] = []
+
+    # ── public API ──
+
+    def feed_pcm(self, pcm_bytes: bytes) -> tuple[str, bool]:
+        """Feed one or more PCM frames.  Returns (new_text, is_final_segment).
+
+        ``new_text`` is the incremental text recognized since the last call.
+        ``is_final_segment`` is True when accumulated text was promoted to a
+        final segment because of detected silence.
+        """
+        self._buffer.extend(pcm_bytes)
+        frame_ms = len(pcm_bytes) / 2 / 16  # int16 samples / 16000 Hz
+        self._total_ms += frame_ms
+
+        new_parts: list[str] = []
+        is_final = False
+
+        while len(self._buffer) >= self.BYTES_PER_CHUNK:
+            chunk_bytes = self._buffer[: self.BYTES_PER_CHUNK]
+            self._buffer = self._buffer[self.BYTES_PER_CHUNK :]
+            chunk = np.frombuffer(chunk_bytes, dtype=np.int16)
+            text = self._recognize_chunk(chunk, is_final=False)
+            if text:
+                new_parts.append(text)
+                self._last_text_at_ms = self._total_ms
+
+        # Promote accumulated text to a final segment if speaker has been
+        # silent for longer than SILENCE_FINALIZE_MS.
+        if (
+            self._accumulated_text
+            and self._total_ms - self._last_text_at_ms > self.SILENCE_FINALIZE_MS
+        ):
+            is_final = True
+            self._final_segments.append(
+                ASRSegment(
+                    text=self._accumulated_text,
+                    start_ms=int(self._session_start_ms),
+                    end_ms=int(self._last_text_at_ms),
+                )
+            )
+            self._accumulated_text = ""
+            self._session_start_ms = self._total_ms
+
+        new_text = "".join(new_parts)
+        if new_text:
+            self._accumulated_text += new_text
+
+        return new_text, is_final
+
+    def finalize(self) -> list[ASRSegment]:
+        """End of stream: flush remaining buffer and return all final segments."""
+        if self._buffer:
+            chunk = np.frombuffer(self._buffer, dtype=np.int16)
+            text = self._recognize_chunk(chunk, is_final=True)
+            if text:
+                self._accumulated_text += text
+            self._buffer = bytearray()
+
+        if self._accumulated_text:
+            self._final_segments.append(
+                ASRSegment(
+                    text=self._accumulated_text,
+                    start_ms=int(self._session_start_ms),
+                    end_ms=int(self._total_ms),
+                )
+            )
+            self._accumulated_text = ""
+
+        # Clear model cache so the next session starts fresh.
+        self._cache = {}
+        return list(self._final_segments)
+
+    # ── internal ──
+
+    def _recognize_chunk(self, chunk: object, is_final: bool) -> str:
         try:
-            with tempfile.NamedTemporaryFile(suffix=file_ext, delete=False) as f:
-                f.write(audio_bytes)
-                f.flush()
-                tmp_path = f.name
-            return self.transcribe(tmp_path)
-        finally:
-            if tmp_path and os.path.exists(tmp_path):
-                try:
-                    os.unlink(tmp_path)
-                except OSError:
-                    pass
+            res = self._model.generate(
+                input=chunk,
+                cache=self._cache,
+                is_final=is_final,
+                chunk_size=[0, 10, 5],
+                encoder_chunk_look_back=4,
+                decoder_chunk_look_back=1,
+            )
+            if res and isinstance(res, list):
+                return res[0].get("text", "")
+        except Exception as exc:
+            logger.warning("streaming_recognize_chunk_failed error=%s", exc)
+        return ""
 
 
 # Singleton instance

@@ -21,6 +21,9 @@ os.environ["SKIP_ASR_PRELOAD"] = "1"
 
 from fastapi.testclient import TestClient
 from app.main import app
+from app.core.database import SessionLocal
+from app.models import User
+from app.core.auth import hash_password
 
 
 def auth_headers(client: TestClient) -> dict[str, str]:
@@ -29,8 +32,22 @@ def auth_headers(client: TestClient) -> dict[str, str]:
         json={"email": "admin", "password": "admin123"},
     )
     assert resp.status_code == 200, resp.text
-    return {"Authorization": f"Bearer {resp.json()['access_token']}"}
+    return {
+        "Authorization": f"Bearer {resp.json()['access_token']}",
+        "Origin": "http://localhost:5173",
+    }
 
+
+def _create_other_user(email: str, username: str, password: str = "other123") -> None:
+    """Directly create a user in DB to bypass rate-limited registration API."""
+    db = SessionLocal()
+    try:
+        if not db.query(User).filter(User.email == email).first():
+            user = User(username=username, email=email, password_hash=hash_password(password))
+            db.add(user)
+            db.commit()
+    finally:
+        db.close()
 
 def _create_notebook_and_session(client: TestClient, headers: dict):
     """Helper: create a notebook and session, return (notebook_id, session_id)."""
@@ -261,16 +278,16 @@ def test_share_status_not_owner():
         headers = auth_headers(client)
         _, session_id = _create_notebook_and_session(client, headers)
 
-        # Create another user
-        client.post(
-            "/api/auth/register",
-            json={"username": "Other", "email": "other@example.com", "password": "other123"},
-        )
+        # Create another user directly in DB (bypass rate limit)
+        _create_other_user("other@example.com", "Other", "other123")
         other_resp = client.post(
             "/api/auth/login",
             json={"email": "other@example.com", "password": "other123"},
         )
-        other_headers = {"Authorization": f"Bearer {other_resp.json()['access_token']}"}
+        other_headers = {
+            "Authorization": f"Bearer {other_resp.json()['access_token']}",
+            "Origin": "http://localhost:5173",
+        }
 
         # Other user tries to get share status
         resp = client.get(f"/api/sessions/{session_id}/share/status", headers=other_headers)
@@ -283,16 +300,16 @@ def test_share_enable_not_owner():
         headers = auth_headers(client)
         _, session_id = _create_notebook_and_session(client, headers)
 
-        # Create another user
-        client.post(
-            "/api/auth/register",
-            json={"username": "Other2", "email": "other2@example.com", "password": "other2123"},
-        )
+        # Create another user directly in DB (bypass rate limit)
+        _create_other_user("other2@example.com", "Other2", "other2123")
         other_resp = client.post(
             "/api/auth/login",
             json={"email": "other2@example.com", "password": "other2123"},
         )
-        other_headers = {"Authorization": f"Bearer {other_resp.json()['access_token']}"}
+        other_headers = {
+            "Authorization": f"Bearer {other_resp.json()['access_token']}",
+            "Origin": "http://localhost:5173",
+        }
 
         resp = client.post(f"/api/sessions/{session_id}/share/enable", headers=other_headers)
         assert resp.status_code == 404

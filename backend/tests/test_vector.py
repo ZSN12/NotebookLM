@@ -21,6 +21,9 @@ os.environ["SKIP_ASR_PRELOAD"] = "1"
 
 from fastapi.testclient import TestClient
 from app.main import app
+from app.core.database import SessionLocal
+from app.models import User
+from app.core.auth import hash_password
 
 
 def auth_headers(client: TestClient) -> dict[str, str]:
@@ -29,8 +32,22 @@ def auth_headers(client: TestClient) -> dict[str, str]:
         json={"email": "admin", "password": "admin123"},
     )
     assert resp.status_code == 200, resp.text
-    return {"Authorization": f"Bearer {resp.json()['access_token']}"}
+    return {
+        "Authorization": f"Bearer {resp.json()['access_token']}",
+        "Origin": "http://localhost:5173",
+    }
 
+
+def _create_other_user(email: str, username: str, password: str = "other1234") -> None:
+    """Directly create a user in DB to bypass rate-limited registration API."""
+    db = SessionLocal()
+    try:
+        if not db.query(User).filter(User.email == email).first():
+            user = User(username=username, email=email, password_hash=hash_password(password))
+            db.add(user)
+            db.commit()
+    finally:
+        db.close()
 
 def _create_notebook_session_note(client: TestClient, headers: dict):
     """Create notebook + session + note with content. Returns (notebook_id, session_id)."""
@@ -146,16 +163,16 @@ def test_cannot_index_others_session():
         headers = auth_headers(client)
         _, session_id = _create_notebook_session_note(client, headers)
 
-        # Create another user
-        client.post(
-            "/api/auth/register",
-            json={"username": "Other", "email": "other_vec@example.com", "password": "other1234"},
-        )
+        # Create another user directly in DB (bypass rate limit)
+        _create_other_user("other_vec@example.com", "Other", "other1234")
         other_resp = client.post(
             "/api/auth/login",
             json={"email": "other_vec@example.com", "password": "other1234"},
         )
-        other_headers = {"Authorization": f"Bearer {other_resp.json()['access_token']}"}
+        other_headers = {
+            "Authorization": f"Bearer {other_resp.json()['access_token']}",
+            "Origin": "http://localhost:5173",
+        }
 
         # Other user tries to rebuild index
         resp = client.post(f"/api/vector/session/{session_id}/rebuild", headers=other_headers)
@@ -169,16 +186,17 @@ def test_cannot_search_others_content():
 
         client.post(f"/api/vector/session/{session_id}/rebuild", headers=headers)
 
-        # Create another user
-        client.post(
-            "/api/auth/register",
-            json={"username": "Other2", "email": "other2_vec@example.com", "password": "other21234"},
-        )
+        # Create another user directly in DB (bypass rate limit)
+        _create_other_user("other2_vec@example.com", "Other2", "other21234")
         other_resp = client.post(
             "/api/auth/login",
             json={"email": "other2_vec@example.com", "password": "other21234"},
         )
-        other_headers = {"Authorization": f"Bearer {other_resp.json()['access_token']}"}
+        assert other_resp.status_code == 200, other_resp.text
+        other_headers = {
+            "Authorization": f"Bearer {other_resp.json()['access_token']}",
+            "Origin": "http://localhost:5173",
+        }
 
         # Other user searches - should get 0 results (their own chunks are empty)
         resp = client.post("/api/vector/search", json={"query": "设计模式"}, headers=other_headers)

@@ -293,7 +293,7 @@ function LayoutBlockRenderer({
               PPT 第 {block.page} 页{block.title ? ` · ${block.title}` : ''}
             </span>
           </div>
-          <SharedPptImage src={block.src} page={block.page} title={block.title} shareToken={shareToken} />
+          <SharedPptImage src={block.src} page={block.page ?? '?'} title={block.title} shareToken={shareToken} />
         </div>
       );
 

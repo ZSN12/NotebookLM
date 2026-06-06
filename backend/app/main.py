@@ -7,7 +7,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import text
-from app.api import auth, notebooks, sessions, process, notes, public, vector
+from app.api import auth, notebooks, sessions, process, notes, public, vector, mindmap, quiz
+from app.api.process.asr_ws import router as asr_ws_router
 from app.core.database import engine, get_db, SessionLocal
 from app.core.auth import hash_password
 from app.middleware.rate_limit import RateLimitMiddleware
@@ -17,15 +18,14 @@ from app.config import SLIDE_DIR, AUDIO_DIR, ALLOWED_ORIGINS, ADMIN_DEFAULT_EMAI
 
 app = FastAPI(title="AI Notebook", version="0.1.0")
 
+app.add_middleware(RateLimitMiddleware)
+app.add_middleware(CSRFMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-app.add_middleware(RateLimitMiddleware)
-app.add_middleware(CSRFMiddleware)
 
 app.include_router(auth.router)
 app.include_router(notebooks.router)
@@ -34,6 +34,9 @@ app.include_router(process.router)
 app.include_router(notes.router)
 app.include_router(public.router)
 app.include_router(vector.router)
+app.include_router(mindmap.router)
+app.include_router(quiz.router)
+app.include_router(asr_ws_router)
 
 
 def _require_user_session(session_id: str, user: User, db: Session) -> DBSession:
@@ -57,6 +60,8 @@ def _get_media_user(request: Request, db: Session = Depends(get_db)) -> User:
         if payload.get("type") != "access":
             raise HTTPException(status_code=401, detail="Invalid token")
         user_id = payload.get("sub")
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token has expired")
     except jwt.PyJWTError:
         raise HTTPException(status_code=401, detail="Invalid token")
     user = db.query(User).filter(User.id == user_id).first()
@@ -104,12 +109,12 @@ async def on_startup():
 
     # Ensure share columns exist for existing databases (SQLite doesn't auto-migrate)
     try:
-        with engine.connect() as conn:
+        with engine.begin() as conn:
             conn.execute(text("ALTER TABLE sessions ADD COLUMN share_enabled BOOLEAN DEFAULT 0"))
     except Exception:
         pass  # Column already exists
     try:
-        with engine.connect() as conn:
+        with engine.begin() as conn:
             conn.execute(text("ALTER TABLE sessions ADD COLUMN share_token VARCHAR(64)"))
     except Exception:
         pass  # Column already exists

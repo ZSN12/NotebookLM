@@ -67,13 +67,22 @@ const colorMap: Record<number, string> = {
   5: 'from-cyan-500 to-cyan-600',
 };
 
+function hashStringToInt(str: string): number {
+  let hash = 0;
+  for (let i = 0; i < str.length; i++) {
+    hash = ((hash << 5) - hash + str.charCodeAt(i)) | 0;
+  }
+  return Math.abs(hash);
+}
+
 export function mapBackendNotebook(bn: BackendNotebook): Notebook {
+  const fallbackColor = colorMap[hashStringToInt(bn.id) % 6];
   return {
     id: bn.id,
     title: bn.title,
     description: bn.description || '',
     icon: iconMap[bn.icon || ''] || 'BookOpen',
-    color: bn.color || colorMap[Math.floor(Math.random() * 6)],
+    color: bn.color || fallbackColor,
     sessionCount: bn.session_count,
     updatedAt: bn.created_at.split('T')[0],
     createdAt: bn.created_at.split('T')[0],
@@ -94,20 +103,25 @@ export function mapBackendSession(bs: BackendSession): Session {
   };
 }
 
-async function request<T>(url: string, options?: RequestInit): Promise<T> {
+interface ApiRequestOptions extends RequestInit {
+  timeoutMs?: number;
+}
+
+async function request<T>(url: string, options?: ApiRequestOptions): Promise<T> {
   const fullUrl = `${API_BASE}${url}`;
+  const { timeoutMs = 10000, ...fetchOptions } = options || {};
 
   try {
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 10000);
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
     const res = await fetch(fullUrl, {
-      ...options,
+      ...fetchOptions,
       signal: controller.signal,
       headers: {
         'Content-Type': 'application/json',
         ...authHeaders(),
-        ...options?.headers,
+        ...fetchOptions.headers,
       },
     });
 
@@ -121,11 +135,20 @@ async function request<T>(url: string, options?: RequestInit): Promise<T> {
     if (res.status === 204) return undefined as unknown as T;
     if (!res.ok) {
       const errorText = await res.text();
-      throw new Error(`API error: ${res.status} ${res.statusText} - ${errorText}`);
+      let message = errorText || res.statusText;
+      try {
+        const parsed = JSON.parse(errorText);
+        if (typeof parsed.detail === 'string') message = parsed.detail;
+        else if (Array.isArray(parsed.detail)) message = parsed.detail.map((item: any) => item.msg || JSON.stringify(item)).join('；');
+      } catch {}
+      throw new Error(message || `请求失败 (${res.status})`);
     }
 
     return res.json();
   } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') {
+      throw new Error('请求超时，请稍后重试');
+    }
     throw error;
   }
 }
@@ -361,7 +384,30 @@ export async function updateTranscript(sessionId: string, transcript: any[]): Pr
 }
 
 export interface AudioUploadCallbacks {
-  onChunk: (text: string, window: number, total: number) => void;
+  onStatus?: (message: string, segment: number, total: number) => void;
+  onChunk: (
+    text: string,
+    segment: number,
+    segmentTotal: number,
+    meta?: {
+      chunkId?: string;
+      rawText?: string;
+      isAiCorrected?: boolean;
+      correctionError?: string | null;
+      isFinal?: boolean;
+    },
+  ) => void;
+  onCorrection?: (
+    text: string,
+    segment: number,
+    segmentTotal: number,
+    meta?: {
+      chunkId?: string;
+      rawText?: string;
+      isAiCorrected?: boolean;
+      correctionError?: string | null;
+    },
+  ) => void;
   onDone: (note: BackendNote | null) => void;
   onError: (error: string) => void;
 }
@@ -407,8 +453,35 @@ export function uploadAudio(
           try {
             const event = JSON.parse(line.slice(6));
             switch (event.type) {
+              case 'status':
+                callbacks.onStatus?.(event.message || '', event.segment ?? 0, event.total ?? 0);
+                break;
               case 'chunk':
-                callbacks.onChunk(event.text, event.window, event.total);
+                callbacks.onChunk(
+                  event.text,
+                  event.segment ?? event.window ?? 0,
+                  event.segment_total ?? event.total ?? 0,
+                  {
+                    chunkId: event.chunk_id,
+                    rawText: event.raw_text,
+                    isAiCorrected: event.is_ai_corrected,
+                    correctionError: event.correction_error,
+                    isFinal: event.is_final,
+                  },
+                );
+                break;
+              case 'correction':
+                callbacks.onCorrection?.(
+                  event.text,
+                  event.segment ?? 0,
+                  event.segment_total ?? event.total ?? 0,
+                  {
+                    chunkId: event.chunk_id,
+                    rawText: event.raw_text,
+                    isAiCorrected: event.is_ai_corrected,
+                    correctionError: event.correction_error,
+                  },
+                );
                 break;
               case 'done':
                 callbacks.onDone(event.note || null);
@@ -543,5 +616,165 @@ export async function searchVectors(query: string, sessionId?: string, notebookI
     method: 'POST',
     body: JSON.stringify({ query, session_id: sessionId, notebook_id: notebookId, limit }),
   });
+  return res;
+}
+
+// Mind Map API
+export interface MindMapNode {
+  id: string;
+  title: string;
+  description?: string;
+  type: 'topic' | 'concept' | 'key_point' | 'difficulty' | 'example' | 'conclusion';
+  importance: 'high' | 'medium' | 'low';
+  sources?: Array<{
+    source_type: string;
+    snippet: string;
+    page?: number | null;
+    block_id?: string;
+  }>;
+  children?: MindMapNode[];
+}
+
+export interface MindMapData {
+  title: string;
+  summary?: string;
+  nodes: MindMapNode[];
+}
+
+export interface MindMapStatus {
+  session_id: string;
+  status: 'empty' | 'not_generated' | 'generating' | 'ready' | 'stale' | 'error';
+  mind_map: MindMapData | null;
+  generated_at?: string;
+  task_id?: string;
+  progress?: number;
+  error?: string | null;
+}
+
+export async function getSessionMindMap(sessionId: string): Promise<MindMapStatus> {
+  const res = await request<any>(`/api/mindmap/session/${sessionId}`, { timeoutMs: 15000 });
+  return res;
+}
+
+export async function generateSessionMindMap(sessionId: string): Promise<MindMapStatus> {
+  const res = await request<any>(`/api/mindmap/session/${sessionId}/generate`, { method: 'POST', timeoutMs: 15000 });
+  return res;
+}
+
+export async function deleteSessionMindMap(sessionId: string): Promise<{ session_id: string; status: string }> {
+  const res = await request<any>(`/api/mindmap/session/${sessionId}`, { method: 'DELETE' });
+  return res;
+}
+
+// ── Quiz ──
+
+export interface QuizOption {
+  id: string;
+  text: string;
+  explanation?: string;
+}
+
+export interface QuizQuestion {
+  id: string;
+  question: string;
+  options: QuizOption[];
+  answer?: string;
+  explanation?: string;
+  source?: {
+    source_type: string;
+    snippet: string;
+    page?: number | null;
+  };
+}
+
+export interface QuizBankStatus {
+  session_id: string;
+  status: 'empty' | 'not_generated' | 'generating' | 'ready' | 'stale' | 'error';
+  question_count: number;
+  task_id?: string | null;
+  progress?: number;
+  error?: string | null;
+}
+
+export interface QuizListItem {
+  quiz_id: string;
+  title: string;
+  question_count: number;
+  questions: Array<{ id: string; question: string; options: Array<{ id: string; text: string }> }>;
+  generated_at?: string;
+  submitted: boolean;
+  score?: {
+    score: number;
+    total: number;
+    percentage: number;
+  } | null;
+}
+
+export interface QuizDetail {
+  quiz_id: string;
+  title: string;
+  questions: QuizQuestion[];
+  generated_at?: string;
+  submission?: {
+    answers: Record<string, string>;
+    score: number;
+    total: number;
+    percentage: number;
+    results: Array<{
+      question_id: string;
+      correct: boolean;
+      selected: string;
+      answer: string;
+      explanation: string;
+    }>;
+    submitted_at: string;
+  };
+}
+
+export interface QuizSubmitResult {
+  score: number;
+  total: number;
+  percentage: number;
+  results: Array<{
+    question_id: string;
+    correct: boolean;
+    selected: string;
+    answer: string;
+    explanation: string;
+  }>;
+}
+
+export async function getQuizBankStatus(sessionId: string): Promise<QuizBankStatus> {
+  const res = await request<any>(`/api/quiz/session/${sessionId}/bank/status`, { timeoutMs: 15000 });
+  return res;
+}
+
+export async function rebuildQuizBank(sessionId: string): Promise<QuizBankStatus> {
+  const res = await request<any>(`/api/quiz/session/${sessionId}/bank/rebuild`, { method: 'POST', timeoutMs: 30000 });
+  return res;
+}
+
+export async function getSessionQuizzes(sessionId: string): Promise<QuizListItem[]> {
+  const res = await request<any>(`/api/quiz/session/${sessionId}`, { timeoutMs: 15000 });
+  return res;
+}
+
+export async function generateSessionQuiz(sessionId: string): Promise<{ quiz_id: string; title: string; questions: Array<{ id: string; question: string; options: Array<{ id: string; text: string }> }> } | QuizBankStatus> {
+  const res = await request<any>(`/api/quiz/session/${sessionId}/generate`, { method: 'POST', timeoutMs: 30000 });
+  return res;
+}
+
+export async function getQuizDetail(sessionId: string, quizId: string): Promise<QuizDetail> {
+  const res = await request<any>(`/api/quiz/session/${sessionId}/${quizId}`, { timeoutMs: 15000 });
+  return res;
+}
+
+export async function submitQuizAnswers(sessionId: string, quizId: string, answers: Record<string, string>): Promise<QuizSubmitResult> {
+  const res = await request<any>(`/api/quiz/session/${sessionId}/${quizId}/submit`, { method: 'POST', body: JSON.stringify({ answers }), timeoutMs: 15000 });
+  return res;
+}
+
+export async function deleteQuiz(sessionId: string, quizId: string): Promise<{ session_id: string; quiz_id: string; status: string }> {
+  const res = await request<any>(`/api/quiz/session/${sessionId}/${quizId}`, { method: 'DELETE' });
   return res;
 }

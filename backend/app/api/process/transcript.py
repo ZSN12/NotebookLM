@@ -7,6 +7,7 @@ from app.core.database import get_db
 from app.core.auth import get_current_user
 from app.models import Note, Session as DBSession, Notebook, User
 from app.config import DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL
+from app.services.prompt_loader import load_prompt
 
 router = APIRouter()
 
@@ -19,30 +20,17 @@ def generate_summary(transcript_text: str, course_title: str):
     from openai import OpenAI
 
     client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
-
-    prompt = f"""你是专业的课程内容总结助手。请根据以下课程内容生成一份简洁的摘要。
-
-课程名称：{course_title}
-
-录音转写内容：
-{transcript_text}
-
-要求：
-1. 提取核心知识点（3-5条）
-2. 总结重点难点
-3. 输出格式清晰简洁
-4. 不超过200字
-
-摘要："""
+    prompt_template = load_prompt("summary")
+    prompt = prompt_template.render(
+        course_title=course_title,
+        text=transcript_text,
+    )
 
     try:
         response = client.chat.completions.create(
             model=DEEPSEEK_MODEL,
             messages=[
-                {
-                    "role": "system",
-                    "content": "你是一个专业的课程内容总结助手。",
-                },
+                {"role": "system", "content": prompt_template.system},
                 {"role": "user", "content": prompt},
             ],
             temperature=0.3,

@@ -12,7 +12,7 @@ interface RichTextEditorProps {
 
 const RichTextEditor = forwardRef<HTMLDivElement, RichTextEditorProps>(
   ({ value, onChange, onFocus, onBlur, placeholder, className }, ref) => {
-    const editorRef = useRef<HTMLDivElement>(null);
+    const editorRef = useRef<HTMLDivElement | null>(null) as React.MutableRefObject<HTMLDivElement | null>;
     const isInternalUpdate = useRef(false);
 
     useEffect(() => {
@@ -41,7 +41,7 @@ const RichTextEditor = forwardRef<HTMLDivElement, RichTextEditorProps>(
           if (typeof ref === 'function') {
             ref(node);
           } else if (ref) {
-            (ref as any).current = node;
+            ((ref as unknown) as { current: HTMLDivElement | null }).current = node;
           }
         }}
         contentEditable

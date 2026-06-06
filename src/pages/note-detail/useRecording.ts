@@ -1,7 +1,6 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
-import { streamAudioChunk, finishRecording, getAudioUrl, updateSessionDuration, fetchNote } from '@/services/api';
-
-const REALTIME_INTERVAL_MS = 2500;
+import { ASRWebSocketClient } from '@/services/asrWebSocket';
+import { finishRecording, getAudioUrl, updateSessionDuration, fetchNote } from '@/services/api';
 
 export function useRecording(sessionId: string | undefined) {
   const [isRecording, setIsRecording] = useState(false);
@@ -22,13 +21,12 @@ export function useRecording(sessionId: string | undefined) {
   const startTimeRef = useRef<number>(0);
   const pausedDurationRef = useRef<number>(0);
   const pauseStartTimeRef = useRef<number>(0);
-  const chunkIndexRef = useRef(0);
-  const chunkIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const timerIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const pendingChunksRef = useRef<Array<{ blob: Blob; index: number; timestamp: number }>>([]);
-  const isSendingRef = useRef(false);
-  const rawAudioBufferRef = useRef<Float32Array[]>([]);
   const audioPlayerRef = useRef<HTMLAudioElement | null>(null);
+
+  const wsClientRef = useRef<ASRWebSocketClient | null>(null);
+  const audioWorkletRef = useRef<AudioWorkletNode | null>(null);
+  const scriptProcessorRef = useRef<ScriptProcessorNode | null>(null);
 
   const formatTime = useCallback((totalMs: number) => {
     const totalSeconds = Math.floor(totalMs / 1000);
@@ -38,30 +36,13 @@ export function useRecording(sessionId: string | undefined) {
     return `${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}:${String(ss).padStart(2, '0')}`;
   }, []);
 
-  const encodeWavBlob = useCallback((audioBuffer: Float32Array, sampleRate: number): Blob => {
-    const buffer = new ArrayBuffer(44 + audioBuffer.length * 2);
-    const view = new DataView(buffer);
-    const writeString = (offset: number, str: string) => {
-      for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
-    };
-    writeString(0, 'RIFF');
-    view.setUint32(4, 36 + audioBuffer.length * 2, true);
-    writeString(8, 'WAVE');
-    writeString(12, 'fmt ');
-    view.setUint32(16, 16, true);
-    view.setUint16(20, 1, true);
-    view.setUint16(22, 1, true);
-    view.setUint32(24, sampleRate, true);
-    view.setUint32(28, sampleRate * 2, true);
-    view.setUint16(32, 2, true);
-    view.setUint16(34, 16, true);
-    writeString(36, 'data');
-    view.setUint32(40, audioBuffer.length * 2, true);
-    for (let i = 0; i < audioBuffer.length; i++) {
-      const s = Math.max(-1, Math.min(1, audioBuffer[i]));
-      view.setInt16(44 + i * 2, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+  const floatToInt16 = useCallback((floatArray: Float32Array): Int16Array => {
+    const int16 = new Int16Array(floatArray.length);
+    for (let i = 0; i < floatArray.length; i++) {
+      const s = Math.max(-1, Math.min(1, floatArray[i]));
+      int16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
     }
-    return new Blob([buffer], { type: 'audio/wav' });
+    return int16;
   }, []);
 
   const updateWaveform = useCallback(() => {
@@ -78,84 +59,98 @@ export function useRecording(sessionId: string | undefined) {
     animationFrameRef.current = requestAnimationFrame(updateWaveform);
   }, []);
 
-  const sendNextChunk = useCallback(async (onTranscribed: (text: string) => void) => {
-    if (pendingChunksRef.current.length === 0 || isSendingRef.current || !sessionId) return;
-    isSendingRef.current = true;
-    const { blob, index } = pendingChunksRef.current.shift()!;
-    try {
-      await streamAudioChunk(blob, sessionId, index, async (text) => {
-        if (text) onTranscribed(text);
-      });
-    } catch (error) {
-      console.error('Chunk upload failed:', error);
-      setIsError(true);
-      setErrorMessage('录音上传失败，请检查网络连接后重试');
-    } finally {
-      isSendingRef.current = false;
-      if (pendingChunksRef.current.length > 0) setTimeout(() => sendNextChunk(onTranscribed), 50);
-    }
-  }, [sessionId]);
+  const _cleanupTimers = useCallback(() => {
+    if (timerIntervalRef.current) { clearInterval(timerIntervalRef.current); timerIntervalRef.current = null; }
+    if (animationFrameRef.current) { cancelAnimationFrame(animationFrameRef.current); animationFrameRef.current = null; }
+  }, []);
 
-  const _startChunkInterval = useCallback((onTranscribed: (text: string) => void) => {
-    chunkIntervalRef.current = setInterval(() => {
-      if (isPausedRef.current || rawAudioBufferRef.current.length === 0) return;
-      const totalLength = rawAudioBufferRef.current.reduce((sum, buf) => sum + buf.length, 0);
-      const combined = new Float32Array(totalLength);
-      let offset = 0;
-      for (const buf of rawAudioBufferRef.current) { combined.set(buf, offset); offset += buf.length; }
-      pendingChunksRef.current.push({ blob: encodeWavBlob(combined, 16000), index: chunkIndexRef.current, timestamp: Date.now() - startTimeRef.current - pausedDurationRef.current });
-      chunkIndexRef.current++;
-      rawAudioBufferRef.current = [];
-      if (!isSendingRef.current) sendNextChunk(onTranscribed);
-    }, REALTIME_INTERVAL_MS);
-
+  const _startTimerOnly = useCallback(() => {
     timerIntervalRef.current = setInterval(() => {
       if (!isPausedRef.current)
         setCurrentTime(formatTime(Date.now() - startTimeRef.current - pausedDurationRef.current));
     }, 200);
     animationFrameRef.current = requestAnimationFrame(updateWaveform);
-  }, [encodeWavBlob, sendNextChunk, updateWaveform, formatTime]);
+  }, [formatTime, updateWaveform]);
 
-  const _cleanupTimers = useCallback(() => {
-    if (chunkIntervalRef.current) { clearInterval(chunkIntervalRef.current); chunkIntervalRef.current = null; }
-    if (timerIntervalRef.current) { clearInterval(timerIntervalRef.current); timerIntervalRef.current = null; }
-    if (animationFrameRef.current) { cancelAnimationFrame(animationFrameRef.current); animationFrameRef.current = null; }
-  }, []);
-
-  const startRecording = useCallback(async (onTranscribed: (text: string) => void) => {
+  const startRecording = useCallback(async (
+    onPartial: (text: string) => void,
+    onFinal: (text: string) => void,
+  ) => {
     if (!sessionId) return;
     setIsError(false);
     setErrorMessage('');
     setIsProcessing(true);
 
     try {
+      // 1. Get mic stream
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       streamRef.current = stream;
 
-      const audioContext = new AudioContext({ sampleRate: 16000 });
+      // 2. Setup AudioContext @ 16kHz
+      let audioContext: AudioContext;
+      try {
+        audioContext = new AudioContext({ sampleRate: 16000 });
+      } catch {
+        audioContext = new AudioContext();
+      }
       audioContextRef.current = audioContext;
+
+      // 3. Setup WebSocket
+      const wsClient = new ASRWebSocketClient(sessionId, {
+        onPartial: (text) => onPartial(text),
+        onFinal: (text) => onFinal(text),
+        onStatus: () => { /* optional */ },
+        onError: (detail) => {
+          setIsError(true);
+          setErrorMessage(detail);
+        },
+        onDone: () => { /* handled by stopRecording */ },
+      });
+      await wsClient.connect();
+      wsClientRef.current = wsClient;
+
+      // 4. Setup audio processing
       const source = audioContext.createMediaStreamSource(stream);
       const analyser = audioContext.createAnalyser();
       analyser.fftSize = 256;
       source.connect(analyser);
       analyserRef.current = analyser;
 
-      const processor = audioContext.createScriptProcessor(4096, 1, 1);
-      rawAudioBufferRef.current = [];
-      processor.onaudioprocess = (e) => {
-        if (isPausedRef.current) return;
-        rawAudioBufferRef.current.push(new Float32Array(e.inputBuffer.getChannelData(0)));
-      };
-      source.connect(processor);
-      processor.connect(audioContext.destination);
+      // Try AudioWorklet first, fallback to ScriptProcessorNode
+      try {
+        await audioContext.audioWorklet.addModule('/pcm-processor.js');
+        const worklet = new AudioWorkletNode(audioContext, 'pcm-processor', {
+          processorOptions: { bufferSize: 2560 }, // ~160ms @ 16kHz
+        });
+        worklet.port.onmessage = (e) => {
+          if (!isPausedRef.current && wsClientRef.current) {
+            const int16 = floatToInt16(e.data);
+            wsClientRef.current.sendAudioFrame(int16);
+          }
+        };
+        source.connect(worklet);
+        audioWorkletRef.current = worklet;
+      } catch {
+        // Fallback: ScriptProcessorNode
+        const processor = audioContext.createScriptProcessor(4096, 1, 1);
+        processor.onaudioprocess = (e) => {
+          if (isPausedRef.current) return;
+          const floatData = e.inputBuffer.getChannelData(0);
+          const int16 = floatToInt16(floatData);
+          wsClient.sendAudioFrame(int16);
+        };
+        source.connect(processor);
+        processor.connect(audioContext.destination);
+        scriptProcessorRef.current = processor;
+      }
 
+      // 5. Start waveform + timer
       startTimeRef.current = Date.now();
       pausedDurationRef.current = 0;
       pauseStartTimeRef.current = 0;
-      chunkIndexRef.current = 0;
       isPausedRef.current = false;
 
-      _startChunkInterval(onTranscribed);
+      _startTimerOnly();
 
       setIsRecording(true);
       setIsPaused(false);
@@ -172,73 +167,88 @@ export function useRecording(sessionId: string | undefined) {
         setErrorMessage('录音启动失败，请检查设备并重试。');
       }
     }
-  }, [sessionId, _startChunkInterval]);
+  }, [sessionId, floatToInt16, _startTimerOnly]);
 
   const pauseRecording = useCallback(() => {
-    _cleanupTimers();
-    rawAudioBufferRef.current = [];
-    pauseStartTimeRef.current = Date.now();
     isPausedRef.current = true;
+    wsClientRef.current?.pause();
+    pauseStartTimeRef.current = Date.now();
+    _cleanupTimers();
     setIsPaused(true);
     setWaveHeights(Array(60).fill(4));
   }, [_cleanupTimers]);
 
-  const resumeRecording = useCallback((onTranscribed: (text: string) => void) => {
+  const resumeRecording = useCallback(() => {
     isPausedRef.current = false;
     if (pauseStartTimeRef.current > 0) {
       pausedDurationRef.current += Date.now() - pauseStartTimeRef.current;
       pauseStartTimeRef.current = 0;
     }
-    _startChunkInterval(onTranscribed);
+    wsClientRef.current?.resume();
+    _startTimerOnly();
     setIsPaused(false);
-  }, [_startChunkInterval]);
+  }, [_startTimerOnly]);
 
-  const stopRecording = useCallback((onTranscriptUpdate: (text: string) => void) => {
+  const stopRecording = useCallback(async (onTranscriptUpdate: (text: string) => void) => {
+    // 1. Cleanup audio
     if (streamRef.current) { streamRef.current.getTracks().forEach((track) => track.stop()); streamRef.current = null; }
-    if (audioContextRef.current) { audioContextRef.current.close(); audioContextRef.current = null; }
+    if (audioContextRef.current) { await audioContextRef.current.close(); audioContextRef.current = null; }
     _cleanupTimers();
 
-    if (rawAudioBufferRef.current.length > 0 && sessionId) {
-      const totalLength = rawAudioBufferRef.current.reduce((sum, buf) => sum + buf.length, 0);
-      const combined = new Float32Array(totalLength);
-      let offset = 0;
-      for (const buf of rawAudioBufferRef.current) { combined.set(buf, offset); offset += buf.length; }
-      pendingChunksRef.current.push({ blob: encodeWavBlob(combined, 16000), index: chunkIndexRef.current, timestamp: Date.now() - startTimeRef.current - pausedDurationRef.current });
-      sendNextChunk(() => {});
-    }
-
-    if (sessionId && startTimeRef.current) {
-      updateSessionDuration(sessionId, Date.now() - startTimeRef.current - pausedDurationRef.current).catch(console.error);
-    }
-
-    if (sessionId) {
-      finishRecording(sessionId).then(() => setAudioPlaybackUrl(getAudioUrl(sessionId))).catch(console.error);
-    }
-
-    setWaveHeights(Array(60).fill(4));
+    // 2. Stop WebSocket gracefully
     setIsRecording(false);
     setIsPaused(false);
-    setIsProcessing(false);
+    setIsProcessing(true);
+    setWaveHeights(Array(60).fill(4));
 
-    if (sessionId) {
-      fetchNote(sessionId).then((note: any) => {
-        if (note?.transcript && Array.isArray(note.transcript) && note.transcript.length > 0) {
-          const corrected = note.transcript
-            .sort((a: any, b: any) => (a.chunk_index || 0) - (b.chunk_index || 0))
-            .map((chunk: any) => chunk.text || '').join(' ');
-          if (corrected.trim()) onTranscriptUpdate(corrected);
+    try {
+      if (wsClientRef.current) {
+        await wsClientRef.current.end();
+        wsClientRef.current.close();
+        wsClientRef.current = null;
+      }
+
+      // 3. Update session duration
+      if (sessionId && startTimeRef.current) {
+        await updateSessionDuration(sessionId, Date.now() - startTimeRef.current - pausedDurationRef.current);
+      }
+
+      // 4. Fetch updated note and apply final transcript
+      if (sessionId) {
+        const note = await fetchNote(sessionId);
+        if (note?.transcript && note.transcript.length > 0) {
+          const sorted = [...note.transcript].sort(
+            (a: any, b: any) => (a.chunk_index || 0) - (b.chunk_index || 0)
+          );
+          const hasFinalTranscript = sorted.some((c: any) => c.correction_stage === 'final');
+          if (!hasFinalTranscript) return;
+          const dbText = sorted
+            .map((c: any) => c.display_text || c.text || c.raw_text || '')
+            .filter(Boolean)
+            .join('\n\n')
+            .trim();
+          if (dbText && dbText.length > 0) {
+            onTranscriptUpdate(dbText);
+          }
         }
-      }).catch(console.error);
+        setAudioPlaybackUrl(getAudioUrl(sessionId));
+      }
+    } catch (error: any) {
+      console.error('Failed to finish recording:', error);
+      setIsError(true);
+      setErrorMessage(error?.message || '录音收尾失败，请稍后重试');
+    } finally {
+      setIsProcessing(false);
     }
-  }, [sessionId, _cleanupTimers, sendNextChunk, encodeWavBlob]);
+  }, [sessionId, _cleanupTimers]);
 
   useEffect(() => {
     return () => {
       if (streamRef.current) streamRef.current.getTracks().forEach((track) => track.stop());
       if (audioContextRef.current) audioContextRef.current.close();
       _cleanupTimers();
-      rawAudioBufferRef.current = [];
-      pendingChunksRef.current = [];
+      wsClientRef.current?.close();
+      wsClientRef.current = null;
     };
   }, [_cleanupTimers]);
 
