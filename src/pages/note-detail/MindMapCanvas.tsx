@@ -1,10 +1,12 @@
-import { useCallback, useMemo } from 'react';
+import { useCallback, useEffect, useRef } from 'react';
 import {
   ReactFlow,
+  ReactFlowProvider,
   Background,
   Controls,
   useNodesState,
   useEdgesState,
+  useReactFlow,
   type Node,
   type Edge,
   type NodeProps,
@@ -13,26 +15,39 @@ import {
   MarkerType,
 } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
-import { ChevronRight, ChevronDown, AlertCircle } from 'lucide-react';
+import { ChevronRight, ChevronDown, BookOpen, FileText, Presentation, ArrowRight } from 'lucide-react';
 import type { MindMapNode, MindMapData } from '@/services/api';
+import ELK from 'elkjs/lib/elk.bundled.js';
 
-// ── Color mapping by node type ──
-const TYPE_COLORS: Record<string, { bg: string; border: string; text: string; badge: string; edge: string }> = {
-  topic:      { bg: 'bg-purple-50 dark:bg-purple-900/30',  border: 'border-purple-300 dark:border-purple-700', text: 'text-purple-700 dark:text-purple-300', badge: 'bg-purple-100 text-purple-700 dark:bg-purple-800 dark:text-purple-300', edge: '#9333ea' },
-  concept:    { bg: 'bg-blue-50 dark:bg-blue-900/30',      border: 'border-blue-300 dark:border-blue-700',     text: 'text-blue-700 dark:text-blue-300',     badge: 'bg-blue-100 text-blue-700 dark:bg-blue-800 dark:text-blue-300',     edge: '#2563eb' },
-  key_point:  { bg: 'bg-green-50 dark:bg-green-900/30',    border: 'border-green-300 dark:border-green-700',   text: 'text-green-700 dark:text-green-300',   badge: 'bg-green-100 text-green-700 dark:bg-green-800 dark:text-green-300', edge: '#16a34a' },
-  difficulty: { bg: 'bg-red-50 dark:bg-red-900/30',        border: 'border-red-300 dark:border-red-700',       text: 'text-red-700 dark:text-red-300',       badge: 'bg-red-100 text-red-700 dark:bg-red-800 dark:text-red-300',         edge: '#dc2626' },
-  example:    { bg: 'bg-amber-50 dark:bg-amber-900/30',    border: 'border-amber-300 dark:border-amber-700',   text: 'text-amber-700 dark:text-amber-300',   badge: 'bg-amber-100 text-amber-700 dark:bg-amber-800 dark:text-amber-300', edge: '#d97706' },
-  conclusion: { bg: 'bg-slate-50 dark:bg-slate-800/50',    border: 'border-slate-300 dark:border-slate-600',   text: 'text-slate-700 dark:text-slate-300',   badge: 'bg-slate-100 text-slate-700 dark:bg-slate-700 dark:text-slate-300', edge: '#64748b' },
+// ── Type accents (subtle left-border) ──
+const TYPE_ACCENT: Record<string, string> = {
+  topic:      'border-l-purple-400',
+  concept:    'border-l-blue-400',
+  key_point:  'border-l-emerald-400',
+  difficulty: 'border-l-rose-400',
+  example:    'border-l-amber-400',
+  process:    'border-l-cyan-400',
+  function:   'border-l-teal-400',
+  question:   'border-l-orange-400',
+  conclusion: 'border-l-slate-400',
 };
 
 const TYPE_LABELS: Record<string, string> = {
   topic: '主题', concept: '概念', key_point: '要点',
-  difficulty: '难点', example: '示例', conclusion: '结论',
+  difficulty: '难点', example: '示例', process: '流程',
+  function: '函数', question: '问题', conclusion: '结论',
 };
 
-const IMPORTANCE_DOTS: Record<string, string> = {
-  high: 'bg-red-400', medium: 'bg-amber-400', low: 'bg-slate-300',
+const TYPE_BADGE: Record<string, string> = {
+  topic:      'bg-purple-50 text-purple-600 dark:bg-purple-900/20 dark:text-purple-300',
+  concept:    'bg-blue-50 text-blue-600 dark:bg-blue-900/20 dark:text-blue-300',
+  key_point:  'bg-emerald-50 text-emerald-600 dark:bg-emerald-900/20 dark:text-emerald-300',
+  difficulty: 'bg-rose-50 text-rose-600 dark:bg-rose-900/20 dark:text-rose-300',
+  example:    'bg-amber-50 text-amber-600 dark:bg-amber-900/20 dark:text-amber-300',
+  process:    'bg-cyan-50 text-cyan-600 dark:bg-cyan-900/20 dark:text-cyan-300',
+  function:   'bg-teal-50 text-teal-600 dark:bg-teal-900/20 dark:text-teal-300',
+  question:   'bg-orange-50 text-orange-600 dark:bg-orange-900/20 dark:text-orange-300',
+  conclusion: 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300',
 };
 
 // ── Custom node component ──
@@ -41,234 +56,277 @@ function MindMapCardNode({ data, selected }: NodeProps) {
     label: string;
     nodeType: string;
     importance: string;
-    hasChildren: boolean;
-    isExpanded: boolean;
     isRoot: boolean;
   };
 
-  const colors = TYPE_COLORS[nodeData.nodeType] || TYPE_COLORS.conclusion;
+  const accent = TYPE_ACCENT[nodeData.nodeType] || TYPE_ACCENT.conclusion;
   const isRoot = nodeData.isRoot;
 
   return (
     <div
       className={`
-        px-3 py-2 rounded-xl border-2 shadow-sm transition-all cursor-pointer
-        ${colors.bg} ${colors.border}
-        ${selected ? 'ring-2 ring-purple-400 shadow-md' : ''}
-        ${isRoot ? 'px-5 py-3' : ''}
+        relative rounded-xl border bg-white dark:bg-slate-800
+        transition-all cursor-pointer group
+        ${isRoot
+          ? 'px-5 py-3 border-slate-800 dark:border-slate-600 bg-slate-800 dark:bg-slate-700 text-white shadow-lg'
+          : `px-3.5 py-2.5 border-slate-200 dark:border-slate-700 border-l-[3px] ${accent} shadow-sm hover:shadow-md hover:border-slate-300 dark:hover:border-slate-500`
+        }
+        ${selected ? 'ring-2 ring-blue-400 shadow-md' : ''}
       `}
     >
-      {/* Target handle (top or left) */}
-      {!isRoot && <Handle type="target" position={Position.Left} className="!w-2 !h-2 !bg-slate-300 !border-0" />}
+      {!isRoot && <Handle type="target" position={Position.Left} className="!w-1.5 !h-1.5 !bg-slate-300 !border-0" />}
+
+      {!isRoot && nodeData.importance === 'high' && (
+        <span className="absolute -top-1 -right-1 w-2 h-2 rounded-full bg-red-400 ring-2 ring-white dark:ring-slate-800" />
+      )}
 
       <div className="flex items-center gap-1.5">
-        {nodeData.hasChildren && (
-          <span className={`${colors.text} flex-shrink-0`}>
-            {nodeData.isExpanded ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronRight className="w-3.5 h-3.5" />}
-          </span>
-        )}
-        <span className={`text-[10px] px-1.5 py-0.5 rounded font-medium flex-shrink-0 ${colors.badge}`}>
-          {TYPE_LABELS[nodeData.nodeType] || nodeData.nodeType}
-        </span>
-        <span className={`${colors.text} ${isRoot ? 'text-base font-semibold' : 'text-sm font-medium'} truncate max-w-[180px]`}>
+        <span
+          className={`
+            line-clamp-2 max-w-[220px]
+            ${isRoot ? 'text-base font-semibold' : 'text-sm font-medium text-slate-700 dark:text-slate-200'}
+          `}
+          title={nodeData.label}
+        >
           {nodeData.label}
         </span>
-        {nodeData.importance === 'high' && (
-          <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${IMPORTANCE_DOTS[nodeData.importance]}`} />
-        )}
       </div>
 
-      {/* Source handle (right or bottom) */}
-      <Handle type="source" position={Position.Right} className="!w-2 !h-2 !bg-slate-300 !border-0" />
+      <Handle type="source" position={Position.Right} className="!w-1.5 !h-1.5 !bg-slate-300 !border-0" />
     </div>
   );
 }
 
 const nodeTypes = { mindMapCard: MindMapCardNode };
 
-// ── Layout algorithm: horizontal tree (XMind-like) ──
-const H_GAP = 60;  // horizontal gap between levels
-const V_GAP = 16;  // vertical gap between siblings
+// ── ELK Layout ──
+const elk = new ELK();
 
-interface LayoutNode {
-  id: string;
-  width: number;
-  height: number;
-  children: LayoutNode[];
-  x: number;
-  y: number;
-}
-
-function estimateNodeSize(node: MindMapNode, isRoot: boolean): { w: number; h: number } {
-  // Rough estimate based on title length
+function estimateNodeSize(title: string, isRoot: boolean): { w: number; h: number } {
   const charWidth = isRoot ? 14 : 11;
-  const padding = isRoot ? 80 : 70;
-  const w = Math.max(120, Math.min(260, node.title.length * charWidth + padding));
+  const padding = isRoot ? 60 : 44;
+  const w = Math.max(120, Math.min(260, title.length * charWidth + padding));
   const h = isRoot ? 48 : 40;
   return { w, h };
 }
 
-function buildLayoutTree(nodes: MindMapNode[], expanded: Set<string>, isRoot: boolean): LayoutNode[] {
-  return nodes.map(node => {
-    const { w, h } = estimateNodeSize(node, isRoot);
-    const children = (node.children?.length && expanded.has(node.id))
-      ? buildLayoutTree(node.children, expanded, false)
-      : [];
-    return { id: node.id, width: w, height: h, children, x: 0, y: 0 };
-  });
-}
-
-function layoutSubtree(node: LayoutNode): number {
-  if (node.children.length === 0) return node.height;
-
-  let totalChildHeight = 0;
-  for (const child of node.children) {
-    totalChildHeight += layoutSubtree(child);
+function flattenNodes(nodes: MindMapNode[], result: MindMapNode[] = []): MindMapNode[] {
+  for (const n of nodes) {
+    result.push(n);
+    if (n.children) flattenNodes(n.children, result);
   }
-  totalChildHeight += (node.children.length - 1) * V_GAP;
-
-  return Math.max(node.height, totalChildHeight);
+  return result;
 }
 
-function positionSubtree(node: LayoutNode, x: number, yCenter: number): void {
-  node.x = x;
-  node.y = yCenter - node.height / 2;
-
-  if (node.children.length === 0) return;
-
-  const childHeights = node.children.map(c => layoutSubtree(c));
-  const totalHeight = childHeights.reduce((a, b) => a + b, 0) + (node.children.length - 1) * V_GAP;
-  let currentY = yCenter - totalHeight / 2;
-
-  for (let i = 0; i < node.children.length; i++) {
-    const childCenter = currentY + childHeights[i] / 2;
-    positionSubtree(node.children[i], x + node.width + H_GAP, childCenter);
-    currentY += childHeights[i] + V_GAP;
-  }
-}
-
-// ── Convert MindMapData to React Flow nodes/edges ──
-function mindMapToFlow(
+/* eslint-disable @typescript-eslint/no-explicit-any */
+function buildElkGraph(
   data: MindMapData,
-  expanded: Set<string>,
-  onToggle: (id: string) => void,
-  onSelect: (node: MindMapNode) => void,
-): { nodes: Node[]; edges: Edge[] } {
+): { graph: any } {
+  const elkNodes: Record<string, unknown>[] = [];
+  const rootSize = estimateNodeSize(data.title || '知识导图', true);
+  elkNodes.push({ id: 'root', width: rootSize.w, height: rootSize.h });
+
+  function addElkNodes(nodes: MindMapNode[]) {
+    for (const n of nodes) {
+      const size = estimateNodeSize(n.title, false);
+      elkNodes.push({ id: n.id, width: size.w, height: size.h });
+      if (n.children?.length) {
+        addElkNodes(n.children);
+      }
+    }
+  }
+  addElkNodes(data.nodes);
+
+  const elkEdges: Record<string, unknown>[] = [];
+  function addTreeEdges(nodes: MindMapNode[], parentId: string) {
+    for (const n of nodes) {
+      elkEdges.push({ id: `e-${parentId}-${n.id}`, sources: [parentId], targets: [n.id] });
+      if (n.children?.length) {
+        addTreeEdges(n.children, n.id);
+      }
+    }
+  }
+  addTreeEdges(data.nodes, 'root');
+
+  const relations = data.relations || [];
+  for (const rel of relations) {
+    elkEdges.push({
+      id: `rel-${rel.source}-${rel.target}`,
+      sources: [rel.source],
+      targets: [rel.target],
+      labels: [{ text: rel.label }],
+    });
+  }
+
+  return {
+    graph: {
+      id: 'root',
+      layoutOptions: {
+        'elk.algorithm': 'layered',
+        'elk.direction': 'RIGHT',
+        'elk.spacing.nodeNode': '40',
+        'elk.layered.spacing.nodeNodeBetweenLayers': '90',
+        'elk.spacing.componentComponent': '50',
+        'elk.edgeRouting': 'ORTHOGONAL',
+        'elk.layered.nodePlacement.strategy': 'BRANDES_KOEPF',
+        'elk.layered.crossingMinimization.strategy': 'LAYER_SWEEP',
+      },
+      children: elkNodes,
+      edges: elkEdges,
+    },
+  };
+}
+
+async function mindMapToFlow(
+  data: MindMapData,
+): Promise<{ nodes: Node[]; edges: Edge[] }> {
+  const { graph } = buildElkGraph(data);
+
+  const layout = await elk.layout(graph);
+
   const flowNodes: Node[] = [];
   const flowEdges: Edge[] = [];
 
-  // Flatten tree into layout nodes
-  const layoutRoots = buildLayoutTree(data.nodes, expanded, false);
+  const allNodes = flattenNodes(data.nodes);
+  const nodeMap = new Map(allNodes.map(n => [n.id, n]));
+  nodeMap.set('root', { id: 'root', title: data.title || '知识导图', type: 'topic', importance: 'high' } as MindMapNode);
 
-  // Build a virtual root for the center topic
-  const rootSize = estimateNodeSize({ id: 'root', title: data.title, type: 'topic', importance: 'high' } as MindMapNode, true);
-  const layoutRoot: LayoutNode = {
-    id: 'root',
-    width: rootSize.w,
-    height: rootSize.h,
-    children: layoutRoots,
-    x: 0,
-    y: 0,
-  };
+  for (const elkNode of layout.children || []) {
+    const mmNode = nodeMap.get(elkNode.id);
+    if (!mmNode) continue;
 
-  // Position the tree
-  layoutSubtree(layoutRoot);
-  positionSubtree(layoutRoot, 0, 0);
-
-  // Walk the layout tree and create flow nodes/edges
-  function walk(layoutNode: LayoutNode, mindMapNode: MindMapNode | null, isRoot: boolean) {
-    const colors = TYPE_COLORS[isRoot ? 'topic' : (mindMapNode?.type || 'conclusion')];
+    const isRoot = elkNode.id === 'root';
 
     flowNodes.push({
-      id: layoutNode.id,
+      id: elkNode.id,
       type: 'mindMapCard',
-      position: { x: layoutNode.x, y: layoutNode.y },
+      position: { x: elkNode.x || 0, y: elkNode.y || 0 },
       data: {
-        label: isRoot ? data.title : (mindMapNode?.title || ''),
-        nodeType: isRoot ? 'topic' : (mindMapNode?.type || 'conclusion'),
-        importance: isRoot ? 'high' : (mindMapNode?.importance || 'low'),
-        hasChildren: isRoot ? data.nodes.length > 0 : (mindMapNode?.children?.length || 0) > 0,
-        isExpanded: isRoot ? expanded.has(layoutNode.id) : expanded.has(layoutNode.id),
+        label: isRoot ? (data.title || '知识导图') : mmNode.title,
+        nodeType: isRoot ? 'topic' : (mmNode.type || 'conclusion'),
+        importance: isRoot ? 'high' : (mmNode.importance || 'low'),
         isRoot,
-        mindMapNodeId: layoutNode.id,
-      } as any,
+        mindMapNodeId: elkNode.id,
+      } as Record<string, unknown>,
     });
+  }
 
-    // Create edges to children
-    for (let i = 0; i < layoutNode.children.length; i++) {
-      const childLayout = layoutNode.children[i];
-      const childMindMap = isRoot
-        ? data.nodes[i]
-        : mindMapNode?.children?.[i];
+  for (const elkEdge of layout.edges || []) {
+    const isRelation = elkEdge.id?.startsWith('rel-');
 
+    if (isRelation) {
       flowEdges.push({
-        id: `e-${layoutNode.id}-${childLayout.id}`,
-        source: layoutNode.id,
-        target: childLayout.id,
-        type: 'smoothstep',
-        style: { stroke: colors.edge, strokeWidth: 2 },
-        markerEnd: { type: MarkerType.ArrowClosed, width: 12, height: 12, color: colors.edge },
+        id: elkEdge.id,
+        source: elkEdge.sources[0],
+        target: elkEdge.targets[0],
+        type: 'default',
+        style: {
+          stroke: '#94a3b8',
+          strokeWidth: 1,
+          strokeDasharray: '5,5',
+          opacity: 0.5,
+        },
+        label: elkEdge.labels?.[0]?.text || '',
+        labelStyle: { fill: '#64748b', fontSize: 10 },
+        labelBgStyle: { fill: '#f8fafc', opacity: 0.9 },
+        labelBgPadding: [4, 4],
+        markerEnd: { type: MarkerType.ArrowClosed, width: 6, height: 6, color: '#94a3b8' },
       });
-
-      walk(childLayout, childMindMap || null, false);
+    } else {
+      flowEdges.push({
+        id: elkEdge.id,
+        source: elkEdge.sources[0],
+        target: elkEdge.targets[0],
+        type: 'default',
+        style: { stroke: '#cbd5e1', strokeWidth: 1.5 },
+        markerEnd: { type: MarkerType.ArrowClosed, width: 10, height: 10, color: '#cbd5e1' },
+      });
     }
   }
 
-  walk(layoutRoot, null, true);
   return { nodes: flowNodes, edges: flowEdges };
+}
+
+// ── All nodes expanded (folding disabled) ──
+function collectAllNodeIds(nodes: MindMapNode[], result = new Set<string>()): Set<string> {
+  for (const n of nodes) {
+    result.add(n.id);
+    if (n.children) collectAllNodeIds(n.children, result);
+  }
+  return result;
+}
+
+function computeDefaultExpanded(nodes: MindMapNode[]): Set<string> {
+  return collectAllNodeIds(nodes, new Set<string>(['root']));
 }
 
 // ── Main component ──
 interface MindMapCanvasProps {
   data: MindMapData;
-  expanded: Set<string>;
-  onToggle: (id: string) => void;
   onSelect: (node: MindMapNode) => void;
   selectedNode: MindMapNode | null;
-  onSourceClick: (source: { source_type: string; page?: number | null; block_id?: string }) => void;
+  onSourceClick: (source: { source_type: string; page?: number | null; block_id?: string; snippet?: string }) => void;
 }
 
-export default function MindMapCanvas({
+function MindMapCanvasInner({
   data,
-  expanded,
-  onToggle,
   onSelect,
   selectedNode,
   onSourceClick,
 }: MindMapCanvasProps) {
-  const { nodes: flowNodes, edges: flowEdges } = useMemo(
-    () => mindMapToFlow(data, expanded, onToggle, onSelect),
-    [data, expanded],
-  );
+  const [nodes, setNodes, onNodesChange] = useNodesState([] as Node[]);
+  const [edges, setEdges, onEdgesChange] = useEdgesState([] as Edge[]);
+  const layoutInProgress = useRef(false);
+  const queuedExpanded = useRef<Set<string> | null>(null);
+  const { fitView } = useReactFlow();
 
-  const [nodes, setNodes, onNodesChange] = useNodesState(flowNodes);
-  const [edges, setEdges, onEdgesChange] = useEdgesState(flowEdges);
+  const runLayout = useCallback(() => {
+    if (layoutInProgress.current) return;
+    layoutInProgress.current = true;
 
-  // Update nodes/edges when data changes
-  useMemo(() => {
-    setNodes(flowNodes);
-    setEdges(flowEdges);
-  }, [flowNodes, flowEdges, setNodes, setEdges]);
+    mindMapToFlow(data)
+      .then((result) => {
+        setNodes(result.nodes);
+        setEdges(result.edges);
+        layoutInProgress.current = false;
+        setTimeout(() => fitView({ padding: 0.2, duration: 300 }), 50);
+      })
+      .catch((err) => {
+        console.error('ELK layout failed:', err);
+        layoutInProgress.current = false;
+      });
+  }, [data, setNodes, setEdges, fitView]);
+
+  useEffect(() => {
+    runLayout();
+  }, [data, runLayout]);
+
+  const handleSelectNode = useCallback((id: string) => {
+    const findNode = (ns: MindMapNode[], targetId: string): MindMapNode | null => {
+      for (const n of ns) {
+        if (n.id === targetId) return n;
+        if (n.children) {
+          const found = findNode(n.children, targetId);
+          if (found) return found;
+        }
+      }
+      return null;
+    };
+    const mmNode = findNode(data.nodes, id);
+    if (mmNode) {
+      onSelect(mmNode);
+      setTimeout(() => {
+        fitView({ nodes: [{ id }], padding: 0.3, duration: 500 });
+      }, 100);
+    }
+  }, [data.nodes, onSelect, fitView]);
 
   const onNodeClick = useCallback(
     (_: React.MouseEvent, node: Node) => {
-      // Find the MindMapNode by id
-      const findNode = (nodes: MindMapNode[], id: string): MindMapNode | null => {
-        for (const n of nodes) {
-          if (n.id === id) return n;
-          if (n.children) {
-            const found = findNode(n.children, id);
-            if (found) return found;
-          }
-        }
-        return null;
-      };
       if (node.id === 'root') return;
-      const mmNode = findNode(data.nodes, node.id);
-      if (mmNode) onSelect(mmNode);
-      onToggle(node.id);
+      handleSelectNode(node.id);
     },
-    [data.nodes, onSelect, onToggle],
+    [handleSelectNode],
   );
 
   return (
@@ -283,87 +341,160 @@ export default function MindMapCanvas({
           onNodeClick={onNodeClick}
           nodeTypes={nodeTypes}
           fitView
-          fitViewOptions={{ padding: 0.3 }}
+          fitViewOptions={{ padding: 0.2 }}
           minZoom={0.2}
           maxZoom={2}
           proOptions={{ hideAttribution: true }}
-          className="bg-slate-50 dark:bg-slate-900"
+          className="bg-slate-50/50 dark:bg-slate-900/50"
         >
-          <Background color="#e2e8f0" gap={20} size={1} />
+          <Background color="#e2e8f0" gap={24} size={1} />
           <Controls showInteractive={false} />
         </ReactFlow>
       </div>
 
       {/* Detail panel */}
       {selectedNode && (
-        <div className="w-80 border-l border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 overflow-y-auto p-4">
-          <div className="flex items-center gap-2 mb-3">
-            <span className={`text-[10px] px-1.5 py-0.5 rounded font-medium ${TYPE_COLORS[selectedNode.type]?.badge || TYPE_COLORS.conclusion.badge}`}>
-              {TYPE_LABELS[selectedNode.type] || selectedNode.type}
-            </span>
-            {selectedNode.importance && (
-              <span className={`text-[10px] px-1.5 py-0.5 rounded font-medium ${
-                selectedNode.importance === 'high' ? 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400' :
-                selectedNode.importance === 'medium' ? 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400' :
-                'bg-slate-100 text-slate-600 dark:bg-slate-700 dark:text-slate-400'
-              }`}>
-                {selectedNode.importance === 'high' ? '重要' : selectedNode.importance === 'medium' ? '一般' : '次要'}
+        <div className="w-80 border-l border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 overflow-y-auto flex flex-col">
+          {/* Header */}
+          <div className="p-4 border-b border-slate-100 dark:border-slate-700">
+            <div className="flex items-center gap-2 mb-2">
+              <span className={`text-[10px] px-2 py-0.5 rounded-full font-medium ${TYPE_BADGE[selectedNode.type] || TYPE_BADGE.conclusion}`}>
+                {TYPE_LABELS[selectedNode.type] || selectedNode.type}
               </span>
-            )}
+              {selectedNode.importance && (
+                <span className={`text-[10px] px-2 py-0.5 rounded-full font-medium ${
+                  selectedNode.importance === 'high'
+                    ? 'bg-red-50 text-red-600 dark:bg-red-900/20 dark:text-red-400'
+                    : selectedNode.importance === 'medium'
+                    ? 'bg-amber-50 text-amber-600 dark:bg-amber-900/20 dark:text-amber-400'
+                    : 'bg-slate-100 text-slate-500 dark:bg-slate-700 dark:text-slate-400'
+                }`}>
+                  {selectedNode.importance === 'high' ? '重要' : selectedNode.importance === 'medium' ? '一般' : '次要'}
+                </span>
+              )}
+            </div>
+            <h3 className="text-lg font-semibold text-slate-800 dark:text-slate-100 leading-snug">
+              {selectedNode.title}
+            </h3>
           </div>
 
-          <h3 className="text-base font-semibold text-slate-800 dark:text-slate-100 mb-2">
-            {selectedNode.title}
-          </h3>
-
-          {selectedNode.description && (
-            <p className="text-sm text-slate-600 dark:text-slate-300 mb-4 leading-relaxed">
-              {selectedNode.description}
-            </p>
-          )}
-
-          {selectedNode.sources && selectedNode.sources.length > 0 && (
-            <div>
-              <h4 className="text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wider mb-2">
-                来源
-              </h4>
-              <div className="space-y-2">
-                {selectedNode.sources.map((src, i) => (
-                  <div
-                    key={i}
-                    className={`text-xs p-2.5 rounded-lg border border-slate-200 dark:border-slate-600 bg-slate-50 dark:bg-slate-700/50 ${
-                      src.source_type === 'ppt' && src.page != null ? 'cursor-pointer hover:bg-blue-50 dark:hover:bg-blue-900/20 hover:border-blue-300 dark:hover:border-blue-700' : ''
-                    }`}
-                    onClick={() => onSourceClick(src)}
-                  >
-                    <div className="flex items-center gap-1.5 mb-1">
-                      <span className={`px-1 py-0.5 rounded text-[10px] font-medium ${
-                        src.source_type === 'ppt' ? 'bg-blue-100 text-blue-700 dark:bg-blue-800 dark:text-blue-300' :
-                        src.source_type === 'transcript' ? 'bg-green-100 text-green-700 dark:bg-green-800 dark:text-green-300' :
-                        'bg-slate-100 text-slate-600 dark:bg-slate-600 dark:text-slate-300'
-                      }`}>
-                        {src.source_type === 'ppt' ? 'PPT' : src.source_type === 'transcript' ? '转写' : '笔记'}
-                      </span>
-                      {src.page != null && (
-                        <span className="text-blue-600 dark:text-blue-400 font-medium">
-                          第 {src.page} 页
-                        </span>
-                      )}
-                    </div>
-                    <p className="text-slate-600 dark:text-slate-300 leading-relaxed line-clamp-3">
-                      {src.snippet}
-                    </p>
-                  </div>
-                ))}
+          <div className="p-4 space-y-5">
+            {/* Description */}
+            {selectedNode.description && (
+              <div>
+                <p className="text-sm text-slate-600 dark:text-slate-300 leading-relaxed">
+                  {selectedNode.description}
+                </p>
               </div>
-            </div>
-          )}
+            )}
 
-          {!selectedNode.description && (!selectedNode.sources || selectedNode.sources.length === 0) && (
-            <p className="text-sm text-slate-400 dark:text-slate-500 italic">暂无详细说明</p>
-          )}
+            {/* Related nodes */}
+            {data.relations && data.relations.length > 0 && (
+              (() => {
+                const related = data.relations.filter(
+                  r => r.source === selectedNode.id || r.target === selectedNode.id
+                );
+                if (related.length === 0) return null;
+
+                const allNodes = flattenNodes(data.nodes);
+                const nodeMap = new Map(allNodes.map(n => [n.id, n]));
+
+                return (
+                  <div>
+                    <h4 className="text-xs font-semibold text-slate-400 dark:text-slate-500 uppercase tracking-wider mb-2">
+                      关联节点
+                    </h4>
+                    <div className="space-y-1.5">
+                      {related.map((rel, i) => {
+                        const isSource = rel.source === selectedNode.id;
+                        const otherId = isSource ? rel.target : rel.source;
+                        const otherNode = nodeMap.get(otherId);
+                        if (!otherNode) return null;
+                        return (
+                          <button
+                            key={i}
+                            onClick={() => handleSelectNode(otherId)}
+                            className="w-full flex items-center gap-2 text-xs p-2 rounded-lg bg-slate-50 dark:bg-slate-700/30 border border-slate-100 dark:border-slate-700/50 hover:bg-blue-50 dark:hover:bg-blue-900/10 hover:border-blue-200 dark:hover:border-blue-800 transition-colors text-left"
+                          >
+                            <span className={`px-1.5 py-0.5 rounded text-[10px] font-medium ${TYPE_BADGE[otherNode.type] || TYPE_BADGE.conclusion}`}>
+                              {TYPE_LABELS[otherNode.type] || otherNode.type}
+                            </span>
+                            <span className="text-slate-700 dark:text-slate-200 flex-1 truncate font-medium">{otherNode.title}</span>
+                            <span className="flex items-center gap-0.5 text-slate-400 dark:text-slate-500 text-[10px] shrink-0">
+                              {isSource ? (
+                                <><span>{rel.label}</span><ArrowRight className="w-3 h-3" /></>
+                              ) : (
+                                <><ArrowRight className="w-3 h-3 rotate-180" /><span>{rel.label}</span></>
+                              )}
+                            </span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                );
+              })()
+            )}
+
+            {/* Sources */}
+            {selectedNode.sources && selectedNode.sources.length > 0 && (
+              <div>
+                <h4 className="text-xs font-semibold text-slate-400 dark:text-slate-500 uppercase tracking-wider mb-2">
+                  来源
+                </h4>
+                <div className="space-y-2">
+                  {selectedNode.sources.map((src, i) => (
+                    <div
+                      key={i}
+                      className={`text-xs p-3 rounded-lg border border-slate-100 dark:border-slate-700 bg-slate-50 dark:bg-slate-700/30 transition-colors ${
+                        src.source_type === 'ppt' && src.page != null
+                          ? 'cursor-pointer hover:bg-blue-50/50 dark:hover:bg-blue-900/10 hover:border-blue-200 dark:hover:border-blue-800'
+                          : ''
+                      }`}
+                      onClick={() => onSourceClick(src)}
+                    >
+                      <div className="flex items-center gap-2 mb-1.5">
+                        <span className="flex items-center gap-1 text-slate-500 dark:text-slate-400">
+                          {src.source_type === 'ppt' ? (
+                            <><Presentation className="w-3 h-3" /> PPT</>
+                          ) : src.source_type === 'transcript' || src.source_type === 'note' ? (
+                            <><FileText className="w-3 h-3" /> 课堂内容</>
+                          ) : (
+                            <><BookOpen className="w-3 h-3" /> 笔记</>
+                          )}
+                        </span>
+                        {src.page != null && (
+                          <span className="text-blue-600 dark:text-blue-400 font-medium">
+                            第 {src.page} 页
+                          </span>
+                        )}
+                      </div>
+                      <p className="text-slate-600 dark:text-slate-300 leading-relaxed line-clamp-3">
+                        {src.snippet}
+                      </p>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {!selectedNode.description && (!selectedNode.sources || selectedNode.sources.length === 0) && (
+              <p className="text-sm text-slate-400 dark:text-slate-500 italic">暂无详细说明</p>
+            )}
+          </div>
         </div>
       )}
     </div>
   );
 }
+
+export default function MindMapCanvas(props: MindMapCanvasProps) {
+  return (
+    <ReactFlowProvider>
+      <MindMapCanvasInner {...props} />
+    </ReactFlowProvider>
+  );
+}
+
+/* eslint-disable react-refresh/only-export-components */
+export { computeDefaultExpanded };

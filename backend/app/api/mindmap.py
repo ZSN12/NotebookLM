@@ -24,13 +24,17 @@ def get_session_mind_map(
 @router.post("/session/{session_id}/generate")
 def generate_session_mind_map(
     session_id: str,
-    response: Response,
+    force: bool = False,
+    response: Response = Response(),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Start or reuse mind map generation for a session."""
+    """Start or reuse mind map generation for a session.
+
+    Pass force=True to regenerate even if a ready mind map already exists.
+    """
     try:
-        result = mindmap_service.start_mind_map_generation(session_id, current_user, db)
+        result = mindmap_service.start_mind_map_generation(session_id, current_user, db, force=force)
         if result.get("status") == "generating":
             response.status_code = status.HTTP_202_ACCEPTED
         return result

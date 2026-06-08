@@ -12,6 +12,7 @@ Backend sends:
   - { "type": "done",    "note": {...} }
 """
 
+import asyncio
 import json
 import logging
 

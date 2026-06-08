@@ -25,6 +25,16 @@ def _extract_ppt_slides(note: Note) -> list | None:
     return None
 
 
+def _raw_text_from_entry(entry: dict) -> str:
+    """Prefer raw_text, fall back to display_text / text for legacy entries."""
+    return (
+        entry.get("raw_text")
+        or entry.get("display_text")
+        or entry.get("text")
+        or ""
+    ).strip()
+
+
 def _display_text_from_entry(entry: dict) -> str:
     return (
         entry.get("display_text")
@@ -44,6 +54,11 @@ def correct_uncorrected_transcripts_from_data(
     is_final: bool = False,
 ):
     """Correct and restructure a transcript snapshot.
+
+    Three-tier fallback:
+      1. raw_text       — merged from all snapshot chunk raw_text fields
+      2. display_text   — deterministic local cleanup (always runs)
+      3. corrected_text — DeepSeek enhancement (best-effort, never blocks)
 
     The snapshot may become stale while DeepSeek is working. We therefore
     re-read the note, correct only chunks that existed in the snapshot, and
@@ -71,69 +86,97 @@ def correct_uncorrected_transcripts_from_data(
             if entry.get("chunk_index", -1) > snapshot_max_chunk
         ]
 
-        all_texts: list[str] = []
+        # Tier 1 — collect raw_text from all snapshot chunks
+        all_raw_texts: list[str] = []
         all_timestamps: list[dict] = []
         for entry in snapshot_chunks:
-            text = _display_text_from_entry(entry)
+            text = _raw_text_from_entry(entry)
             if text:
-                all_texts.append(text)
+                all_raw_texts.append(text)
             timestamps = entry.get("timestamps", [])
             if timestamps:
                 all_timestamps.extend(timestamps)
 
-        if not all_texts:
+        if not all_raw_texts:
             logger.info("transcript_correction_skip_no_text session_id=%s", session_id)
             return
 
-        all_texts = corrector.dedupe_repeated_texts(all_texts)
-        full_text = "\n".join(all_texts)
+        all_raw_texts = corrector.dedupe_repeated_texts(all_raw_texts)
+        full_raw_text = "\n".join(all_raw_texts)
         ppt_slides = _extract_ppt_slides(fresh_note)
-        logger.info(
-            "transcript_correction_llm_start session_id=%s chunks=%s chars=%s new_chunks=%s has_ppt=%s",
-            session_id,
-            len(all_texts),
-            len(full_text),
-            len(new_chunks),
-            bool(ppt_slides),
-        )
 
-        corrected = corrector.restructure_transcript(
-            text=full_text,
-            course_title=course_title,
-            keywords=keywords,
-            ppt_slides=ppt_slides,
-        )
-        logger.info(
-            "transcript_correction_llm_raw session_id=%s input_len=%s output_len=%s output_preview=%r",
-            session_id, len(full_text), len(corrected or ""), (corrected or "")[:120],
-        )
+        # Tier 2 — local deterministic cleanup (always runs)
+        local_display = corrector.clean_transcript_for_display(full_raw_text).strip() or full_raw_text
 
-        base_for_display = full_text
-        if corrected and corrected != full_text:
-            if corrector.preserves_source_content(full_text, corrected, min_ratio=0.50):
+        # Tier 3 — DeepSeek enhancement (best-effort)
+        display_text = local_display
+        corrected_text = None
+        is_ai_corrected = False
+        correction_error = None
+
+        if getattr(corrector, "has_llm", False) and local_display:
+            try:
                 logger.info(
-                    "transcript_correction_llm_accepted session_id=%s source_chars=%s corrected_chars=%s",
+                    "transcript_correction_llm_start session_id=%s chars=%s new_chunks=%s has_ppt=%s",
                     session_id,
-                    len(full_text),
-                    len(corrected),
+                    len(local_display),
+                    len(new_chunks),
+                    bool(ppt_slides),
                 )
-                base_for_display = corrected
-            else:
-                logger.warning(
-                    "transcript_correction_llm_rejected session_id=%s source_chars=%s corrected_chars=%s",
-                    session_id,
-                    len(full_text),
-                    len(corrected),
+                corrected = corrector.restructure_transcript(
+                    text=local_display,
+                    course_title=course_title,
+                    keywords=keywords,
+                    ppt_slides=ppt_slides,
+                )
+                logger.info(
+                    "transcript_correction_llm_raw session_id=%s input_len=%s output_len=%s output_preview=%r",
+                    session_id, len(local_display), len(corrected or ""), (corrected or "")[:120],
                 )
 
-        display_corrected = corrector.clean_transcript_for_display(base_for_display)
+                if corrected and corrected.strip():
+                    ai_display = corrector.clean_transcript_for_display(corrected).strip() or corrected.strip()
+                    if corrector.preserves_source_content(local_display, ai_display, min_ratio=0.70):
+                        display_text = ai_display
+                        corrected_text = ai_display
+                        is_ai_corrected = True
+                        logger.info(
+                            "transcript_correction_llm_accepted session_id=%s source_chars=%s corrected_chars=%s",
+                            session_id,
+                            len(local_display),
+                            len(ai_display),
+                        )
+                    else:
+                        correction_error = "AI 整理失败"
+                        logger.warning(
+                            "transcript_correction_llm_rejected session_id=%s source_chars=%s corrected_chars=%s",
+                            session_id,
+                            len(local_display),
+                            len(ai_display),
+                        )
+                else:
+                    correction_error = "AI 整理失败"
+            except Exception as exc:
+                logger.warning(
+                    "transcript_correction_llm_failed session_id=%s error_type=%s error=%s",
+                    session_id,
+                    type(exc).__name__,
+                    exc,
+                )
+                correction_error = "AI 整理失败"
+        else:
+            correction_error = "AI 整理失败，已使用本地整理稿"
+
         corrected_entry = {
             "chunk_index": 0,
-            "text": display_corrected,
-            "raw_text": full_text,
-            "display_text": display_corrected,
+            "text": display_text,
+            "raw_text": full_raw_text,
+            "display_text": display_text,
+            "corrected_text": corrected_text,
             "timestamps": all_timestamps,
-            "is_corrected": True,
+            "is_corrected": display_text != full_raw_text,
+            "is_ai_corrected": is_ai_corrected,
+            "correction_error": correction_error,
             "is_restructured": False,
             "correction_stage": "final" if is_final else "rolling",
         }
@@ -146,9 +189,9 @@ def correct_uncorrected_transcripts_from_data(
         fresh_note.transcript = merged
         db.commit()
         logger.info(
-            "transcript_correction_saved session_id=%s corrected_chars=%s new_chunks=%s total_chunks=%s",
+            "transcript_correction_saved session_id=%s display_chars=%s new_chunks=%s total_chunks=%s",
             session_id,
-            len(display_corrected),
+            len(display_text),
             len(new_chunks),
             len(merged),
         )

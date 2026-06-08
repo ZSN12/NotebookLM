@@ -2,20 +2,19 @@ import asyncio
 import logging
 import os
 from pathlib import Path
-import jwt
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
-from sqlalchemy import text
-from app.api import auth, notebooks, sessions, process, notes, public, vector, mindmap, quiz
+
+from app.api import auth, notebooks, sessions, process, notes, public, vector, mindmap, quiz, agents
 from app.api.process.asr_ws import router as asr_ws_router
-from app.core.database import engine, get_db, SessionLocal
-from app.core.auth import hash_password
+from app.core.database import get_db, SessionLocal
+from app.core.auth import hash_password, get_current_user
 from app.middleware.rate_limit import RateLimitMiddleware
 from app.middleware.csrf import CSRFMiddleware
-from app.models import Base, Notebook, Session as DBSession, User
-from app.config import SLIDE_DIR, AUDIO_DIR, ALLOWED_ORIGINS, ADMIN_DEFAULT_EMAIL, ADMIN_DEFAULT_PASSWORD, SECRET_KEY, ALGORITHM
+from app.models import Notebook, Session as DBSession, User
+from app.config import SLIDE_DIR, AUDIO_DIR, ALLOWED_ORIGINS, ADMIN_DEFAULT_EMAIL, ADMIN_DEFAULT_PASSWORD
 
 # ── Logging ──
 _LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -32,8 +31,8 @@ app.add_middleware(CSRFMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-CSRF-Token", "Origin", "Accept"],
 )
 
 app.include_router(auth.router)
@@ -45,6 +44,7 @@ app.include_router(public.router)
 app.include_router(vector.router)
 app.include_router(mindmap.router)
 app.include_router(quiz.router)
+app.include_router(agents.router)
 app.include_router(asr_ws_router)
 
 
@@ -57,26 +57,6 @@ def _require_user_session(session_id: str, user: User, db: Session) -> DBSession
     if not session:
         raise HTTPException(status_code=404, detail="Media not found")
     return session
-
-
-def _get_media_user(request: Request, db: Session = Depends(get_db)) -> User:
-    auth = request.headers.get("authorization", "")
-    token = auth[7:] if auth.startswith("Bearer ") else request.query_params.get("token")
-    if not token:
-        raise HTTPException(status_code=401, detail="Not authenticated")
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        if payload.get("type") != "access":
-            raise HTTPException(status_code=401, detail="Invalid token")
-        user_id = payload.get("sub")
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token has expired")
-    except jwt.PyJWTError:
-        raise HTTPException(status_code=401, detail="Invalid token")
-    user = db.query(User).filter(User.id == user_id).first()
-    if user is None:
-        raise HTTPException(status_code=401, detail="User not found")
-    return user
 
 
 def _safe_media_path(base_dir: Path, *parts: str) -> Path:
@@ -93,7 +73,7 @@ def _safe_media_path(base_dir: Path, *parts: str) -> Path:
 def get_slide_media(
     session_id: str,
     slide_path: str,
-    current_user: User = Depends(_get_media_user),
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     _require_user_session(session_id, current_user, db)
@@ -103,7 +83,7 @@ def get_slide_media(
 @app.get("/api/media/audio/{filename}")
 def get_audio_media(
     filename: str,
-    current_user: User = Depends(_get_media_user),
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     if not filename.endswith(".wav"):
@@ -114,19 +94,16 @@ def get_audio_media(
 
 @app.on_event("startup")
 async def on_startup():
-    Base.metadata.create_all(bind=engine)
+    # Run database migrations via Alembic
+    try:
+        from alembic.config import Config as AlembicConfig
+        from alembic import command as alembic_command
 
-    # Ensure share columns exist for existing databases (SQLite doesn't auto-migrate)
-    try:
-        with engine.begin() as conn:
-            conn.execute(text("ALTER TABLE sessions ADD COLUMN share_enabled BOOLEAN DEFAULT 0"))
-    except Exception:
-        pass  # Column already exists
-    try:
-        with engine.begin() as conn:
-            conn.execute(text("ALTER TABLE sessions ADD COLUMN share_token VARCHAR(64)"))
-    except Exception:
-        pass  # Column already exists
+        alembic_cfg = AlembicConfig(Path(__file__).resolve().parents[1] / "alembic.ini")
+        alembic_command.upgrade(alembic_cfg, "head")
+        print("[INFO] Database migrations applied.")
+    except Exception as e:
+        print(f"[WARN] Alembic upgrade failed (may already be up to date): {e}")
 
     db = SessionLocal()
     try:

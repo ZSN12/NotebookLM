@@ -165,11 +165,12 @@ class StreamingRecognizer:
 
         raw_text = "\n\n".join(seg.text for seg in self.final_segments)
 
-        # Local deterministic cleanup
+        # Tier 2: local deterministic cleanup — ALWAYS runs
         local_display = corrector.clean_transcript_for_display(raw_text).strip() or raw_text
 
-        # One-shot DeepSeek full restructure
+        # Tier 3: DeepSeek enhancement — best-effort, never blocks saving
         display_text = local_display
+        corrected_text = None
         is_ai_corrected = False
         correction_error = None
 
@@ -183,12 +184,15 @@ class StreamingRecognizer:
                 ai_text = (ai_text or "").strip()
                 if ai_text and corrector.preserves_source_content(local_display, ai_text, min_ratio=0.50):
                     display_text = corrector.clean_transcript_for_display(ai_text).strip() or ai_text
+                    corrected_text = display_text
                     is_ai_corrected = True
                 else:
-                    correction_error = "AI 整理疑似删减，已使用本地整理"
+                    correction_error = "AI 整理失败"
             except Exception as exc:
                 logger.warning("streaming_final_deepseek_failed session_id=%s error=%s", self.session_id, exc)
-                correction_error = "AI 整理失败，已使用本地整理"
+                correction_error = "AI 整理失败"
+        else:
+            correction_error = "AI 整理失败，已使用本地整理稿"
 
         # Save full audio WAV
         self._save_audio_wav()
@@ -199,8 +203,9 @@ class StreamingRecognizer:
             "text": display_text,
             "raw_text": raw_text,
             "display_text": display_text,
+            "corrected_text": corrected_text,
             "timestamps": self.all_timestamps,
-            "is_corrected": True,
+            "is_corrected": display_text != raw_text,
             "is_ai_corrected": is_ai_corrected,
             "correction_error": correction_error,
             "is_restructured": False,

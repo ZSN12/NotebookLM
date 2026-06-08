@@ -1,4 +1,5 @@
 import { useNavigate } from 'react-router-dom';
+import { toast } from 'sonner';
 import * as LucideIcons from 'lucide-react';
 import { ArrowRight, Trash2, Edit3 } from 'lucide-react';
 import type { Notebook } from '@/types';
@@ -18,8 +19,9 @@ export default function NotebookCard({ notebook }: NotebookCardProps) {
     if (window.confirm(`确定要删除"${notebook.title}"吗？所有课次也会被删除。`)) {
       try {
         await removeNotebook(notebook.id);
+        toast.success('笔记本已删除');
       } catch (error) {
-        alert('删除失败，请稍后重试');
+        toast.error('删除失败，请稍后重试');
       }
     }
   };

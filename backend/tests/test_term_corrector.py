@@ -256,7 +256,7 @@ def test_audio_final_display_helper_uses_whole_text_for_ai(monkeypatch):
         )
     )
 
-    assert result["text"] == "第一段知识。\n\n第二段知识。"
+    assert result["display_text"] == "第一段知识。\n\n第二段知识。"
     assert result["is_ai_corrected"] is True
     assert result["correction_error"] is None
 
@@ -287,6 +287,6 @@ def test_audio_final_display_helper_falls_back_when_ai_rejected(monkeypatch):
         )
     )
 
-    assert result["text"] == "第一段。\n\n第二段。"
+    assert result["display_text"] == "第一段。\n\n第二段。"
     assert result["is_ai_corrected"] is False
-    assert "疑似删减" in result["correction_error"]
+    assert result["correction_error"] == "AI 整理失败"

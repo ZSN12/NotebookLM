@@ -107,7 +107,8 @@ MOCK_MINDMAP_RESPONSE = {
             "sources": [{"source_type": "transcript", "snippet": "设计模式是软件工程中常用的解决方案", "page": None, "block_id": "t1"}],
             "children": []
         }
-    ]
+    ],
+    "relations": []
 }
 
 
@@ -139,7 +140,7 @@ def test_get_mindmap_not_generated():
         assert resp.json()["status"] == "not_generated"
 
 
-@patch("app.services.mindmap_service.OpenAI")
+@patch("app.agents.base.OpenAI")
 def test_generate_mind_map_success(mock_openai_cls):
     """Generate mind map with mocked DeepSeek returns 'ready'."""
     mock_client = MagicMock()
@@ -166,7 +167,7 @@ def test_generate_mind_map_success(mock_openai_cls):
         assert data["mind_map"]["title"] == "设计模式"
 
 
-@patch("app.services.mindmap_service.OpenAI")
+@patch("app.agents.base.OpenAI")
 def test_generate_mind_map_reuses_running_task(mock_openai_cls):
     """Repeated generate requests while running should reuse the active task."""
     mock_client = MagicMock()
@@ -196,7 +197,7 @@ def test_generate_mind_map_reuses_running_task(mock_openai_cls):
         assert mock_client.chat.completions.create.call_count == 1
 
 
-@patch("app.services.mindmap_service.OpenAI")
+@patch("app.agents.base.OpenAI")
 def test_mind_map_stale_after_content_change(mock_openai_cls):
     """After modifying note content, status should be 'stale'."""
     mock_client = MagicMock()
@@ -232,7 +233,7 @@ def test_mind_map_stale_after_content_change(mock_openai_cls):
         assert resp.json()["status"] == "stale"
 
 
-@patch("app.services.mindmap_service.OpenAI")
+@patch("app.agents.base.OpenAI")
 def test_mind_map_ready_after_regenerate(mock_openai_cls):
     """Regenerating after stale returns 'ready'."""
     mock_client = MagicMock()
@@ -270,7 +271,7 @@ def test_mind_map_ready_after_regenerate(mock_openai_cls):
         assert data["status"] == "ready"
 
 
-@patch("app.services.mindmap_service.OpenAI")
+@patch("app.agents.base.OpenAI")
 def test_delete_mind_map(mock_openai_cls):
     """Delete mind map returns to 'not_generated'."""
     mock_client = MagicMock()
@@ -326,7 +327,7 @@ def test_cannot_access_others_mindmap():
         assert resp.status_code == 404
 
 
-@patch("app.services.mindmap_service.OpenAI")
+@patch("app.agents.base.OpenAI")
 def test_invalid_json_from_ai(mock_openai_cls):
     """AI returning invalid JSON should result in generation failure."""
     mock_client = MagicMock()
@@ -357,7 +358,7 @@ def test_no_api_key_returns_error():
             assert resp.status_code == 503
 
 
-@patch("app.services.mindmap_service.OpenAI")
+@patch("app.agents.base.OpenAI")
 def test_invalid_nodes_type_rejected(mock_openai_cls):
     """AI returning {"nodes": "bad"} should be rejected, not saved."""
     mock_client = MagicMock()
@@ -381,7 +382,7 @@ def test_invalid_nodes_type_rejected(mock_openai_cls):
         assert resp.json()["mind_map"] is None
 
 
-@patch("app.services.mindmap_service.OpenAI")
+@patch("app.agents.base.OpenAI")
 def test_nodes_missing_id_title_dropped(mock_openai_cls):
     """Nodes without id or title should be dropped; all bad nodes = rejection."""
     mock_client = MagicMock()
@@ -407,7 +408,7 @@ def test_nodes_missing_id_title_dropped(mock_openai_cls):
         _wait_for_mindmap_status(client, session_id, headers, {"error"})
 
 
-@patch("app.services.mindmap_service.OpenAI")
+@patch("app.agents.base.OpenAI")
 def test_missing_fields_filled_with_defaults(mock_openai_cls):
     """Nodes with missing type/importance should get defaults after normalization."""
     mock_client = MagicMock()
@@ -441,7 +442,7 @@ def test_missing_fields_filled_with_defaults(mock_openai_cls):
         assert node["importance"] == "medium"  # default
 
 
-@patch("app.services.mindmap_service.OpenAI")
+@patch("app.agents.base.OpenAI")
 def test_deepseek_network_error_returns_502(mock_openai_cls):
     """DeepSeek network/timeout error should result in 502, not 500."""
     mock_client = MagicMock()
@@ -458,7 +459,7 @@ def test_deepseek_network_error_returns_502(mock_openai_cls):
         assert "超时" in data["error"]
 
 
-@patch("app.services.mindmap_service.OpenAI")
+@patch("app.agents.base.OpenAI")
 def test_deepseek_generic_error_returns_502(mock_openai_cls):
     """DeepSeek generic API error should result in 502."""
     mock_client = MagicMock()

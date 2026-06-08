@@ -412,89 +412,166 @@ export interface AudioUploadCallbacks {
   onError: (error: string) => void;
 }
 
+const CHUNK_THRESHOLD = 10 * 1024 * 1024; // 10MB
+const CHUNK_SIZE = 5 * 1024 * 1024; // 5MB per chunk
+
+function _parseSseStream(
+  res: Response,
+  callbacks: AudioUploadCallbacks,
+  onComplete?: () => void,
+): Promise<void> {
+  const reader = res.body?.getReader();
+  if (!reader) { callbacks.onError('No response body'); return Promise.resolve(); }
+
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  return new Promise<void>((resolve) => {
+    const pump = async () => {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            try {
+              const event = JSON.parse(line.slice(6));
+              switch (event.type) {
+                case 'status':
+                  callbacks.onStatus?.(event.message || '', event.segment ?? 0, event.total ?? 0);
+                  break;
+                case 'chunk':
+                  callbacks.onChunk(
+                    event.text,
+                    event.segment ?? event.window ?? 0,
+                    event.segment_total ?? event.total ?? 0,
+                    {
+                      chunkId: event.chunk_id,
+                      rawText: event.raw_text,
+                      isAiCorrected: event.is_ai_corrected,
+                      correctionError: event.correction_error,
+                      isFinal: event.is_final,
+                    },
+                  );
+                  break;
+                case 'correction':
+                  callbacks.onCorrection?.(
+                    event.text,
+                    event.segment ?? 0,
+                    event.segment_total ?? event.total ?? 0,
+                    {
+                      chunkId: event.chunk_id,
+                      rawText: event.raw_text,
+                      isAiCorrected: event.is_ai_corrected,
+                      correctionError: event.correction_error,
+                    },
+                  );
+                  break;
+                case 'done':
+                  callbacks.onDone(event.note || null);
+                  break;
+                case 'error':
+                  callbacks.onError(event.detail || 'Unknown error');
+                  break;
+              }
+            } catch {}
+          }
+        }
+      }
+      onComplete?.();
+      resolve();
+    };
+    pump();
+  });
+}
+
 export function uploadAudio(
   file: File,
   sessionId: string,
   callbacks: AudioUploadCallbacks,
 ): { abort: () => void } {
-  const formData = new FormData();
-  formData.append('file', file);
   const controller = new AbortController();
 
-  fetch(`${API_BASE}/api/process/audio-batch?session_id=${sessionId}`, {
-    method: 'POST',
-    headers: authHeaders(),
-    body: formData,
-    signal: controller.signal,
-  }).then(async (res) => {
+  const runUpload = async () => {
+    // Use chunked upload for large files
+    if (file.size > CHUNK_THRESHOLD) {
+      callbacks.onStatus?.('正在分片上传音频...', 0, Math.ceil(file.size / CHUNK_SIZE));
+      const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+
+      for (let i = 0; i < totalChunks; i++) {
+        if (controller.signal.aborted) return;
+        const start = i * CHUNK_SIZE;
+        const end = Math.min(start + CHUNK_SIZE, file.size);
+        const chunk = file.slice(start, end);
+
+        const formData = new FormData();
+        formData.append('file', chunk, `${file.name}.part${i}`);
+
+        const res = await fetch(
+          `${API_BASE}/api/process/audio-chunk?session_id=${sessionId}&chunk_index=${i}&total_chunks=${totalChunks}`,
+          {
+            method: 'POST',
+            headers: authHeaders(),
+            body: formData,
+            signal: controller.signal,
+          }
+        );
+
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({ detail: '分片上传失败' }));
+          callbacks.onError(`Chunk ${i + 1}/${totalChunks} upload failed: ${err.detail || res.status}`);
+          return;
+        }
+        callbacks.onStatus?.(`已上传 ${i + 1}/${totalChunks} 片`, i + 1, totalChunks);
+      }
+
+      if (controller.signal.aborted) return;
+
+      callbacks.onStatus?.('分片上传完成，开始处理...', 0, 0);
+      const finishRes = await fetch(
+        `${API_BASE}/api/process/audio-chunk-finish?session_id=${sessionId}&file_name=${encodeURIComponent(file.name)}&total_chunks=${totalChunks}`,
+        {
+          method: 'POST',
+          headers: authHeaders(),
+          signal: controller.signal,
+        }
+      );
+
+      if (!finishRes.ok) {
+        const err = await finishRes.json().catch(() => ({ detail: '处理失败' }));
+        callbacks.onError(`Finish failed: ${err.detail || finishRes.status}`);
+        return;
+      }
+
+      await _parseSseStream(finishRes, callbacks);
+      return;
+    }
+
+    // Direct upload for small files
+    const formData = new FormData();
+    formData.append('file', file);
+
+    const res = await fetch(`${API_BASE}/api/process/audio-batch?session_id=${sessionId}`, {
+      method: 'POST',
+      headers: authHeaders(),
+      body: formData,
+      signal: controller.signal,
+    });
+
     if (!res.ok) {
       const errorText = await res.text().catch(() => 'Unknown error');
       callbacks.onError(`Audio upload failed: ${res.status} ${errorText}`);
       return;
     }
 
-    const reader = res.body?.getReader();
-    if (!reader) { callbacks.onError('No response body'); return; }
+    await _parseSseStream(res, callbacks);
+  };
 
-    const decoder = new TextDecoder();
-    let buffer = '';
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      // Keep the last (potentially incomplete) line in buffer
-      buffer = lines.pop() || '';
-
-      for (const line of lines) {
-        if (line.startsWith('data: ')) {
-          try {
-            const event = JSON.parse(line.slice(6));
-            switch (event.type) {
-              case 'status':
-                callbacks.onStatus?.(event.message || '', event.segment ?? 0, event.total ?? 0);
-                break;
-              case 'chunk':
-                callbacks.onChunk(
-                  event.text,
-                  event.segment ?? event.window ?? 0,
-                  event.segment_total ?? event.total ?? 0,
-                  {
-                    chunkId: event.chunk_id,
-                    rawText: event.raw_text,
-                    isAiCorrected: event.is_ai_corrected,
-                    correctionError: event.correction_error,
-                    isFinal: event.is_final,
-                  },
-                );
-                break;
-              case 'correction':
-                callbacks.onCorrection?.(
-                  event.text,
-                  event.segment ?? 0,
-                  event.segment_total ?? event.total ?? 0,
-                  {
-                    chunkId: event.chunk_id,
-                    rawText: event.raw_text,
-                    isAiCorrected: event.is_ai_corrected,
-                    correctionError: event.correction_error,
-                  },
-                );
-                break;
-              case 'done':
-                callbacks.onDone(event.note || null);
-                break;
-              case 'error':
-                callbacks.onError(event.detail || 'Unknown error');
-                break;
-            }
-          } catch {}
-        }
-      }
-    }
-  }).catch((err) => {
+  runUpload().catch((err) => {
     if (err.name === 'AbortError') return;
     callbacks.onError(err.message || 'Upload failed');
   });
@@ -530,9 +607,16 @@ export async function exportNotebook(notebookId: string): Promise<any> {
 }
 
 // Share API
-export async function enableShare(sessionId: string): Promise<{ share_enabled: boolean; share_token: string; share_url: string }> {
+export async function enableShare(
+  sessionId: string,
+  expiresInHours?: number,
+  maxViews?: number,
+): Promise<{ share_enabled: boolean; share_token: string; share_url: string; share_expires_at?: string; share_max_views?: number }> {
   const token = getToken();
-  const res = await fetch(`${API_BASE}/api/sessions/${sessionId}/share/enable`, {
+  const params = new URLSearchParams();
+  if (expiresInHours !== undefined) params.set('expires_in_hours', String(expiresInHours));
+  if (maxViews !== undefined) params.set('max_views', String(maxViews));
+  const res = await fetch(`${API_BASE}/api/sessions/${sessionId}/share/enable?${params.toString()}`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${token}` },
   });
@@ -556,7 +640,7 @@ export async function disableShare(sessionId: string): Promise<{ share_enabled: 
   return res.json();
 }
 
-export async function getShareStatus(sessionId: string): Promise<{ share_enabled: boolean; share_token: string | null; share_url: string | null }> {
+export async function getShareStatus(sessionId: string): Promise<{ share_enabled: boolean; share_token: string | null; share_url: string | null; share_expires_at?: string; share_max_views?: number; share_view_count?: number }> {
   const token = getToken();
   const res = await fetch(`${API_BASE}/api/sessions/${sessionId}/share/status`, {
     headers: { Authorization: `Bearer ${token}` },
@@ -624,7 +708,7 @@ export interface MindMapNode {
   id: string;
   title: string;
   description?: string;
-  type: 'topic' | 'concept' | 'key_point' | 'difficulty' | 'example' | 'conclusion';
+  type: 'topic' | 'concept' | 'key_point' | 'difficulty' | 'example' | 'process' | 'function' | 'question' | 'conclusion';
   importance: 'high' | 'medium' | 'low';
   sources?: Array<{
     source_type: string;
@@ -635,10 +719,18 @@ export interface MindMapNode {
   children?: MindMapNode[];
 }
 
+export interface MindMapRelation {
+  source: string;
+  target: string;
+  type: 'contrast' | 'step' | 'example_of' | 'used_by' | 'depends_on' | 'warning' | 'related';
+  label: string;
+}
+
 export interface MindMapData {
   title: string;
   summary?: string;
   nodes: MindMapNode[];
+  relations?: MindMapRelation[];
 }
 
 export interface MindMapStatus {
@@ -656,8 +748,9 @@ export async function getSessionMindMap(sessionId: string): Promise<MindMapStatu
   return res;
 }
 
-export async function generateSessionMindMap(sessionId: string): Promise<MindMapStatus> {
-  const res = await request<any>(`/api/mindmap/session/${sessionId}/generate`, { method: 'POST', timeoutMs: 15000 });
+export async function generateSessionMindMap(sessionId: string, force = false): Promise<MindMapStatus> {
+  const query = force ? '?force=true' : '';
+  const res = await request<any>(`/api/mindmap/session/${sessionId}/generate${query}`, { method: 'POST', timeoutMs: 15000 });
   return res;
 }
 
@@ -777,4 +870,36 @@ export async function submitQuizAnswers(sessionId: string, quizId: string, answe
 export async function deleteQuiz(sessionId: string, quizId: string): Promise<{ session_id: string; quiz_id: string; status: string }> {
   const res = await request<any>(`/api/quiz/session/${sessionId}/${quizId}`, { method: 'DELETE' });
   return res;
+}
+
+export interface AgentTask {
+  task_id: string;
+  task_type: string;
+  status: 'pending' | 'running' | 'success' | 'error';
+  progress: number;
+  error: string | null;
+  created_at: string | null;
+}
+
+export async function runAllAgents(sessionId: string, roles?: string[]): Promise<{ workflow_id: string; session_id: string; agents: Array<{ role: string; task_id: string; status: string; progress: number; error: string | null }>; reused?: boolean }> {
+  const res = await request<any>(`/api/agents/session/${sessionId}/run`, {
+    method: 'POST',
+    body: JSON.stringify({ roles }),
+    timeoutMs: 15000,
+  });
+  return res;
+}
+
+export async function getAgentTasks(sessionId: string): Promise<{ session_id: string; agents: AgentTask[] }> {
+  const res = await request<any>(`/api/agents/session/${sessionId}/tasks`, { timeoutMs: 15000 });
+  return res;
+}
+
+export async function restructureTranscript(sessionId: string, force = false): Promise<BackendNote> {
+  const res = await request<any>(`/api/process/session/${sessionId}/restructure`, {
+    method: 'POST',
+    body: JSON.stringify({ force }),
+    timeoutMs: 120000,
+  });
+  return res.note;
 }

@@ -4,31 +4,45 @@ Generates structured knowledge maps from session notes.
 Stores results in Note.vocabulary with kind="mind_map".
 """
 
-import json
 import logging
+import os
 import threading
 import time
 from datetime import datetime, timezone
 from typing import Optional
 
-from openai import OpenAI
-
-from app.config import DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL
+from app.agents import AgentContext, get_agent
+from app.agents.normalizers import normalize_mind_map_data
+from app.config import DEEPSEEK_API_KEY
+from openai import OpenAI  # noqa: F401  kept for test compatibility
 from app.core.database import SessionLocal
+from app.core.task_runner import run_agent_task, wait_for_agent_threads
 from app.models import Note, Session, Notebook, User, Task
 from sqlalchemy.orm import Session as DBSessionType
-from app.services.prompt_loader import load_prompt
 from app.services.vector_service import _compute_session_content_hash
 
 
 logger = logging.getLogger(__name__)
 
-VALID_TYPES = {"topic", "concept", "key_point", "difficulty", "example", "conclusion"}
-VALID_IMPORTANCE = {"high", "medium", "low"}
-DEFAULT_TYPE = "concept"
-DEFAULT_IMPORTANCE = "medium"
-TASK_TYPE = "mind_map_generate"
+TASK_TYPE = "agent_mindmap"
 ACTIVE_TASK_STATUSES = {"pending", "running"}
+
+# Per-(session_id, task_type) lock to prevent races when checking for active
+# tasks and creating new ones.
+_START_LOCKS: dict[str, threading.Lock] = {}
+_START_LOCKS_GUARD = threading.Lock()
+
+
+def _get_start_lock(session_id: str, task_type: str) -> threading.Lock:
+    key = f"{session_id}:{task_type}"
+    lock = _START_LOCKS.get(key)
+    if lock is None:
+        with _START_LOCKS_GUARD:
+            lock = _START_LOCKS.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                _START_LOCKS[key] = lock
+    return lock
 
 
 # ── Mind map vocabulary helpers ──
@@ -67,99 +81,6 @@ def _clear_mind_map_from_vocabulary(note: Note):
         if not (isinstance(item, dict) and item.get("kind") == "mind_map")
     ]
     note.vocabulary = next_items
-
-
-# ── Content extraction ──
-
-
-# ── Normalization / validation ──
-
-def _normalize_sources(sources) -> list[dict]:
-    """Ensure sources is a list of dicts with required fields."""
-    if not isinstance(sources, list):
-        return []
-    result = []
-    for s in sources:
-        if not isinstance(s, dict):
-            continue
-        source_type = s.get("source_type", "")
-        if source_type not in ("transcript", "note", "ppt"):
-            source_type = "note"
-        snippet = str(s.get("snippet", ""))
-        page = s.get("page") if isinstance(s.get("page"), int) else None
-        block_id = str(s.get("block_id", "")) if s.get("block_id") else None
-        result.append({
-            "source_type": source_type,
-            "snippet": snippet,
-            "page": page,
-            "block_id": block_id,
-        })
-    return result
-
-
-def _normalize_node(node: dict) -> Optional[dict]:
-    """Normalize a single node: fill defaults, discard if missing required fields."""
-    if not isinstance(node, dict):
-        return None
-
-    node_id = node.get("id")
-    title = node.get("title")
-    if not node_id or not title:
-        return None  # Drop invalid nodes
-
-    node_type = node.get("type", DEFAULT_TYPE)
-    if node_type not in VALID_TYPES:
-        node_type = DEFAULT_TYPE
-
-    importance = node.get("importance", DEFAULT_IMPORTANCE)
-    if importance not in VALID_IMPORTANCE:
-        importance = DEFAULT_IMPORTANCE
-
-    return {
-        "id": str(node_id),
-        "title": str(title),
-        "description": str(node.get("description", "")),
-        "type": node_type,
-        "importance": importance,
-        "sources": _normalize_sources(node.get("sources", [])),
-        "children": _normalize_nodes(node.get("children", [])),
-    }
-
-
-def _normalize_nodes(nodes) -> list[dict]:
-    """Normalize a list of nodes, dropping invalid ones."""
-    if not isinstance(nodes, list):
-        return []
-    result = []
-    for n in nodes:
-        normalized = _normalize_node(n)
-        if normalized:
-            result.append(normalized)
-    return result
-
-
-def normalize_mind_map_data(data: dict) -> dict:
-    """Normalize and validate the entire mind map data structure.
-
-    - Ensures nodes is a list, discarding invalid nodes.
-    - Fills defaults for missing fields.
-    - Recursively normalizes children.
-    - Raises ValueError if the result is unusable (no valid nodes).
-    """
-    if not isinstance(data, dict):
-        raise ValueError("AI 返回的 JSON 不是对象")
-
-    # Normalize nodes
-    raw_nodes = data.get("nodes", [])
-    nodes = _normalize_nodes(raw_nodes)
-    if not nodes:
-        raise ValueError("AI 返回的 JSON 中没有有效的节点")
-
-    return {
-        "title": str(data.get("title", "知识导图")),
-        "summary": str(data.get("summary", "")),
-        "nodes": nodes,
-    }
 
 
 # ── Content extraction ──
@@ -255,11 +176,10 @@ def _task_payload(task: Task | None) -> dict:
 
 
 def generate_mind_map(session_id: str, user: User, db: DBSessionType) -> dict:
-    """Generate a mind map for a session. Returns the mind map data or raises."""
+    """Generate a mind map for a session via the MindmapAgent."""
     if not DEEPSEEK_API_KEY:
         raise ValueError("未配置 DEEPSEEK_API_KEY，无法生成知识导图")
 
-    # Verify ownership
     session = _get_session_for_user(session_id, user, db)
     if not session:
         raise ValueError("Session not found or access denied")
@@ -268,67 +188,28 @@ def generate_mind_map(session_id: str, user: User, db: DBSessionType) -> dict:
     if not note:
         raise ValueError("No note content found")
 
+    notebook = db.query(Notebook).filter(Notebook.id == session.notebook_id).first()
+    if not notebook:
+        raise ValueError("Notebook not found")
+
     content_text = _extract_content_for_prompt(note)
     if not content_text.strip():
         raise ValueError("No indexable content in note")
 
-    # Build prompt
-    keywords = ", ".join(session.keywords) if session.keywords else "无"
-    prompt_template = load_prompt("mindmap")
-    prompt = prompt_template.render(
-        title=session.title or "未命名课次",
-        keywords=keywords,
-        content=content_text[:6000],  # Limit to avoid token overflow
+    agent = get_agent("mindmap")
+    ctx = AgentContext(
+        session_id=session_id,
+        user=user,
+        db=db,
+        note=note,
+        session=session,
+        notebook=notebook,
     )
+    result = agent.run(ctx)
+    if not result.success:
+        raise ValueError(result.error_message or "知识导图生成失败")
 
-    # Call DeepSeek
-    started = time.monotonic()
-    client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
-    try:
-        response = client.chat.completions.create(
-            model=DEEPSEEK_MODEL,
-            messages=[
-                {"role": "system", "content": prompt_template.system},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.3,
-            max_tokens=4000,
-        )
-    except Exception as e:
-        error_msg = str(e)
-        if "timeout" in error_msg.lower() or "timed out" in error_msg.lower():
-            raise ValueError("知识导图生成失败: DeepSeek 请求超时，请稍后重试")
-        raise ValueError(f"知识导图生成失败: {error_msg}")
-
-    raw = response.choices[0].message.content.strip()
-
-    # Strip markdown code fences if present
-    if raw.startswith("```"):
-        lines = raw.split("\n")
-        lines = [l for l in lines if not l.startswith("```")]
-        raw = "\n".join(lines)
-
-    # Parse JSON
-    try:
-        mind_map_data = json.loads(raw)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"AI 返回的 JSON 格式无效: {e}")
-
-    # Validate and normalize structure
-    mind_map_data = normalize_mind_map_data(mind_map_data)
-
-    # Save to vocabulary
-    content_hash = _compute_session_content_hash(note)
-    _set_mind_map_in_vocabulary(note, mind_map_data, content_hash)
-    db.commit()
-
-    logger.info(
-        "mind_map_generated session_id=%s user_id=%s elapsed_ms=%s",
-        session_id,
-        user.id,
-        int((time.monotonic() - started) * 1000),
-    )
-    return mind_map_data
+    return result.data if result.data else {}
 
 
 def _run_mind_map_task(task_id: str, session_id: str, user_id: str):
@@ -378,8 +259,12 @@ def _run_mind_map_task(task_id: str, session_id: str, user_id: str):
         db.close()
 
 
-def start_mind_map_generation(session_id: str, user: User, db: DBSessionType) -> dict:
-    """Start or reuse an async mind map generation task."""
+def start_mind_map_generation(session_id: str, user: User, db: DBSessionType, force: bool = False) -> dict:
+    """Start or reuse an async mind map generation task.
+
+    Args:
+        force: If True, regenerate even if a ready mind map exists.
+    """
     if not DEEPSEEK_API_KEY:
         raise ValueError("未配置 DEEPSEEK_API_KEY，无法生成知识导图")
 
@@ -394,29 +279,30 @@ def start_mind_map_generation(session_id: str, user: User, db: DBSessionType) ->
     if not content_text.strip():
         raise ValueError("No indexable content in note")
 
-    status = get_mind_map_status(session_id, user, db)
-    if status["status"] == "ready":
-        return status
-    if status["status"] == "generating":
-        return status
+    with _get_start_lock(session_id, TASK_TYPE):
+        # Re-check inside the lock to close the race window.
+        db.expire_all()
+        status = get_mind_map_status(session_id, user, db)
+        if status["status"] == "ready" and not force:
+            return status
+        if status["status"] == "generating":
+            return status
 
-    task = Task(
-        session_id=session_id,
-        task_type=TASK_TYPE,
-        status="pending",
-        progress=0.0,
-        error_message=None,
-    )
-    db.add(task)
-    db.commit()
-    db.refresh(task)
+        task = Task(
+            session_id=session_id,
+            task_type=TASK_TYPE,
+            status="pending",
+            progress=0.0,
+            error_message=None,
+        )
+        db.add(task)
+        db.commit()
+        db.refresh(task)
 
-    thread = threading.Thread(
-        target=_run_mind_map_task,
-        args=(task.id, session_id, user.id),
+    run_agent_task(
+        target=lambda: _run_mind_map_task(task.id, session_id, user.id),
         daemon=True,
     )
-    thread.start()
     logger.info(
         "mind_map_task_started task_id=%s session_id=%s user_id=%s",
         task.id,

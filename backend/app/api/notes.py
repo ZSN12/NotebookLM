@@ -46,7 +46,7 @@ def update_note(
     else:
         note.content = data.content or ""
     if data.layout_blocks is not None:
-        note.layout_blocks = data.layout_blocks
+        note.layout_blocks = [b.model_dump() for b in data.layout_blocks]
     db.commit()
     db.refresh(note)
     return note

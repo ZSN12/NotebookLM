@@ -652,27 +652,12 @@ class TermCorrector:
     # Content preservation — now uses deduped baseline, not raw
     # ──────────────────────────────────────────────────────────────────
 
-    @staticmethod
-    def _core_terms(text: str) -> set[str]:
-        """Extract content-bearing terms for overlap checking."""
-        # Chinese characters (2+) and alphanumeric sequences
-        terms = re.findall(r'[a-zA-Z0-9]+|[一-鿿]{2,}', text or "")
-        # Exclude common oral fillers that carry no knowledge
-        fillers = {
-            '我们', '你们', '大家', '这个', '那个', '就是', '然后', '那么',
-            '因为', '所以', '但是', '不过', '如果', '什么', '怎么', '一个',
-            '可以', '就是', '这样', '那样', '现在', '今天', '这边',
-        }
-        return {t for t in terms if t not in fillers}
-
     @classmethod
     def preserves_source_content(cls, raw_source: str, candidate: str, min_ratio: float = 0.80) -> bool:
         """Check that candidate didn't delete real content vs raw_source.
 
         Uses the *deterministically cleaned* version of raw_source as the
         baseline so filler removal & dedup don't falsely trigger rejection.
-        Also checks core-term coverage so legitimate corrections that drop
-        fillers aren't rejected.
         """
         if cls.looks_like_summary(candidate, raw_source):
             return False
@@ -688,21 +673,7 @@ class TermCorrector:
             return False
         if baseline_len < 30:
             return candidate_len >= max(1, int(baseline_len * 0.6))
-
-        # Primary: length ratio (already accounts for filler removal)
-        length_ok = candidate_len >= int(baseline_len * min_ratio)
-
-        # Secondary: core term coverage — if length is short, check that
-        # most content-bearing terms (Chinese words + English/code) survived
-        core_baseline = cls._core_terms(baseline)
-        core_candidate = cls._core_terms(candidate or "")
-        if core_baseline:
-            covered = len(core_baseline & core_candidate) / len(core_baseline)
-            core_ok = covered >= 0.75  # 75% core terms must survive
-        else:
-            core_ok = True
-
-        return length_ok or core_ok
+        return candidate_len >= int(baseline_len * min_ratio)
 
     @staticmethod
     def looks_like_summary(candidate: str, source: str = "") -> bool:

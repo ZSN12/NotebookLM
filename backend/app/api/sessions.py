@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
+from datetime import datetime, timezone, timedelta
 from app.core.database import get_db
 from app.core.auth import get_current_user
 from app.api.schemas import SessionCreate, SessionUpdate, SessionResponse
@@ -107,6 +108,8 @@ def delete_session(
 @router.post("/{session_id}/share/enable")
 def enable_share(
     session_id: str,
+    expires_in_hours: int = None,
+    max_views: int = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -120,10 +123,21 @@ def enable_share(
     token = secrets.token_urlsafe(24)
     session.share_enabled = True
     session.share_token = token
+    session.share_view_count = 0
+    if expires_in_hours is not None and expires_in_hours > 0:
+        session.share_expires_at = datetime.now(timezone.utc) + timedelta(hours=expires_in_hours)
+    else:
+        session.share_expires_at = None
+    if max_views is not None and max_views > 0:
+        session.share_max_views = max_views
+    else:
+        session.share_max_views = None
     db.commit()
 
     return {"share_enabled": True, "share_token": token,
-            "share_url": f"/share/{session_id}?token={token}"}
+            "share_url": f"/share/{session_id}?token={token}",
+            "share_expires_at": session.share_expires_at,
+            "share_max_views": session.share_max_views}
 
 
 @router.post("/{session_id}/share/disable")
@@ -141,6 +155,9 @@ def disable_share(
 
     session.share_enabled = False
     session.share_token = None
+    session.share_expires_at = None
+    session.share_max_views = None
+    session.share_view_count = 0
     db.commit()
 
     return {"share_enabled": False}
@@ -163,4 +180,7 @@ def get_share_status(
         "share_enabled": bool(session.share_enabled),
         "share_token": session.share_token if session.share_enabled else None,
         "share_url": f"/share/{session_id}?token={session.share_token}" if session.share_enabled and session.share_token else None,
+        "share_expires_at": session.share_expires_at,
+        "share_max_views": session.share_max_views,
+        "share_view_count": session.share_view_count,
     }

@@ -3,6 +3,8 @@
 Slide images are saved as PNG files to disk (not base64 in the database).
 """
 
+import base64
+import logging
 import os
 import re
 import io
@@ -17,7 +19,9 @@ from pptx.enum.shapes import MSO_SHAPE_TYPE
 from pptx.dml.color import RGBColor
 from PIL import Image, ImageDraw, ImageFont
 
-from app.config import FONTS_DIR
+from app.config import FONTS_DIR, QWEN_VL_API_KEY, DASHSCOPE_API_KEY
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -195,7 +199,10 @@ def _render_background(slide, draw: ImageDraw.Draw, canvas: Image.Image) -> None
         bg = slide.background
         fill_elem = bg.fill
         # Try to read solid fill
-        srgb = fill_elem.fore_color.rgb if fill_elem.fore_color else None
+        try:
+            srgb = fill_elem.fore_color.rgb if fill_elem.fore_color else None
+        except AttributeError:
+            srgb = None
         if srgb:
             color = _rgb_to_tuple(srgb)
             draw.rectangle([(0, 0), canvas.size], fill=color)
@@ -290,7 +297,11 @@ def _render_text_box(draw: ImageDraw.Draw, shape, canvas: Image.Image, dpi_scale
             else:
                 font_size_pt = default_font_size_pt
 
-            color = _rgb_to_tuple(run.font.color.rgb if run.font.color and run.font.color.rgb else None)
+            try:
+                rgb_val = run.font.color.rgb if run.font.color else None
+            except AttributeError:
+                rgb_val = None
+            color = _rgb_to_tuple(rgb_val)
             is_bold = run.font.bold or False
             is_italic = run.font.italic or False
             runs_data.append((text, font_name, font_size_pt, color, is_bold, is_italic))
@@ -703,16 +714,84 @@ def parse_ppt_to_slides(ppt_path: str, output_dir: Optional[str] = None) -> List
                     pass
         rendered = _render_slides_via_pillow(ppt_path, output_dir, slide_count)
 
+    def _pick_title(slide) -> str:
+        """Pick the best title candidate.
+
+        Priority:
+          1. Title / Center-Title placeholders (largest font, top of slide)
+          2. Placeholders with large font
+          3. Non-page-number text boxes, sorted by font size desc
+        """
+        candidates = []
+        for shape in slide.shapes:
+            if not shape.has_text_frame:
+                continue
+
+            # Detect title placeholder type
+            is_title_placeholder = False
+            try:
+                if shape.is_placeholder:
+                    ph_type = shape.placeholder_format.type
+                    # 1 = TITLE, 3 = CENTER_TITLE, 6 = SLIDE_NUMBER (skip)
+                    is_title_placeholder = ph_type in (1, 3)
+                    if ph_type == 6:  # slide number
+                        continue
+            except Exception:
+                pass
+
+            for para in shape.text_frame.paragraphs:
+                txt = para.text.strip()
+                if not txt:
+                    continue
+                # Skip pure numbers / page-number-like tokens
+                if re.fullmatch(r"\d{1,3}|SUMMARY|CONTENTS|目录|内容", txt):
+                    continue
+                # Skip code fragments like '}', '{', single symbols
+                if re.fullmatch(r"[\{\}\(\)\[\]<>/\\]+|private|public|if|return", txt):
+                    continue
+
+                # Estimate font size (EMU → pt)
+                font_size = 0
+                try:
+                    if para.runs:
+                        run = para.runs[0]
+                        if run.font.size:
+                            font_size = run.font.size / 12700.0  # EMU to pt
+                except Exception:
+                    pass
+                if not font_size and shape.text_frame.paragraphs[0].runs:
+                    try:
+                        run = shape.text_frame.paragraphs[0].runs[0]
+                        if run.font.size:
+                            font_size = run.font.size / 12700.0
+                    except Exception:
+                        pass
+
+                # Vertical position bonus (higher on slide = more likely title)
+                top_y = 0
+                try:
+                    top_y = shape.top
+                except Exception:
+                    pass
+
+                candidates.append((
+                    is_title_placeholder,
+                    font_size,
+                    -top_y,   # higher (smaller y) first
+                    len(txt),
+                    txt,
+                ))
+
+        if not candidates:
+            return ""
+
+        # Sort: title placeholder > large font > higher position > shorter text
+        candidates.sort(key=lambda x: (not x[0], -x[1], -x[2], x[3]))
+        return candidates[0][4]
+
     slides = []
     for idx, slide in enumerate(prs.slides, start=1):
-        title = ""
-        for shape in slide.shapes:
-            if shape.has_text_frame:
-                first_text = shape.text_frame.paragraphs[0].text.strip()
-                if first_text:
-                    title = first_text
-                    break
-
+        title = _pick_title(slide)
         text = extract_text_from_slide(slide)
 
         image_path = ""
@@ -726,4 +805,133 @@ def parse_ppt_to_slides(ppt_path: str, output_dir: Optional[str] = None) -> List
             "image_path": image_path,
         })
 
+    # ── Optional: enrich sparse slides with VL image description ──
+    # If a slide has very little text (< 60 chars) but a rendered image,
+    # ask Qwen-VL to describe the image so the aligner has more signal.
+    if rendered and output_dir:
+        _enrich_slides_with_vl(slides, str(output_dir))
+
     return slides
+
+
+def _describe_slide_image(image_path: str, title: str) -> str:
+    """Describe a slide image using Qwen-VL via DashScope OpenAI-compatible API.
+
+    Returns empty string on any error so the caller can safely ignore it.
+    """
+    api_key = QWEN_VL_API_KEY or DASHSCOPE_API_KEY
+    if not api_key:
+        return ""
+
+    try:
+        # Resize to max 800px width to keep payload small
+        with Image.open(image_path) as img:
+            max_width = 800
+            if img.width > max_width:
+                ratio = max_width / img.width
+                new_height = int(img.height * ratio)
+                img = img.resize((max_width, new_height), Image.LANCZOS)
+
+            buffer = io.BytesIO()
+            img.save(buffer, format="JPEG", quality=85)
+            img_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+        from openai import OpenAI
+
+        client = OpenAI(
+            api_key=api_key,
+            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        )
+
+        prompt = (
+            f"你是一位课堂助教。幻灯片标题是「{title}」。"
+            "请用一句话描述这张教学幻灯片的核心内容，"
+            "重点提取图中展示的概念、模型、流程或数据，"
+            "不要描述排版和颜色。控制在80字以内。"
+        )
+
+        response = client.chat.completions.create(
+            model="qwen-vl-plus",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{img_base64}"
+                            },
+                        },
+                    ],
+                }
+            ],
+            max_tokens=200,
+            timeout=30,
+        )
+
+        desc = response.choices[0].message.content.strip()
+        desc = desc.strip('"').strip("'").strip()
+        return desc
+
+    except Exception as e:
+        logger.warning("vl_describe_failed path=%s error=%s", image_path, e)
+        return ""
+
+
+def _is_likely_chapter_header(slide: dict) -> bool:
+    """Detect chapter/header slides — VL description is wasted on these.
+
+    Chapter slides usually have a big title + a small number like '01',
+    'CONTENTS', 'SUMMARY', etc. The rendered image is just a background
+    with text overlay, so VL adds little value for alignment.
+    """
+    text = slide.get("text", "") or ""
+    title = slide.get("title", "") or ""
+    if not title:
+        return False
+
+    # Remove title and whitespace from text
+    remainder = text.replace(title, "").strip()
+    cleaned = re.sub(r"[\s\n\r\t]", "", remainder)
+
+    # If remainder is empty or very short → likely chapter
+    if len(cleaned) <= 8:
+        return True
+
+    # If remainder is just numbering/catalog words → chapter
+    if re.fullmatch(r"(CONTENTS|SUMMARY|目录|内容|THANKYOU|\d{1,3})+", cleaned, re.I):
+        return True
+
+    return False
+
+
+def _enrich_slides_with_vl(slides: List[dict], output_dir: str) -> None:
+    """Enrich text-sparse slides with VL-generated descriptions."""
+    for slide in slides:
+        text = slide.get("text", "") or ""
+        image_path = slide.get("image_path", "")
+        if not image_path:
+            continue
+
+        # Only describe slides that are text-poor (< 60 chars)
+        if len(text) >= 60:
+            continue
+
+        # Skip chapter/header slides to save API cost
+        if _is_likely_chapter_header(slide):
+            continue
+
+        img_full = os.path.join(output_dir, image_path)
+        if not os.path.exists(img_full):
+            continue
+
+        desc = _describe_slide_image(img_full, slide.get("title", ""))
+        if desc:
+            slide["text"] = f"{text}\n[图片描述]{desc}".strip()
+            logger.info(
+                "vl_enrich page=%s title=%s desc=%s",
+                slide["page"],
+                slide.get("title", "")[:20],
+                desc[:40],
+            )

@@ -20,6 +20,7 @@ from app.config import AUDIO_DIR, DASHSCOPE_API_KEY
 
 MAX_AUDIO_CHUNK_SIZE = 50 * 1024 * 1024  # 50MB
 MAX_FULL_AUDIO_SIZE = 500 * 1024 * 1024  # 500MB
+MAX_CHUNK_UPLOAD_SIZE = 10 * 1024 * 1024  # 10MB per chunk for resumable upload
 logger = logging.getLogger(__name__)
 
 from app.api.process.correction import schedule_correction
@@ -95,7 +96,7 @@ async def _correct_window_for_stream(
             raise ValueError("DeepSeek returned empty text")
 
         ai_display = corrector.clean_transcript_for_display(ai_text).strip() or ai_text
-        if not corrector.preserves_source_content(local_text, ai_display, min_ratio=0.50):
+        if not corrector.preserves_source_content(local_text, ai_display, min_ratio=0.60):
             return {
                 "text": local_text,
                 "raw_text": cleaned,
@@ -140,19 +141,26 @@ async def _finalize_display_text_for_stream(
 ) -> dict:
     """Produce the final display transcript from the whole recording.
 
-    Chunk-level correction keeps the UI responsive, but paragraph boundaries
-    often cross a 20-30s audio window. This final pass works on the whole
-    transcript so the saved note can dedupe and split by meaning globally.
+    Three-tier fallback:
+      1. raw_text       — ASR original (preserved as-is)
+      2. display_text   — deterministic local cleanup (always runs)
+      3. corrected_text — DeepSeek enhancement (best-effort, never blocks)
+
+    On any DeepSeek failure, timeout, or content-rejection, returns
+    display_text = local_clean, corrected_text = None, and a uniform
+    correction_error so callers never fall back to raw ASR.
     """
     raw = (raw_text or "").strip()
     source = (display_source or raw).strip()
     if not source:
         return {
-            "text": "",
+            "display_text": "",
+            "corrected_text": None,
             "is_ai_corrected": False,
             "correction_error": None,
         }
 
+    # Tier 2 — local deterministic cleanup (always runs)
     try:
         local_display = corrector.clean_transcript_for_display(source).strip() or source
     except Exception as exc:
@@ -163,58 +171,285 @@ async def _finalize_display_text_for_stream(
         )
         local_display = source
 
+    display_text = local_display
+    corrected_text = None
+    is_ai_corrected = False
+    correction_error = None
+
+    # Tier 3 — DeepSeek enhancement (best-effort)
     if not getattr(corrector, "has_llm", False):
-        return {
-            "text": local_display,
-            "is_ai_corrected": False,
-            "correction_error": "未配置 DeepSeek API，已使用本地整理",
-        }
+        correction_error = "AI 整理失败"
+    else:
+        try:
+            ai_text = await asyncio.wait_for(
+                asyncio.to_thread(
+                    corrector.restructure_transcript,
+                    local_display,
+                    course_title,
+                    keywords,
+                    ppt_slides,
+                ),
+                timeout=timeout_seconds,
+            )
+            ai_text = (ai_text or "").strip()
+            if not ai_text:
+                raise ValueError("DeepSeek returned empty final text")
+
+            ai_display = corrector.clean_transcript_for_display(ai_text).strip() or ai_text
+            if not corrector.preserves_source_content(local_display, ai_display, min_ratio=0.65):
+                correction_error = "AI 整理失败"
+            else:
+                display_text = ai_display
+                corrected_text = ai_display
+                is_ai_corrected = True
+        except asyncio.TimeoutError:
+            correction_error = "AI 整理失败"
+        except Exception as exc:
+            logger.warning(
+                "audio_batch_final_ai_cleanup_failed error_type=%s error=%s",
+                type(exc).__name__, exc,
+                exc_info=True,
+            )
+            correction_error = "AI 整理失败"
+
+    return {
+        "display_text": display_text,
+        "corrected_text": corrected_text,
+        "is_ai_corrected": is_ai_corrected,
+        "correction_error": correction_error,
+    }
+
+
+def _merge_segments_to_chunks(segments, max_speech_ms=8000):
+    chunks = []
+    current = []
+    current_ms = 0
+    for seg in segments:
+        if not current:
+            current.append(seg)
+            current_ms = seg.end_ms - seg.start_ms
+            continue
+        gap = seg.start_ms - current[-1].end_ms
+        add_ms = seg.end_ms - seg.start_ms
+        if gap > 500 or current_ms + add_ms > max_speech_ms:
+            chunks.append(current)
+            current = [seg]
+            current_ms = add_ms
+        else:
+            current.append(seg)
+            current_ms += add_ms
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def _cleanup_temp_files(temp_path: str, wav_path: str | None) -> None:
+    if os.path.exists(temp_path):
+        try:
+            os.unlink(temp_path)
+        except Exception:
+            pass
+    if wav_path and os.path.exists(wav_path):
+        try:
+            os.unlink(wav_path)
+        except Exception:
+            pass
+
+
+async def _generate_audio_sse(
+    session_id: str,
+    process_path: str,
+    temp_path: str,
+    wav_path: str | None,
+    course_title: str,
+    keywords: list,
+    ppt_slides: list | None,
+):
+    """Async generator that transcribes audio and yields SSE events."""
+    # Save persistent audio
+    try:
+        AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+        audio_output = AUDIO_DIR / f"{session_id}.wav"
+        def _copy_audio():
+            src_path = process_path if process_path == wav_path else temp_path
+            with open(src_path, "rb") as src, open(audio_output, "wb") as dst:
+                dst.write(src.read())
+        await asyncio.to_thread(_copy_audio)
+        logger.info("audio_batch_saved_audio session_id=%s path=%s", session_id, audio_output)
+    except Exception as save_err:
+        logger.warning("audio_batch_save_audio_failed session_id=%s error=%s", session_id, save_err, exc_info=True)
+
+    yield f"data: {json.dumps({'type': 'status', 'message': '开始识别语音', 'segment': 0, 'total': 1}, ensure_ascii=False)}\n\n"
 
     try:
-        ai_text = await asyncio.wait_for(
-            asyncio.to_thread(
-                corrector.restructure_transcript,
-                local_display,
-                course_title,
-                keywords,
-                ppt_slides,
-            ),
-            timeout=timeout_seconds,
-        )
-        ai_text = (ai_text or "").strip()
-        if not ai_text:
-            raise ValueError("DeepSeek returned empty final text")
+        all_segments = await asyncio.to_thread(transcriber.transcribe, process_path)
+    except Exception as e:
+        logger.warning("audio_batch_transcribe_failed session_id=%s error=%s", session_id, e)
+        all_segments = []
 
-        ai_display = corrector.clean_transcript_for_display(ai_text).strip() or ai_text
-        if not corrector.preserves_source_content(local_display, ai_display, min_ratio=0.50):
-            return {
-                "text": local_display,
-                "is_ai_corrected": False,
-                "correction_error": "AI 全文整理疑似删减内容，已使用本地整理",
-            }
+    if not all_segments:
+        logger.warning("audio_batch_no_text session_id=%s", session_id)
+        yield f"data: {json.dumps({'type': 'error', 'detail': '未识别到语音内容，请检查音频格式、音量或 ASR 配置'}, ensure_ascii=False)}\n\n"
+        _cleanup_temp_files(temp_path, wav_path)
+        return
 
-        return {
-            "text": ai_display,
-            "is_ai_corrected": ai_display != local_display,
-            "correction_error": None,
+    logger.info(
+        "audio_batch_whole_transcribe session_id=%s segments=%s",
+        session_id, len(all_segments),
+    )
+
+    chunks = _merge_segments_to_chunks(all_segments, max_speech_ms=8000)
+    total_chunks = len(chunks)
+
+    raw_parts = []
+    display_parts = []
+    all_timestamps = []
+
+    for i, chunk in enumerate(chunks):
+        chunk_text = " ".join(seg.text for seg in chunk).strip()
+        if not chunk_text:
+            continue
+
+        raw_parts.append(chunk_text)
+        all_timestamps.extend(seg.to_dict() for seg in chunk)
+
+        cleaned = corrector.clean_transcript_for_display(chunk_text).strip()
+        if not cleaned:
+            continue
+
+        history = "\n\n".join(display_parts)
+        display_text = corrector.prepare_stream_chunk(cleaned, history).strip()
+        if not display_text:
+            logger.info("audio_batch_chunk_deduped session_id=%s chunk=%s", session_id, i + 1)
+            continue
+
+        display_parts.append(display_text)
+
+        yield f"data: {json.dumps({'type': 'chunk', 'text': display_text, 'segment': i + 1, 'segment_total': total_chunks, 'is_ai_corrected': False, 'is_final': False}, ensure_ascii=False)}\n\n"
+
+    # One-shot DeepSeek full restructure
+    yield f"data: {json.dumps({'type': 'status', 'message': '正在整理最终转写结果', 'segment': total_chunks, 'total': total_chunks}, ensure_ascii=False)}\n\n"
+
+    raw_text = "\n\n".join(raw_parts)
+    display_source = "\n\n".join(display_parts)
+    if not display_source:
+        display_source = corrector.clean_transcript_for_display(raw_text).strip() or raw_text
+
+    final_result = await _finalize_display_text_for_stream(
+        raw_text=raw_text,
+        display_source=display_source,
+        course_title=course_title,
+        keywords=keywords,
+        ppt_slides=ppt_slides,
+    )
+    display_text = final_result.get("display_text") or display_source or raw_text
+    corrected_text = final_result.get("corrected_text")
+    if final_result.get("correction_error"):
+        yield f"data: {json.dumps({'type': 'status', 'message': final_result['correction_error'], 'segment': total_chunks, 'total': total_chunks}, ensure_ascii=False)}\n\n"
+
+    if display_text and display_text != display_source:
+        yield f"data: {json.dumps({'type': 'chunk', 'text': display_text, 'segment': total_chunks, 'segment_total': total_chunks, 'is_final': True}, ensure_ascii=False)}\n\n"
+
+    transcript_data = [{
+        "chunk_index": 0,
+        "text": display_text,
+        "raw_text": raw_text,
+        "display_text": display_text,
+        "corrected_text": corrected_text,
+        "timestamps": all_timestamps,
+        "is_corrected": display_text != raw_text,
+        "is_ai_corrected": bool(final_result.get("is_ai_corrected")),
+        "correction_error": final_result.get("correction_error"),
+        "is_restructured": False,
+        "correction_stage": "final",
+    }]
+    transcript_blocks = [
+        {
+            "id": f"transcript-{i + 1}",
+            "type": "transcript",
+            "content": part.strip(),
         }
-    except asyncio.TimeoutError:
+        for i, part in enumerate(display_text.split("\n\n"))
+        if part.strip()
+    ]
+
+    def _notes_content_from_existing(content):
+        existing = (content or "").strip()
+        if not existing:
+            return ""
+        marker = "\n\n---\n\n"
+        if existing.startswith("## 语音转文字"):
+            return existing.split(marker, 1)[1].strip() if marker in existing else ""
+        return existing
+
+    def _serialize_note(note):
         return {
-            "text": local_display,
-            "is_ai_corrected": False,
-            "correction_error": "DeepSeek 全文整理超时，已使用本地整理",
+            "id": note.id,
+            "session_id": note.session_id,
+            "content": note.content or "",
+            "transcript": note.transcript,
+            "ppt_images": note.ppt_images or [],
+            "vocabulary": note.vocabulary or [],
+            "layout_blocks": note.layout_blocks or [],
+            "created_at": note.created_at.isoformat() if note.created_at else None,
         }
-    except Exception as exc:
-        logger.warning(
-            "audio_batch_final_ai_cleanup_failed error_type=%s error=%s",
-            type(exc).__name__, exc,
-            exc_info=True,
+
+    def _save():
+        from app.core.database import SessionLocal
+        sav_db = SessionLocal()
+        try:
+            existing_note = sav_db.query(Note).filter(Note.session_id == session_id).first()
+            if existing_note:
+                notes_content = _notes_content_from_existing(existing_note.content)
+                existing_note_blocks = existing_note.layout_blocks or []
+                note_blocks = [
+                    block for block in existing_note_blocks
+                    if isinstance(block, dict) and block.get("type") == "note"
+                ]
+                if notes_content and not note_blocks:
+                    note_blocks = [{
+                        "id": f"note-{len(transcript_blocks) + 1}",
+                        "type": "note",
+                        "content": notes_content,
+                    }]
+                existing_note.content = (
+                    f"## 语音转文字\n\n{display_text}\n\n---\n\n{notes_content}".strip()
+                    if notes_content
+                    else f"## 语音转文字\n\n{display_text}".strip()
+                )
+                existing_note.transcript = transcript_data
+                existing_note.layout_blocks = transcript_blocks + note_blocks
+                sav_db.commit()
+                sav_db.refresh(existing_note)
+                return _serialize_note(existing_note)
+            else:
+                note = Note(
+                    session_id=session_id,
+                    content=f"## 语音转文字\n\n{display_text}".strip(),
+                    transcript=transcript_data,
+                    ppt_images=[],
+                    vocabulary=[],
+                )
+                note.layout_blocks = transcript_blocks
+                sav_db.add(note)
+                sav_db.commit()
+                sav_db.refresh(note)
+                return _serialize_note(note)
+        finally:
+            sav_db.close()
+
+    try:
+        saved_note = await asyncio.to_thread(_save)
+        logger.info(
+            "audio_batch_saved session_id=%s raw_chars=%s display_chars=%s chunks=%s",
+            session_id, len(raw_text), len(display_text), total_chunks,
         )
-        return {
-            "text": local_display,
-            "is_ai_corrected": False,
-            "correction_error": "AI 全文整理失败，已使用本地整理",
-        }
+        yield f"data: {json.dumps({'type': 'done', 'note': saved_note}, ensure_ascii=False)}\n\n"
+    except Exception as db_err:
+        logger.exception("audio_batch_db_save_failed session_id=%s", session_id)
+        yield f"data: {json.dumps({'type': 'error', 'detail': f'Failed to save: {db_err}'})}\n\n"
+
+    _cleanup_temp_files(temp_path, wav_path)
 
 
 def _find_ffmpeg() -> str | None:
@@ -583,8 +818,6 @@ async def process_audio_batch_stream(
     course_title = notebook.title if notebook else ""
     keywords = session.keywords or []
 
-    print(f"[AUDIO-BATCH] session_id={session_id} course={course_title} keywords={keywords} file={file.filename}", flush=True)
-
     # Read file
     audio_bytes = await file.read()
     file_size = len(audio_bytes)
@@ -669,237 +902,8 @@ async def process_audio_batch_stream(
         except Exception:
             ppt_slides = None
 
-        # Save persistent audio
-        try:
-            AUDIO_DIR.mkdir(parents=True, exist_ok=True)
-            audio_output = AUDIO_DIR / f"{session_id}.wav"
-            def _copy_audio():
-                src_path = process_path if process_path == wav_path else temp_path
-                with open(src_path, "rb") as src, open(audio_output, "wb") as dst:
-                    dst.write(src.read())
-            await asyncio.to_thread(_copy_audio)
-            logger.info("audio_batch_saved_audio session_id=%s path=%s", session_id, audio_output)
-        except Exception as save_err:
-            logger.warning("audio_batch_save_audio_failed session_id=%s error=%s", session_id, save_err, exc_info=True)
-
-        # ----------------------------------------------------------------
-        # SSE generator — whole-file ASR + VAD-driven chunk merge + one-shot
-        # ----------------------------------------------------------------
-        # 1. Transcribe the whole file at once (FunASR VAD produces natural
-        #    sentence boundaries internally).
-        # 2. Merge segments into ~8s chunks based on natural pauses.
-        # 3. Stream each chunk after local cleanup + history dedup.
-        # 4. After all chunks, call DeepSeek ONCE for full restructure.
-
-        def _merge_segments_to_chunks(segments, max_speech_ms=8000):
-            chunks = []
-            current = []
-            current_ms = 0
-            for seg in segments:
-                if not current:
-                    current.append(seg)
-                    current_ms = seg.end_ms - seg.start_ms
-                    continue
-                gap = seg.start_ms - current[-1].end_ms
-                add_ms = seg.end_ms - seg.start_ms
-                if gap > 500 or current_ms + add_ms > max_speech_ms:
-                    chunks.append(current)
-                    current = [seg]
-                    current_ms = add_ms
-                else:
-                    current.append(seg)
-                    current_ms += add_ms
-            if current:
-                chunks.append(current)
-            return chunks
-
-        async def generate():
-            yield f"data: {json.dumps({'type': 'status', 'message': '开始识别语音', 'segment': 0, 'total': 1}, ensure_ascii=False)}\n\n"
-
-            try:
-                all_segments = await asyncio.to_thread(transcriber.transcribe, process_path)
-            except Exception as e:
-                logger.warning("audio_batch_transcribe_failed session_id=%s error=%s", session_id, e)
-                all_segments = []
-
-            if not all_segments:
-                logger.warning("audio_batch_no_text session_id=%s", session_id)
-                yield f"data: {json.dumps({'type': 'error', 'detail': '未识别到语音内容，请检查音频格式、音量或 ASR 配置'}, ensure_ascii=False)}\n\n"
-                _cleanup_temp_files()
-                return
-
-            logger.info(
-                "audio_batch_whole_transcribe session_id=%s segments=%s",
-                session_id, len(all_segments),
-            )
-
-            chunks = _merge_segments_to_chunks(all_segments, max_speech_ms=8000)
-            total_chunks = len(chunks)
-
-            raw_parts = []
-            display_parts = []
-            all_timestamps = []
-
-            for i, chunk in enumerate(chunks):
-                chunk_text = " ".join(seg.text for seg in chunk).strip()
-                if not chunk_text:
-                    continue
-
-                raw_parts.append(chunk_text)
-                all_timestamps.extend(seg.to_dict() for seg in chunk)
-
-                cleaned = corrector.clean_transcript_for_display(chunk_text).strip()
-                if not cleaned:
-                    continue
-
-                history = "\n\n".join(display_parts)
-                display_text = corrector.prepare_stream_chunk(cleaned, history).strip()
-                if not display_text:
-                    logger.info("audio_batch_chunk_deduped session_id=%s chunk=%s", session_id, i + 1)
-                    continue
-
-                display_parts.append(display_text)
-
-                yield f"data: {json.dumps({'type': 'chunk', 'text': display_text, 'segment': i + 1, 'segment_total': total_chunks, 'is_ai_corrected': False, 'is_final': False}, ensure_ascii=False)}\n\n"
-
-            # One-shot DeepSeek full restructure
-            yield f"data: {json.dumps({'type': 'status', 'message': '正在整理最终转写结果', 'segment': total_chunks, 'total': total_chunks}, ensure_ascii=False)}\n\n"
-
-            raw_text = "\n\n".join(raw_parts)
-            display_source = "\n\n".join(display_parts)
-            if not display_source:
-                display_source = corrector.clean_transcript_for_display(raw_text).strip() or raw_text
-
-            final_result = await _finalize_display_text_for_stream(
-                raw_text=raw_text,
-                display_source=display_source,
-                course_title=course_title,
-                keywords=keywords,
-                ppt_slides=ppt_slides,
-            )
-            display_text = corrector.clean_transcript_for_display(
-                (final_result.get("text") or display_source or raw_text).strip()
-            ).strip()
-            if final_result.get("correction_error"):
-                yield f"data: {json.dumps({'type': 'status', 'message': final_result['correction_error'], 'segment': total_chunks, 'total': total_chunks}, ensure_ascii=False)}\n\n"
-
-            if display_text and display_text != display_source:
-                yield f"data: {json.dumps({'type': 'chunk', 'text': display_text, 'segment': total_chunks, 'segment_total': total_chunks, 'is_final': True}, ensure_ascii=False)}\n\n"
-
-            transcript_data = [{
-                "chunk_index": 0,
-                "text": display_text,
-                "raw_text": raw_text,
-                "display_text": display_text,
-                "timestamps": all_timestamps,
-                "is_corrected": display_text != raw_text,
-                "is_ai_corrected": bool(final_result.get("is_ai_corrected")),
-                "correction_error": final_result.get("correction_error"),
-                "is_restructured": False,
-                "correction_stage": "final",
-            }]
-            transcript_blocks = [
-                {
-                    "id": f"transcript-{i + 1}",
-                    "type": "transcript",
-                    "content": part.strip(),
-                }
-                for i, part in enumerate(display_text.split("\n\n"))
-                if part.strip()
-            ]
-
-            def _notes_content_from_existing(content):
-                existing = (content or "").strip()
-                if not existing:
-                    return ""
-                marker = "\n\n---\n\n"
-                if existing.startswith("## 语音转文字"):
-                    return existing.split(marker, 1)[1].strip() if marker in existing else ""
-                return existing
-
-            def _serialize_note(note):
-                return {
-                    "id": note.id,
-                    "session_id": note.session_id,
-                    "content": note.content or "",
-                    "transcript": note.transcript,
-                    "ppt_images": note.ppt_images or [],
-                    "vocabulary": note.vocabulary or [],
-                    "layout_blocks": note.layout_blocks or [],
-                    "created_at": note.created_at.isoformat() if note.created_at else None,
-                }
-
-            def _save():
-                from app.core.database import SessionLocal
-                sav_db = SessionLocal()
-                try:
-                    existing_note = sav_db.query(Note).filter(Note.session_id == session_id).first()
-                    if existing_note:
-                        notes_content = _notes_content_from_existing(existing_note.content)
-                        existing_note_blocks = existing_note.layout_blocks or []
-                        note_blocks = [
-                            block for block in existing_note_blocks
-                            if isinstance(block, dict) and block.get("type") == "note"
-                        ]
-                        if notes_content and not note_blocks:
-                            note_blocks = [{
-                                "id": f"note-{len(transcript_blocks) + 1}",
-                                "type": "note",
-                                "content": notes_content,
-                            }]
-                        existing_note.content = (
-                            f"## 语音转文字\n\n{display_text}\n\n---\n\n{notes_content}".strip()
-                            if notes_content
-                            else f"## 语音转文字\n\n{display_text}".strip()
-                        )
-                        existing_note.transcript = transcript_data
-                        existing_note.layout_blocks = transcript_blocks + note_blocks
-                        sav_db.commit()
-                        sav_db.refresh(existing_note)
-                        return _serialize_note(existing_note)
-                    else:
-                        note = Note(
-                            session_id=session_id,
-                            content=f"## 语音转文字\n\n{display_text}".strip(),
-                            transcript=transcript_data,
-                            ppt_images=[],
-                            vocabulary=[],
-                        )
-                        note.layout_blocks = transcript_blocks
-                        sav_db.add(note)
-                        sav_db.commit()
-                        sav_db.refresh(note)
-                        return _serialize_note(note)
-                finally:
-                    sav_db.close()
-
-            try:
-                saved_note = await asyncio.to_thread(_save)
-                logger.info(
-                    "audio_batch_saved session_id=%s raw_chars=%s display_chars=%s chunks=%s",
-                    session_id, len(raw_text), len(display_text), total_chunks,
-                )
-                yield f"data: {json.dumps({'type': 'done', 'note': saved_note}, ensure_ascii=False)}\n\n"
-            except Exception as db_err:
-                logger.exception("audio_batch_db_save_failed session_id=%s", session_id)
-                yield f"data: {json.dumps({'type': 'error', 'detail': f'Failed to save: {db_err}'})}\n\n"
-
-            _cleanup_temp_files()
-
-        def _cleanup_temp_files():
-            if os.path.exists(temp_path):
-                try:
-                    os.unlink(temp_path)
-                except Exception:
-                    pass
-            if wav_path and os.path.exists(wav_path):
-                try:
-                    os.unlink(wav_path)
-                except Exception:
-                    pass
-
         return StreamingResponse(
-            generate(),
+            _generate_audio_sse(session_id, process_path, temp_path, wav_path, course_title, keywords, ppt_slides),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -936,4 +940,179 @@ async def process_audio_batch_stream(
                     os.rmdir(seg_dir)
                 except Exception:
                     pass
+        raise HTTPException(status_code=500, detail=f"Audio processing failed: {str(e)}")
+
+
+
+@router.post("/audio-chunk")
+async def upload_audio_chunk(
+    file: UploadFile = File(...),
+    session_id: str = "",
+    chunk_index: int = 0,
+    total_chunks: int = 0,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Receive a single chunk of a split audio file upload.
+
+    Chunks are stored in a temporary directory and assembled when
+    audio-chunk-finish is called.
+    """
+    if not session_id:
+        raise HTTPException(status_code=400, detail="session_id is required")
+    if chunk_index < 0 or total_chunks < 1:
+        raise HTTPException(status_code=400, detail="Invalid chunk_index or total_chunks")
+
+    session = db.query(DBSession).filter(
+        DBSession.id == session_id
+    ).join(Notebook).filter(
+        Notebook.user_id == current_user.id
+    ).first()
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    chunk_bytes = await file.read()
+    if len(chunk_bytes) > MAX_CHUNK_UPLOAD_SIZE:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Chunk too large: {len(chunk_bytes)} bytes (max {MAX_CHUNK_UPLOAD_SIZE} bytes)"
+        )
+
+    chunk_dir = AUDIO_DIR / f"{session_id}_chunks"
+    chunk_dir.mkdir(parents=True, exist_ok=True)
+    chunk_path = chunk_dir / f"chunk_{chunk_index:04d}"
+    with open(chunk_path, "wb") as f:
+        f.write(chunk_bytes)
+
+    logger.info(
+        "audio_chunk_received session_id=%s chunk=%s/%s size=%s",
+        session_id, chunk_index + 1, total_chunks, len(chunk_bytes)
+    )
+
+    return {
+        "received": True,
+        "chunk_index": chunk_index,
+        "total_chunks": total_chunks,
+    }
+
+
+@router.post("/audio-chunk-finish")
+async def finish_audio_chunk_upload(
+    session_id: str = "",
+    file_name: str = "",
+    total_chunks: int = 0,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Assemble uploaded chunks and process the complete audio file.
+
+    Returns an SSE stream identical to /audio-batch.
+    """
+    if not session_id:
+        raise HTTPException(status_code=400, detail="session_id is required")
+    if total_chunks < 1:
+        raise HTTPException(status_code=400, detail="total_chunks must be >= 1")
+
+    session = db.query(DBSession).filter(
+        DBSession.id == session_id
+    ).join(Notebook).filter(
+        Notebook.user_id == current_user.id
+    ).first()
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    if not _check_asr_available():
+        raise HTTPException(
+            status_code=503,
+            detail="语音识别服务不可用。请检查 FunASR 是否正确安装或配置 DASHSCOPE_API_KEY 环境变量。"
+        )
+
+    notebook = db.query(Notebook).filter(Notebook.id == session.notebook_id).first()
+    course_title = notebook.title if notebook else ""
+    keywords = session.keywords or []
+
+    chunk_dir = AUDIO_DIR / f"{session_id}_chunks"
+    if not chunk_dir.exists():
+        raise HTTPException(status_code=400, detail="No chunks found for this session")
+
+    expected_chunks = list(range(total_chunks))
+    found_chunks = sorted(
+        int(p.name.split("_")[1]) for p in chunk_dir.glob("chunk_*")
+        if p.name.split("_")[1].isdigit()
+    )
+    missing = [i for i in expected_chunks if i not in found_chunks]
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Missing chunks: {missing}"
+        )
+
+    file_ext = os.path.splitext(file_name or ".webm")[1] or ".webm"
+
+    with tempfile.NamedTemporaryFile(suffix=file_ext, delete=False) as f:
+        temp_path = f.name
+        for i in expected_chunks:
+            chunk_path = chunk_dir / f"chunk_{i:04d}"
+            with open(chunk_path, "rb") as chunk_file:
+                f.write(chunk_file.read())
+
+    # Clean up chunk directory after assembly
+    try:
+        for p in chunk_dir.glob("chunk_*"):
+            p.unlink()
+        chunk_dir.rmdir()
+    except Exception:
+        pass
+
+    # Convert to WAV if needed
+    wav_path = None
+    process_path = temp_path
+    try:
+        supported_exts = {'.wav', '.flac', '.ogg'}
+        if file_ext.lower() not in supported_exts:
+            wav_path = temp_path + ".wav"
+            converted = False
+            ffmpeg = _find_ffmpeg()
+            if ffmpeg:
+                try:
+                    result = await asyncio.to_thread(
+                        lambda: subprocess.run(
+                            [ffmpeg, "-y", "-i", temp_path, "-ar", "16000", "-ac", "1", wav_path],
+                            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120,
+                        )
+                    )
+                    if result.returncode == 0 and os.path.exists(wav_path):
+                        process_path = wav_path
+                        converted = True
+                except Exception:
+                    pass
+            if not converted:
+                logger.warning("audio_chunk_finish_convert_failed session_id=%s", session_id)
+                process_path = temp_path
+
+        ppt_slides = None
+        try:
+            note_for_ppt = db.query(Note).filter(Note.session_id == session_id).first()
+            if note_for_ppt and isinstance(note_for_ppt.ppt_images, list) and note_for_ppt.ppt_images:
+                last_ppt = note_for_ppt.ppt_images[-1]
+                if isinstance(last_ppt, dict):
+                    ppt_slides = last_ppt.get("slides", [])
+        except Exception:
+            ppt_slides = None
+
+        return StreamingResponse(
+            _generate_audio_sse(session_id, process_path, temp_path, wav_path, course_title, keywords, ppt_slides),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+                "Connection": "keep-alive",
+            },
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("audio_chunk_finish_unexpected_error session_id=%s", session_id)
+        _cleanup_temp_files(temp_path, wav_path)
         raise HTTPException(status_code=500, detail=f"Audio processing failed: {str(e)}")

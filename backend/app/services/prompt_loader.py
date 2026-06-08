@@ -43,17 +43,27 @@ def _extract_section(raw: str, heading: str) -> str:
 
 @lru_cache(maxsize=32)
 def load_prompt(name: str) -> PromptTemplate:
-    safe_name = Path(name).name
-    if safe_name != name or not safe_name:
+    """Load a prompt Markdown file from the prompts directory.
+
+    Supports nested paths like ``agents/mindmap`` as long as the resolved file
+    stays inside PROMPT_DIR and contains no ``..`` segments.
+    """
+    if not name or ".." in name or name.startswith("/") or name.startswith("\\"):
         raise PromptTemplateError(f"Invalid prompt name: {name}")
 
-    path = PROMPT_DIR / f"{safe_name}.md"
+    path = PROMPT_DIR / f"{name}.md"
+    # Defensive: ensure the resolved path is still inside PROMPT_DIR
+    try:
+        path.resolve().relative_to(PROMPT_DIR.resolve())
+    except ValueError as exc:
+        raise PromptTemplateError(f"Invalid prompt name: {name}") from exc
+
     if not path.exists():
         raise PromptTemplateError(f"Prompt file not found: {path}")
 
     raw = path.read_text(encoding="utf-8")
     return PromptTemplate(
-        name=safe_name,
+        name=name,
         system=_extract_section(raw, "System"),
         user_template=_extract_section(raw, "User Template"),
     )

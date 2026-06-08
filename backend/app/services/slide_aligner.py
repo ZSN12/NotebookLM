@@ -68,7 +68,7 @@ class SlideAligner:
 
         scores = []
         for i, slide_kw in enumerate(self.slide_keywords):
-            score = self._score_slide(input_kw, slide_kw, self.slide_raw[i], text_lower, i)
+            score = self.score_slide(input_kw, slide_kw, self.slide_raw[i], text_lower, i)
             scores.append(score)
 
         # Find best and second-best scores
@@ -94,8 +94,25 @@ class SlideAligner:
     # Scoring
     # ----------------------------------------------------------------
 
-    def _score_slide(self, input_kw: set, slide_kw: set,
-                     slide_raw: str, input_raw: str, slide_idx: int) -> float:
+    def get_slide_score(self, text: str, slide_idx: int) -> float:
+        """Return the alignment score of *text* against a specific slide index."""
+        if not self.slides or not text or not text.strip():
+            return 0.0
+        if slide_idx < 0 or slide_idx >= len(self.slides):
+            return 0.0
+        input_kw = self._extract_keywords(text)
+        if not input_kw:
+            return 0.0
+        return self.score_slide(
+            input_kw,
+            self.slide_keywords[slide_idx],
+            self.slide_raw[slide_idx],
+            text.lower(),
+            slide_idx,
+        )
+
+    def score_slide(self, input_kw: set, slide_kw: set,
+                    slide_raw: str, input_raw: str, slide_idx: int) -> float:
         """Score a single slide against input keywords.
 
         Combines:

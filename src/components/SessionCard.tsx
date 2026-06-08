@@ -1,4 +1,5 @@
 import { useNavigate } from 'react-router-dom';
+import { toast } from 'sonner';
 import * as LucideIcons from 'lucide-react';
 import { Clock, Trash2 } from 'lucide-react';
 import type { Session } from '@/types';
@@ -19,8 +20,9 @@ export default function SessionCard({ session, notebookId }: SessionCardProps) {
     if (window.confirm(`确定要删除"${session.title}"吗？`)) {
       try {
         await removeSession(notebookId, session.id);
+        toast.success('课次已删除');
       } catch (error) {
-        alert('删除失败，请稍后重试');
+        toast.error('删除失败，请稍后重试');
       }
     }
   };

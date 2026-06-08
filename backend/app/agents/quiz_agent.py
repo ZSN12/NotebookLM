@@ -1,0 +1,175 @@
+"""Quiz agent: generates a question bank from session notes."""
+
+import logging
+import time
+
+from app.agents.base import AgentContext, AgentResult, BaseAgent
+from app.agents.normalizers import normalize_quiz_data
+from app.services.vector_service import _compute_session_content_hash
+
+logger = logging.getLogger(__name__)
+
+
+class QuizAgent(BaseAgent):
+    """Generates a bank of single-choice questions in two batches."""
+
+    role = "quiz"
+    task_type = "agent_quiz"
+    output_kind = "quiz_bank"
+    prompt_name = "quiz"
+
+    temperature = 0.4
+    max_tokens = 8000
+
+    # Number of questions per batch.
+    BATCH1_COUNT = 5
+    BATCH2_COUNT = 5
+    MIN_TOTAL_QUESTIONS = 10
+
+    def _call_batch(
+        self,
+        prompt_template,
+        ctx: AgentContext,
+        count: int,
+        focus: str,
+        existing_questions: list[str] | None = None,
+        retry: bool = True,
+    ) -> list[dict]:
+        """Generate a single batch of questions.
+
+        If the returned valid questions are fewer than ``count``,
+        retry once with a stronger instruction. If still insufficient, raise.
+        """
+        focus_text = focus
+        if existing_questions:
+            focus_text += "\n\n已生成的题目（请避免重复以下题干）：\n" + "\n".join(
+                f"{i + 1}. {q[:120]}" for i, q in enumerate(existing_questions)
+            )
+
+        prompt = prompt_template.render(
+            title=ctx.session.title or "未命名课次",
+            keywords=ctx.get_keywords_text(),
+            content=ctx.get_content_text(max_length=8000),
+            count=count,
+            focus=focus_text,
+        )
+
+        questions = self._try_generate(prompt_template, prompt, count)
+        if len(questions) >= count:
+            return questions
+
+        if retry:
+            logger.info(
+                "quiz_agent_batch_retry session_id=%s requested=%s actual=%s",
+                ctx.session_id,
+                count,
+                len(questions),
+            )
+            retry_prompt = prompt_template.render(
+                title=ctx.session.title or "未命名课次",
+                keywords=ctx.get_keywords_text(),
+                content=ctx.get_content_text(max_length=8000),
+                count=count,
+                focus=focus_text
+                + f"\n\n注意：上一轮只返回了 {len(questions)} 道有效题目，"
+                f"请务必严格返回 {count} 道符合要求的题目。",
+            )
+            retry_questions = self._try_generate(prompt_template, retry_prompt, count)
+            if len(retry_questions) >= len(questions):
+                questions = retry_questions
+
+        if len(questions) < count:
+            raise ValueError(
+                f"AI 返回的题目数量不足: 要求 {count} 道，实际仅 {len(questions)} 道有效题目"
+            )
+        return questions
+
+    def _try_generate(
+        self,
+        prompt_template,
+        prompt: str,
+        min_count: int,
+    ) -> list[dict]:
+        """Call LLM and parse questions; return list (may be shorter than min_count)."""
+        raw = self.call_llm(prompt_template, prompt)
+        batch_data = self.parse_json(raw, repair=True)
+        batch_data = normalize_quiz_data(batch_data)
+        questions = batch_data.get("questions", [])
+
+        if not questions:
+            return []
+        if len(questions) < min_count:
+            logger.warning(
+                "quiz_agent_batch_fewer_questions_than_requested expected=%s actual=%s",
+                min_count,
+                len(questions),
+            )
+        return questions
+
+    def _update_progress(self, ctx: AgentContext, progress: float) -> None:
+        if ctx.task:
+            ctx.task.progress = progress
+            ctx.db.commit()
+
+    def run(self, ctx: AgentContext) -> AgentResult:
+        started = time.monotonic()
+        try:
+            content_text = ctx.get_content_text(max_length=8000)
+            if not content_text.strip():
+                return AgentResult(success=False, error_message="没有可用的索引内容")
+
+            prompt_template = self.load_prompt_template()
+
+            # Batch 1: core concepts
+            batch1 = self._call_batch(
+                prompt_template,
+                ctx,
+                count=self.BATCH1_COUNT,
+                focus="请重点关注课程的核心概念和主要知识点。",
+            )
+            self._update_progress(ctx, 0.5)
+
+            # Batch 2: details and difficult points (deduplicated)
+            batch1_texts = [q["question"] for q in batch1]
+            batch2 = self._call_batch(
+                prompt_template,
+                ctx,
+                count=self.BATCH2_COUNT,
+                focus="请重点关注课程的细节、难点和深入理解。",
+                existing_questions=batch1_texts,
+            )
+
+            all_questions = batch1 + batch2
+            if len(all_questions) < self.MIN_TOTAL_QUESTIONS:
+                raise ValueError(
+                    f"题库题目数量不足: 共 {len(all_questions)} 道，"
+                    f"至少需要 {self.MIN_TOTAL_QUESTIONS} 道"
+                )
+
+            for i, q in enumerate(all_questions, 1):
+                q["id"] = f"q{i}"
+
+            bank_data = {
+                "title": "本节课测验",
+                "questions": all_questions,
+            }
+
+            content_hash = _compute_session_content_hash(ctx.note)
+            self.save_to_vocabulary(
+                ctx,
+                bank_data,
+                extra={"content_hash": content_hash},
+            )
+            ctx.db.commit()
+
+            logger.info(
+                "quiz_agent_success session_id=%s user_id=%s elapsed_ms=%s",
+                ctx.session_id,
+                ctx.user.id,
+                int((time.monotonic() - started) * 1000),
+            )
+            return AgentResult(success=True, data=bank_data)
+        except Exception as e:
+            logger.exception("quiz_agent_failed session_id=%s", ctx.session_id)
+            ctx.db.rollback()
+            return AgentResult(success=False, error_message=str(e))

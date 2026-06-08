@@ -1,4 +1,5 @@
 import { useParams, useNavigate } from 'react-router-dom';
+import { toast } from 'sonner';
 import {
   ArrowLeft, Play, Pause, ChevronUp, ChevronDown, Edit3, Loader2, AlertCircle, ImagePlus,
   X, FileText, Square, Download, Bold, List, Share2, Trash2, Mic, MicOff, Search,
@@ -10,7 +11,7 @@ import { useState, useRef, useCallback, useEffect, useMemo } from 'react';
 import { getProfile, getAvatarUrl } from '@/services/auth';
 import ThemeToggle from '@/components/ThemeToggle';
 import RichTextEditor from '@/components/RichTextEditor';
-import { API_BASE, deleteAudio, uploadPPT, insertPPTIntoTranscript, uploadAudio, getMediaUrl, fetchNotebookDetail, fetchSessionById, enableShare, disableShare, getShareStatus, rebuildSessionVectorIndex, getSessionVectorStatus, searchVectors, VectorIndexStatus, VectorSearchResult, getSessionMindMap, generateSessionMindMap, deleteSessionMindMap, MindMapStatus, MindMapNode, MindMapData, getSessionQuizzes, generateSessionQuiz, getQuizDetail, submitQuizAnswers, deleteQuiz, getQuizBankStatus, rebuildQuizBank, QuizListItem, QuizDetail, QuizQuestion, QuizBankStatus } from '@/services/api';
+import { API_BASE, deleteAudio, uploadPPT, insertPPTIntoTranscript, uploadAudio, getMediaUrl, fetchNotebookDetail, fetchSessionById, enableShare, disableShare, getShareStatus, rebuildSessionVectorIndex, getSessionVectorStatus, searchVectors, VectorIndexStatus, VectorSearchResult, getSessionMindMap, generateSessionMindMap, deleteSessionMindMap, MindMapStatus, MindMapNode, MindMapData, getSessionQuizzes, generateSessionQuiz, getQuizDetail, submitQuizAnswers, deleteQuiz, getQuizBankStatus, rebuildQuizBank, QuizListItem, QuizDetail, QuizQuestion, QuizBankStatus, runAllAgents, getAgentTasks, fetchNote, restructureTranscript } from '@/services/api';
 import { sanitizeHTML } from '@/lib/sanitize';
 import { layoutFromNoteParts } from '@/lib/noteLayout';
 import type { Notebook, Session } from '@/types';
@@ -20,7 +21,7 @@ import { useTranscript, StudentNote } from './useTranscript';
 import { usePPT } from './usePPT';
 import { useNotes } from './useNotes';
 import { useExport } from './useExport';
-import MindMapCanvas from './MindMapCanvas';
+import MindMapCanvas, { computeDefaultExpanded } from './MindMapCanvas';
 import type { ContentBlock } from '@/services/api';
 
 const TEXT_COLORS = [
@@ -80,11 +81,37 @@ export default function NoteDetail() {
   const [shareToken, setShareToken] = useState('');
   const [shareEnabled, setShareEnabled] = useState(false);
   const [shareLoading, setShareLoading] = useState(false);
+  const [shareExpiresAt, setShareExpiresAt] = useState<string | null>(null);
+  const [shareMaxViews, setShareMaxViews] = useState<number | null>(null);
+  const [shareViewCount, setShareViewCount] = useState(0);
+  const [shareExpiresIn, setShareExpiresIn] = useState<number | ''>('');
+  const [shareMaxViewsInput, setShareMaxViewsInput] = useState<number | ''>('');
   const [copySuccess, setCopySuccess] = useState(false);
   const [showLeftPanel, setShowLeftPanel] = useState(false); // tablet sidebar
   const [isUploadingAudio, setIsUploadingAudio] = useState(false);
   const [audioUploadStatus, setAudioUploadStatus] = useState<string | null>(null);
   const [audioUploadError, setAudioUploadError] = useState<string | null>(null);
+  const [aiCorrectionStatus, setAiCorrectionStatus] = useState<{ type: 'idle' | 'corrected' | 'local' | 'error'; message?: string }>({ type: 'idle' });
+
+  // Auto-generate study materials setting (default true)
+  const [autoGenerateStudyMaterials, setAutoGenerateStudyMaterials] = useState(() => {
+    try {
+      const raw = localStorage.getItem('nootbook_auto_generate_study_materials');
+      return raw === null ? true : JSON.parse(raw);
+    } catch {
+      return true;
+    }
+  });
+  useEffect(() => {
+    localStorage.setItem('nootbook_auto_generate_study_materials', JSON.stringify(autoGenerateStudyMaterials));
+  }, [autoGenerateStudyMaterials]);
+
+  // Auto-generate toast
+  const [autoGenerateToast, setAutoGenerateToast] = useState<string | null>(null);
+
+  // Restructure state
+  const [isRestructuring, setIsRestructuring] = useState(false);
+  const [showRawDebug, setShowRawDebug] = useState(false);
 
   // Vector index state
   const [vectorStatus, setVectorStatus] = useState<VectorIndexStatus | null>(null);
@@ -145,6 +172,18 @@ export default function NoteDetail() {
       const hasTranscript = loadedNote.transcript && Array.isArray(loadedNote.transcript) && loadedNote.transcript.length > 0;
       const parsed = notesHook.actions.parseNotesFromContent(loadedNote.content, hasTranscript);
       if (parsed.length > 0) notesHook.actions.setNotes(parsed);
+    }
+    // Set AI correction status from loaded note
+    if (loadedNote?.transcript && Array.isArray(loadedNote.transcript) && loadedNote.transcript.length > 0) {
+      const sorted = [...loadedNote.transcript].sort((a: any, b: any) => (a.chunk_index || 0) - (b.chunk_index || 0));
+      const lastEntry = sorted[sorted.length - 1];
+      if (lastEntry?.is_ai_corrected) {
+        setAiCorrectionStatus({ type: 'corrected' });
+      } else if (lastEntry?.correction_error) {
+        setAiCorrectionStatus({ type: 'error', message: lastEntry.correction_error });
+      } else if (lastEntry?.is_corrected === false) {
+        setAiCorrectionStatus({ type: 'local' });
+      }
     }
     if (loadedNote.ppt_images && loadedNote.ppt_images.length > 0) {
       const lastPpt = loadedNote.ppt_images[loadedNote.ppt_images.length - 1];
@@ -294,16 +333,29 @@ export default function NoteDetail() {
         setShareEnabled(true);
         setShareToken(status.share_token || '');
         setShareLink(`${window.location.origin}${status.share_url}`);
+        setShareExpiresAt(status.share_expires_at || null);
+        setShareMaxViews(status.share_max_views ?? null);
+        setShareViewCount(status.share_view_count || 0);
       } else {
-        const result = await enableShare(sessionId);
+        const expiresIn = typeof shareExpiresIn === 'number' && shareExpiresIn > 0 ? shareExpiresIn : undefined;
+        const maxViews = typeof shareMaxViewsInput === 'number' && shareMaxViewsInput > 0 ? shareMaxViewsInput : undefined;
+        const result = await enableShare(sessionId, expiresIn, maxViews);
         setShareEnabled(true);
         setShareToken(result.share_token);
         setShareLink(`${window.location.origin}${result.share_url}`);
+        setShareExpiresAt(result.share_expires_at || null);
+        setShareMaxViews(result.share_max_views ?? null);
+        setShareViewCount(0);
+        toast.success('分享已开启');
       }
     } catch (err: any) {
       setShareEnabled(false);
       setShareLink('');
       setShareToken('');
+      setShareExpiresAt(null);
+      setShareMaxViews(null);
+      setShareViewCount(0);
+      toast.error(err.message || '开启分享失败');
     } finally {
       setShareLoading(false);
     }
@@ -317,8 +369,13 @@ export default function NoteDetail() {
       setShareEnabled(false);
       setShareLink('');
       setShareToken('');
+      setShareExpiresAt(null);
+      setShareMaxViews(null);
+      setShareViewCount(0);
+      setShareExpiresIn('');
+      setShareMaxViewsInput('');
     } catch (err: any) {
-      alert(err.message || '关闭分享失败');
+      toast.error(err.message || "关闭分享失败");
     } finally {
       setShareLoading(false);
     }
@@ -360,15 +417,15 @@ export default function NoteDetail() {
 
   useEffect(() => {
     if (mindMapStatus?.status === 'ready' && mindMapStatus.mind_map?.nodes && expandedNodes.size === 0) {
-      setExpandedNodes(new Set(mindMapStatus.mind_map.nodes.map(n => n.id)));
+      setExpandedNodes(computeDefaultExpanded(mindMapStatus.mind_map.nodes));
     }
   }, [mindMapStatus?.status, mindMapStatus?.mind_map, expandedNodes.size]);
 
-  const handleGenerateMindMap = async () => {
+  const handleGenerateMindMap = async (force = false) => {
     if (!sessionId) return;
     setIsGeneratingMindMap(true);
     try {
-      const result = await generateSessionMindMap(sessionId);
+      const result = await generateSessionMindMap(sessionId, force);
       setMindMapStatus(result);
       // Expand all top-level nodes by default
       if (result.status === 'ready' && result.mind_map?.nodes) {
@@ -417,9 +474,33 @@ export default function NoteDetail() {
     });
   };
 
-  const handleMindMapSourceClick = (source: { source_type: string; page?: number | null; block_id?: string }) => {
+  const handleMindMapSourceClick = (source: { source_type: string; page?: number | null; block_id?: string; snippet?: string }) => {
     if (source.source_type === 'ppt' && source.page != null) {
       ppt.actions.setActiveSlideIndex(source.page - 1);
+      return;
+    }
+    if ((source.source_type === 'transcript' || source.source_type === 'note') && source.snippet) {
+      setShowMindMap(false);
+      setTimeout(() => {
+        const container = paragraphContainerRef.current;
+        if (!container) return;
+        const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
+        const lowerSnippet = source.snippet!.toLowerCase();
+        let node: Text | null;
+        while ((node = walker.nextNode() as Text | null)) {
+          if (node.textContent?.toLowerCase().includes(lowerSnippet)) {
+            const el = node.parentElement;
+            if (el) {
+              el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+              el.classList.add('bg-yellow-100', 'dark:bg-yellow-900/30', 'transition-colors');
+              setTimeout(() => {
+                el.classList.remove('bg-yellow-100', 'dark:bg-yellow-900/30', 'transition-colors');
+              }, 3000);
+            }
+            break;
+          }
+        }
+      }, 300);
     }
   };
 
@@ -561,12 +642,6 @@ export default function NoteDetail() {
     } catch { /* ignore */ }
   };
 
-  const handleQuizSourceClick = (source: { source_type: string; page?: number | null }) => {
-    if (source.source_type === 'ppt' && source.page != null) {
-      ppt.actions.setActiveSlideIndex(source.page - 1);
-    }
-  };
-
   const handleRebuildIndex = async () => {
     if (!sessionId) return;
     setIsRebuilding(true);
@@ -574,7 +649,7 @@ export default function NoteDetail() {
       const result = await rebuildSessionVectorIndex(sessionId);
       setVectorStatus({ session_id: sessionId, chunk_count: result.chunk_count, has_content: true, status: 'indexed' });
     } catch (err: any) {
-      alert(err.message || '建立索引失败');
+      toast.error(err.message || "建立索引失败");
     } finally {
       setIsRebuilding(false);
     }
@@ -620,6 +695,7 @@ export default function NoteDetail() {
     setIsUploadingAudio(true);
     setAudioUploadStatus('正在上传录音文件');
     setAudioUploadError(null);
+    setAiCorrectionStatus({ type: 'idle' });
 
     // Clear transcript before streaming new content
     transcript.actions.clearDerivedTranscriptViews();
@@ -638,6 +714,9 @@ export default function NoteDetail() {
         }
         if (meta?.correctionError) {
           setAudioUploadStatus(meta.correctionError);
+          setAiCorrectionStatus({ type: 'error', message: meta.correctionError });
+        } else if (meta?.isAiCorrected) {
+          setAiCorrectionStatus({ type: 'corrected' });
         }
       },
       onDone: async (note) => {
@@ -651,6 +730,14 @@ export default function NoteDetail() {
           const sorted = Array.isArray(note.transcript)
             ? [...note.transcript].sort((a: any, b: any) => (a.chunk_index || 0) - (b.chunk_index || 0))
             : [];
+          const lastEntry = sorted[sorted.length - 1];
+          if (lastEntry?.is_ai_corrected) {
+            setAiCorrectionStatus({ type: 'corrected' });
+          } else if (lastEntry?.correction_error) {
+            setAiCorrectionStatus({ type: 'error', message: lastEntry.correction_error });
+          } else {
+            setAiCorrectionStatus({ type: 'local' });
+          }
           const hasFinal = sorted.some((c: any) => c.correction_stage === 'final');
           const dbText = sorted
             .map((c: any) => c.display_text || c.text || c.raw_text || '')
@@ -674,6 +761,29 @@ export default function NoteDetail() {
               }
             } catch {}
           }
+
+          // Auto-trigger study-material agents if enabled and AI correction succeeded
+          if (
+            autoGenerateStudyMaterials &&
+            lastEntry?.correction_stage === 'final' &&
+            lastEntry?.is_ai_corrected
+          ) {
+            setAutoGenerateToast('正在自动生成导图和题库...');
+            runAllAgents(sessionId, ['summary', 'mindmap', 'quiz']).then(() => {
+              pollAgentsUntilDone(sessionId);
+            }).catch((err: any) => {
+              setAutoGenerateToast('自动启动学习资料生成失败，可手动重试');
+              setTimeout(() => setAutoGenerateToast(null), 4000);
+              console.warn('Auto-run agents failed:', err);
+            });
+          } else if (
+            autoGenerateStudyMaterials &&
+            lastEntry?.correction_stage === 'final' &&
+            !lastEntry?.is_ai_corrected
+          ) {
+            setAutoGenerateToast('AI 整理未完成，暂不自动生成学习资料');
+            setTimeout(() => setAutoGenerateToast(null), 4000);
+          }
         }
       },
       onError: (errMsg) => {
@@ -686,6 +796,122 @@ export default function NoteDetail() {
     });
 
     audioUploadAbortRef.current = abort;
+  };
+
+  const handleStopRecording = async () => {
+    await recording.actions.stopRecording(transcript.actions.receiveAiText);
+    // After recording stops and transcript is fetched, check auto-generate
+    if (!sessionId) return;
+    try {
+      const note = await fetchNote(sessionId);
+      if (!note?.transcript?.length) return;
+      const sorted = [...note.transcript].sort((a: any, b: any) => (a.chunk_index || 0) - (b.chunk_index || 0));
+      const lastEntry = sorted[sorted.length - 1];
+      if (
+        autoGenerateStudyMaterials &&
+        lastEntry?.correction_stage === 'final' &&
+        lastEntry?.is_ai_corrected
+      ) {
+        setAutoGenerateToast('正在自动生成导图和题库...');
+        try {
+          await runAllAgents(sessionId, ['summary', 'mindmap', 'quiz']);
+          pollAgentsUntilDone(sessionId);
+        } catch {
+          setAutoGenerateToast('自动启动学习资料生成失败，可手动重试');
+          setTimeout(() => setAutoGenerateToast(null), 4000);
+        }
+      } else if (
+        autoGenerateStudyMaterials &&
+        lastEntry?.correction_stage === 'final' &&
+        !lastEntry?.is_ai_corrected
+      ) {
+        setAutoGenerateToast('AI 整理未完成，暂不自动生成学习资料');
+        setTimeout(() => setAutoGenerateToast(null), 4000);
+      }
+    } catch {
+      // ignore fetch/agent errors on stop
+    }
+  };
+
+  const pollAgentsUntilDone = useCallback((sessionId: string) => {
+    const targetRoles = ['agent_summary', 'agent_mindmap', 'agent_quiz'];
+    let attempts = 0;
+    const maxAttempts = 60;
+
+    const tick = async () => {
+      attempts++;
+      try {
+        const status = await getAgentTasks(sessionId);
+        const agents = status.agents || [];
+        const relevant = agents.filter((a: any) => targetRoles.includes(a.task_type));
+        if (relevant.length === 0) {
+          // No tasks created yet, keep polling briefly
+          if (attempts < maxAttempts) {
+            setTimeout(tick, 2500);
+          } else {
+            setAutoGenerateToast(null);
+          }
+          return;
+        }
+        const allDone = relevant.every((a: any) => a.status === 'success' || a.status === 'error');
+        if (allDone) {
+          const anyError = relevant.some((a: any) => a.status === 'error');
+          if (anyError) {
+            setAutoGenerateToast('部分学习资料生成失败，可手动重试');
+          } else {
+            setAutoGenerateToast('导图和题库生成完成');
+          }
+          setTimeout(() => setAutoGenerateToast(null), 4000);
+          return;
+        }
+        if (attempts < maxAttempts) {
+          setTimeout(tick, 2500);
+        } else {
+          setAutoGenerateToast('学习资料生成时间较长，请稍后查看');
+          setTimeout(() => setAutoGenerateToast(null), 4000);
+        }
+      } catch {
+        if (attempts < maxAttempts) {
+          setTimeout(tick, 2500);
+        } else {
+          setAutoGenerateToast(null);
+        }
+      }
+    };
+
+    setTimeout(tick, 2500);
+  }, []);
+
+  const handleRestructure = async () => {
+    if (!sessionId) return;
+    setIsRestructuring(true);
+    try {
+      const note = await restructureTranscript(sessionId, true);
+      if (note?.transcript && note.transcript.length > 0) {
+        const sorted = [...note.transcript].sort((a: any, b: any) => (a.chunk_index || 0) - (b.chunk_index || 0));
+        const lastEntry = sorted[sorted.length - 1];
+        const dbText = sorted
+          .map((c: any) => c.display_text || c.text || '')
+          .filter(Boolean)
+          .join('\n\n')
+          .trim();
+        if (dbText) {
+          transcript.actions.receiveAiText(dbText, { force: true });
+        }
+        if (lastEntry?.is_ai_corrected) {
+          setAiCorrectionStatus({ type: 'corrected' });
+        } else if (lastEntry?.correction_error) {
+          setAiCorrectionStatus({ type: 'error', message: lastEntry.correction_error });
+        } else {
+          setAiCorrectionStatus({ type: 'local' });
+        }
+      }
+    } catch (err: any) {
+      console.error('Restructure failed:', err);
+      setAiCorrectionStatus({ type: 'error', message: err.message || '重新整理失败' });
+    } finally {
+      setIsRestructuring(false);
+    }
   };
 
   if (isLoading) {
@@ -822,7 +1048,7 @@ export default function NoteDetail() {
                 </button>
               ) : recording.state.isError ? (
                 <button onClick={() => {
-                  if (recording.state.isRecording) recording.actions.stopRecording(transcript.actions.receiveAiText);
+                  if (recording.state.isRecording) handleStopRecording();
                 }}
                   className="w-9 h-9 rounded-full bg-gradient-to-br from-red-500 to-red-600 text-white flex items-center justify-center shadow-lg hover:shadow-xl transition-all hover:scale-105 active:scale-95">
                   <AlertCircle className="w-4 h-4" />
@@ -872,7 +1098,7 @@ export default function NoteDetail() {
             )}
 
             {recording.state.isRecording && (
-              <button onClick={() => recording.actions.stopRecording(transcript.actions.receiveAiText)}
+              <button onClick={handleStopRecording}
                 className="flex items-center gap-1 px-3 py-2 text-sm font-medium rounded-md bg-red-100 dark:bg-red-900/30 text-red-600 dark:text-red-400 hover:bg-red-200 dark:hover:bg-red-900/50 transition-colors min-h-[44px]">
                 <MicOff className="w-3.5 h-3.5" />
                 停止
@@ -901,11 +1127,28 @@ export default function NoteDetail() {
         </div>
       </div>
 
+      {autoGenerateToast && (
+        <div className={`flex-shrink-0 mx-4 mt-3 px-3 py-2 border rounded-xl flex items-center gap-2 text-xs ${autoGenerateToast.includes('自动生成') && !autoGenerateToast.includes('失败') ? 'bg-emerald-50 text-emerald-700 border-emerald-200 dark:bg-emerald-900/20 dark:text-emerald-300 dark:border-emerald-800' : 'bg-amber-50 text-amber-700 border-amber-200 dark:bg-amber-900/20 dark:text-amber-300 dark:border-amber-800'}`}>
+          {autoGenerateToast === '正在自动生成导图和题库...' ? <Loader2 className="w-3.5 h-3.5 animate-spin flex-shrink-0" /> : <AlertCircle className="w-3.5 h-3.5 flex-shrink-0" />}
+          <span className="flex-1">{autoGenerateToast}</span>
+        </div>
+      )}
+
       <div className={`flex-shrink-0 mx-4 mt-3 px-3 py-2 border rounded-xl flex items-center gap-2 text-xs ${statusClass}`}>
         {(ppt.state.isUploadingPPT || isUploadingAudio || recording.state.isProcessing || transcript.state.isPptMatching || transcript.state.saveStatus === 'saving') && (
           <Loader2 className="w-3.5 h-3.5 animate-spin flex-shrink-0" />
         )}
         <span className="flex-1">{workflowStatus.text}</span>
+        <div className="flex items-center gap-1.5 ml-2" title="转写完成后自动生成学习资料">
+          <input
+            type="checkbox"
+            id="auto-generate"
+            checked={autoGenerateStudyMaterials}
+            onChange={(e) => setAutoGenerateStudyMaterials(e.target.checked)}
+            className="w-3.5 h-3.5 rounded border-slate-300 text-blue-600 focus:ring-blue-500 cursor-pointer"
+          />
+          <label htmlFor="auto-generate" className="cursor-pointer select-none text-[10px] opacity-80 hover:opacity-100">自动生成</label>
+        </div>
         {transcript.state.saveStatus === 'error' && (
           <button
             onClick={() => transcript.actions.saveContent(notesHook.state.notes, true)}
@@ -1066,8 +1309,38 @@ export default function NoteDetail() {
               <h2 className="text-sm font-semibold text-slate-600 dark:text-slate-300 flex items-center gap-2">
                 {recording.state.isRecording ? <span className="w-2 h-2 rounded-full bg-red-400 animate-pulse" /> : <span className="w-2 h-2 rounded-full bg-slate-400" />}
                 语音转文字 {recording.state.isRecording && <span className="text-xs font-normal text-slate-400">录制中</span>}
+                {aiCorrectionStatus.type === 'corrected' && (
+                  <span className="px-1.5 py-0.5 rounded text-[10px] font-medium bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400" title="DeepSeek AI 已纠正同音字、术语和格式">AI 已纠正</span>
+                )}
+                {aiCorrectionStatus.type === 'local' && (
+                  <span className="px-1.5 py-0.5 rounded text-[10px] font-medium bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400" title="未配置 DeepSeek API 或 AI 纠正被拦截，使用本地规则整理">本地整理</span>
+                )}
+                {aiCorrectionStatus.type === 'error' && (
+                  <span className="px-1.5 py-0.5 rounded text-[10px] font-medium bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400" title={aiCorrectionStatus.message}>AI 纠正失败</span>
+                )}
               </h2>
-              {transcript.state.lastSaveTime && <span className="text-xs text-slate-400">已保存 {new Date(transcript.state.lastSaveTime).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}</span>}
+              <div className="flex items-center gap-2">
+                {transcript.state.transcriptText && !recording.state.isRecording && (
+                  <button
+                    onClick={handleRestructure}
+                    disabled={isRestructuring}
+                    className="px-2 py-1 text-[10px] font-medium rounded bg-blue-50 text-blue-600 hover:bg-blue-100 dark:bg-blue-900/20 dark:text-blue-400 dark:hover:bg-blue-900/30 disabled:opacity-50 flex items-center gap-1 transition-colors"
+                    title="重新调用 DeepSeek 整理转写文本"
+                  >
+                    {isRestructuring ? <Loader2 className="w-3 h-3 animate-spin" /> : <RefreshCw className="w-3 h-3" />}
+                    重新 AI 整理
+                  </button>
+                )}
+                {transcript.state.transcriptText && (
+                  <button
+                    onClick={() => setShowRawDebug(v => !v)}
+                    className="px-2 py-1 text-[10px] font-medium rounded bg-slate-50 text-slate-500 hover:bg-slate-100 dark:bg-slate-800 dark:text-slate-400 dark:hover:bg-slate-700 transition-colors"
+                  >
+                    {showRawDebug ? '隐藏调试' : '调试'}
+                  </button>
+                )}
+                {transcript.state.lastSaveTime && <span className="text-xs text-slate-400">已保存 {new Date(transcript.state.lastSaveTime).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}</span>}
+              </div>
             </div>
 
             {recording.state.audioPlaybackUrl && !recording.state.isRecording && (
@@ -1528,6 +1801,39 @@ export default function NoteDetail() {
                 <p className="text-sm">转录内容将显示在这里</p>
               </div>
             )}
+
+            {/* Raw text debug view */}
+            {showRawDebug && transcript.state.loadedNote?.transcript && (
+              <div className="mx-4 mt-4 mb-4 p-3 bg-slate-50 dark:bg-slate-900/50 border border-slate-200 dark:border-slate-700 rounded-lg">
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider">调试 — raw_text（ASR 原始输出）</span>
+                  <button onClick={() => setShowRawDebug(false)} className="text-slate-400 hover:text-slate-600"><X className="w-3 h-3" /></button>
+                </div>
+                <div className="space-y-2">
+                  {(() => {
+                    const entries = transcript.state.loadedNote.transcript
+                      .filter((e: any) => e && typeof e === 'object')
+                      .sort((a: any, b: any) => (a.chunk_index || 0) - (b.chunk_index || 0));
+                    return entries.map((entry: any, idx: number) => (
+                      <div key={idx} className="space-y-1">
+                        <div className="text-[10px] text-slate-400 flex items-center gap-2">
+                          <span>chunk {entry.chunk_index ?? idx}</span>
+                          {entry.is_ai_corrected && <span className="text-green-500">AI corrected</span>}
+                          {entry.correction_error && <span className="text-red-400">{entry.correction_error}</span>}
+                          {entry.correction_stage && <span className="text-slate-300">{entry.correction_stage}</span>}
+                        </div>
+                        <pre className="text-[11px] text-slate-500 dark:text-slate-400 whitespace-pre-wrap break-words font-mono leading-relaxed bg-white dark:bg-slate-800 p-2 rounded border border-slate-100 dark:border-slate-700">{entry.raw_text || '(无 raw_text)'}</pre>
+                        {entry.corrected_text && (
+                          <div className="text-[11px] text-green-600 dark:text-green-400 font-mono leading-relaxed bg-green-50 dark:bg-green-900/10 p-2 rounded border border-green-100 dark:border-green-800/30">
+                            corrected: {entry.corrected_text}
+                          </div>
+                        )}
+                      </div>
+                    ));
+                  })()}
+                </div>
+              </div>
+            )}
           </div>
         </main>
       </div>
@@ -1553,9 +1859,9 @@ export default function NoteDetail() {
                   </button>
                 )}
                 {(mindMapStatus?.status === 'ready' || mindMapStatus?.status === 'stale') && (
-                  <button onClick={handleGenerateMindMap} disabled={isGeneratingMindMap} className="px-3 py-1.5 text-xs font-medium text-purple-600 bg-purple-50 dark:bg-purple-900/20 rounded-lg hover:bg-purple-100 dark:hover:bg-purple-900/30 disabled:opacity-50 flex items-center gap-1" title={mindMapStatus.status === 'stale' ? '重新生成' : '重新生成'}>
+                  <button onClick={() => handleGenerateMindMap(mindMapStatus.status === 'ready')} disabled={isGeneratingMindMap} className="px-3 py-1.5 text-xs font-medium text-purple-600 bg-purple-50 dark:bg-purple-900/20 rounded-lg hover:bg-purple-100 dark:hover:bg-purple-900/30 disabled:opacity-50 flex items-center gap-1" title="重新生成">
                     <RefreshCw className={`w-3.5 h-3.5 ${isGeneratingMindMap ? 'animate-spin' : ''}`} />
-                    {mindMapStatus.status === 'stale' ? '重新生成' : '重新生成'}
+                    重新生成
                   </button>
                 )}
                 {mindMapStatus?.status === 'ready' && (
@@ -1580,7 +1886,7 @@ export default function NoteDetail() {
                 <div className="flex flex-col items-center justify-center h-full text-slate-400 gap-4">
                   <BrainCircuit className="w-10 h-10 opacity-30" />
                   <p className="text-sm">{mindMapStatus.status === 'stale' ? '内容已变化，需要重新生成' : '尚未生成知识导图'}</p>
-                  <button onClick={handleGenerateMindMap} disabled={isGeneratingMindMap} className="px-4 py-2 text-sm font-medium text-white bg-purple-500 rounded-lg hover:bg-purple-600 disabled:opacity-50 flex items-center gap-2">
+                  <button onClick={() => handleGenerateMindMap()} disabled={isGeneratingMindMap} className="px-4 py-2 text-sm font-medium text-white bg-purple-500 rounded-lg hover:bg-purple-600 disabled:opacity-50 flex items-center gap-2">
                     {isGeneratingMindMap ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
                     {mindMapStatus.status === 'stale' ? '重新生成' : '生成导图'}
                   </button>
@@ -1589,7 +1895,7 @@ export default function NoteDetail() {
                 <div className="flex flex-col items-center justify-center h-full text-slate-400 gap-4">
                   <AlertCircle className="w-10 h-10 text-red-400 opacity-50" />
                   <p className="text-sm text-red-500">{mindMapStatus.error || '生成失败'}</p>
-                  <button onClick={handleGenerateMindMap} disabled={isGeneratingMindMap} className="px-4 py-2 text-sm font-medium text-white bg-purple-500 rounded-lg hover:bg-purple-600 disabled:opacity-50">重试</button>
+                  <button onClick={() => handleGenerateMindMap()} disabled={isGeneratingMindMap} className="px-4 py-2 text-sm font-medium text-white bg-purple-500 rounded-lg hover:bg-purple-600 disabled:opacity-50">重试</button>
                 </div>
               ) : isGeneratingMindMap || mindMapStatus?.status === 'generating' ? (
                 <div className="flex flex-col items-center justify-center h-full text-slate-400 gap-3">
@@ -1602,8 +1908,6 @@ export default function NoteDetail() {
               ) : mindMapStatus?.mind_map ? (
                 <MindMapCanvas
                   data={mindMapStatus.mind_map}
-                  expanded={expandedNodes}
-                  onToggle={toggleNodeExpand}
                   onSelect={setSelectedMindMapNode}
                   selectedNode={selectedMindMapNode}
                   onSourceClick={handleMindMapSourceClick}
@@ -1698,15 +2002,6 @@ export default function NoteDetail() {
                                 <div className="mt-2 ml-5 text-xs text-slate-500 dark:text-slate-400">
                                   <span className="font-medium">解析：</span>{q.explanation}
                                 </div>
-                              )}
-                              {q.source && (
-                                <button
-                                  onClick={() => handleQuizSourceClick(q.source!)}
-                                  className="mt-2 ml-5 text-[10px] text-blue-500 hover:text-blue-600 flex items-center gap-1"
-                                >
-                                  <span className="font-medium">{q.source.source_type === 'transcript' ? '转写' : q.source.source_type === 'ppt' ? `PPT第${q.source.page || '?'}页` : '笔记'}</span>
-                                  <span className="line-clamp-1">{q.source.snippet}</span>
-                                </button>
                               )}
                             </div>
                           );
@@ -1951,20 +2246,55 @@ export default function NoteDetail() {
                 <div className="flex items-center gap-2 mb-3">
                   <span className="w-2 h-2 rounded-full bg-green-400" />
                   <span className="text-xs text-green-600 dark:text-green-400">分享已开启</span>
+                  {shareExpiresAt && (
+                    <span className="text-xs text-amber-600 dark:text-amber-400 ml-2">
+                      有效期至 {new Date(shareExpiresAt).toLocaleString()}
+                    </span>
+                  )}
                 </div>
                 <div className="flex items-center gap-2 mb-4">
                   <input readOnly value={shareLink} className="flex-1 px-3 py-2 text-sm border border-slate-200 dark:border-slate-600 rounded-lg bg-slate-50 dark:bg-slate-900 text-slate-600 dark:text-slate-300" />
                   <button onClick={() => { navigator.clipboard.writeText(shareLink); setCopySuccess(true); setTimeout(() => setCopySuccess(false), 3000); }}
                     className="px-3 py-2 text-sm font-medium text-white bg-blue-500 rounded-lg hover:bg-blue-600 transition-colors">{copySuccess ? '已复制' : '复制'}</button>
                 </div>
+                {shareMaxViews !== null && (
+                  <p className="text-xs text-slate-500 dark:text-slate-400 mb-3">
+                    已访问 {shareViewCount} / {shareMaxViews} 次
+                  </p>
+                )}
                 <button onClick={handleDisableShare} className="w-full py-2 text-sm text-red-500 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-900/20 rounded-lg transition-colors">
                   关闭分享
                 </button>
               </>
             ) : (
-              <div className="text-center py-4">
-                <p className="text-sm text-slate-500 dark:text-slate-400 mb-4">开启分享失败，请重试</p>
-                <button onClick={handleShareSession} className="px-4 py-2 text-sm font-medium text-white bg-blue-500 rounded-lg hover:bg-blue-600 transition-colors">重试</button>
+              <div className="space-y-4">
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-xs text-slate-500 dark:text-slate-400 mb-1">有效期（小时）</label>
+                    <input
+                      type="number"
+                      min={1}
+                      placeholder="不限"
+                      value={shareExpiresIn}
+                      onChange={(e) => setShareExpiresIn(e.target.value === '' ? '' : Number(e.target.value))}
+                      className="w-full px-3 py-2 text-sm border border-slate-200 dark:border-slate-600 rounded-lg bg-slate-50 dark:bg-slate-700 text-slate-800 dark:text-slate-200 focus:outline-none focus:ring-2 focus:ring-blue-300"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs text-slate-500 dark:text-slate-400 mb-1">最大访问次数</label>
+                    <input
+                      type="number"
+                      min={1}
+                      placeholder="不限"
+                      value={shareMaxViewsInput}
+                      onChange={(e) => setShareMaxViewsInput(e.target.value === '' ? '' : Number(e.target.value))}
+                      className="w-full px-3 py-2 text-sm border border-slate-200 dark:border-slate-600 rounded-lg bg-slate-50 dark:bg-slate-700 text-slate-800 dark:text-slate-200 focus:outline-none focus:ring-2 focus:ring-blue-300"
+                    />
+                  </div>
+                </div>
+                <button onClick={handleShareSession} className="w-full py-2 text-sm font-medium text-white bg-blue-500 rounded-lg hover:bg-blue-600 transition-colors">
+                  开启分享
+                </button>
               </div>
             )}
           </div>

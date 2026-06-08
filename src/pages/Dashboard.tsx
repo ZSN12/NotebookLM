@@ -1,5 +1,6 @@
 import { useEffect, useState, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
+import { toast } from 'sonner';
 import { Plus, Search, Upload } from 'lucide-react';
 import { useStore } from '@/store/useStore';
 import { getProfile, getAvatarUrl } from '@/services/auth';
@@ -30,7 +31,7 @@ export default function Dashboard() {
     if (!file) return;
 
     if (!file.name.endsWith('.nootbook')) {
-      alert('请选择 .nootbook 文件');
+      toast.error('请选择 .nootbook 文件');
       return;
     }
 
@@ -39,11 +40,11 @@ export default function Dashboard() {
       const text = await file.text();
       const pkg = JSON.parse(text);
       await importNotebook(pkg);
-      alert('笔记本导入成功！');
+      toast.success('笔记本导入成功');
       loadNotebooks();
     } catch (err: any) {
       console.error('Import failed:', err);
-      alert(err.message || '导入失败，请检查文件格式');
+      toast.error(err.message || '导入失败，请检查文件格式');
     } finally {
       setIsImporting(false);
       if (importFileRef.current) importFileRef.current.value = '';

@@ -108,6 +108,9 @@ class SessionResponse(BaseModel):
     duration: Optional[str] = None
     status: str = "pending"
     share_enabled: bool = False
+    share_expires_at: Optional[datetime] = None
+    share_max_views: Optional[int] = None
+    share_view_count: int = 0
     created_at: datetime
 
     @field_validator("keywords", mode="before")
@@ -115,17 +118,48 @@ class SessionResponse(BaseModel):
     def ensure_keywords_list(cls, v):
         return v if v is not None else []
 
+# Layout Block Schema
+class LayoutBlock(BaseModel):
+    id: str
+    type: str
+    content: Optional[str] = None
+    src: Optional[str] = None
+    page: Optional[int] = None
+    title: Optional[str] = None
+
+    @field_validator("type")
+    @classmethod
+    def validate_type(cls, v: str) -> str:
+        if v not in ("transcript", "ppt", "note"):
+            raise ValueError("type must be one of: transcript, ppt, note")
+        return v
+
+    @field_validator("id")
+    @classmethod
+    def validate_id(cls, v: str) -> str:
+        if not v or len(v) > 128:
+            raise ValueError("id must be non-empty and <= 128 chars")
+        return v
+
+
 # Note Schemas
 class NoteCreate(BaseModel):
     content: Optional[str] = None
     transcript: Optional[list] = None
     ppt_images: Optional[list] = None
     vocabulary: Optional[list[dict]] = None
-    layout_blocks: Optional[list[dict]] = None
+    layout_blocks: Optional[list[LayoutBlock]] = None
 
 class NoteUpdate(BaseModel):
     content: Optional[str] = None
-    layout_blocks: Optional[list[dict]] = None
+    layout_blocks: Optional[list[LayoutBlock]] = None
+
+    @field_validator("layout_blocks")
+    @classmethod
+    def validate_layout_blocks_length(cls, v):
+        if v is not None and len(v) > 10000:
+            raise ValueError("layout_blocks cannot exceed 10000 items")
+        return v
 
 class NoteResponse(BaseModel):
     model_config = {"from_attributes": True}
@@ -135,7 +169,7 @@ class NoteResponse(BaseModel):
     transcript: Optional[list] = None
     ppt_images: Optional[list] = None
     vocabulary: Optional[list[dict]] = None
-    layout_blocks: Optional[list[dict]] = None
+    layout_blocks: Optional[list[LayoutBlock]] = None
     created_at: datetime
 
 # File Schemas

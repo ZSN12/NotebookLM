@@ -1,3 +1,4 @@
+import { toast } from "sonner";
 import { useState } from 'react';
 import { exportNotebook, getMediaUrl } from '@/services/api';
 import type { NoteLayoutBlock } from '@/lib/noteLayout';
@@ -169,7 +170,7 @@ export function useExport(session: Session | undefined | null, notebook: Noteboo
       setTimeout(() => URL.revokeObjectURL(url), 2000);
     } catch (err: any) {
       console.error('Notebook package export failed:', err);
-      alert(err.message || '导出失败');
+      toast.error(err.message || "导出失败");
     } finally {
       setIsExportingPackage(false);
       setShowExportMenu(false);

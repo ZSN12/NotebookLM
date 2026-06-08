@@ -7,7 +7,6 @@ Two-layer structure:
 Stores results in Note.vocabulary with kind="quiz_bank" and kind="quiz".
 """
 
-import json
 import logging
 import random
 import threading
@@ -16,31 +15,62 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
-from openai import OpenAI
-
-from app.config import DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL
+from app.agents import AgentContext, get_agent
+from app.agents.normalizers import normalize_quiz_data
+from app.config import DEEPSEEK_API_KEY
+from openai import OpenAI  # noqa: F401  kept for test compatibility
 from app.models import Note, Session, Notebook, User, Task
 from sqlalchemy.orm import Session as DBSessionType
 from app.core.database import SessionLocal
-from app.services.prompt_loader import load_prompt
+from app.core.task_runner import run_agent_task
 from app.services.vector_service import _compute_session_content_hash
 
 
 logger = logging.getLogger(__name__)
 
-TASK_TYPE = "quiz_bank_generate"
+TASK_TYPE = "agent_quiz"
 ACTIVE_TASK_STATUSES = {"pending", "running"}
 QUESTIONS_PER_QUIZ = 10
+
+# Per-(session_id, task_type) lock to prevent races when checking for active
+# tasks and creating new ones.
+_START_LOCKS: dict[str, threading.Lock] = {}
+_START_LOCKS_GUARD = threading.Lock()
+
+
+def _get_start_lock(session_id: str, task_type: str) -> threading.Lock:
+    key = f"{session_id}:{task_type}"
+    lock = _START_LOCKS.get(key)
+    if lock is None:
+        with _START_LOCKS_GUARD:
+            lock = _START_LOCKS.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                _START_LOCKS[key] = lock
+    return lock
 
 
 # ── Vocabulary helpers: quiz_bank ──
 
 def _get_quiz_bank_from_vocabulary(note: Note) -> Optional[dict]:
-    """Read the quiz_bank entry from note.vocabulary."""
+    """Read the quiz_bank entry from note.vocabulary.
+
+    Normalizes the agent nested-data shape (data: {questions, title}) into the
+    legacy flat shape (questions, title at top level) so downstream code stays
+    unchanged.
+    """
     if not isinstance(note.vocabulary, list):
         return None
     for item in note.vocabulary:
         if isinstance(item, dict) and item.get("kind") == "quiz_bank":
+            if "data" in item and isinstance(item["data"], dict):
+                return {
+                    "kind": "quiz_bank",
+                    "content_hash": item.get("content_hash", ""),
+                    "generated_at": item.get("generated_at", ""),
+                    "questions": item["data"].get("questions", []),
+                    "title": item["data"].get("title", "本节课测验"),
+                }
             return item
     return None
 
@@ -173,105 +203,6 @@ def _get_session_for_user(session_id: str, user: User, db: DBSessionType) -> Ses
     ).join(Notebook).filter(Notebook.user_id == user.id).first()
 
 
-# ── Normalization / validation ──
-
-VALID_OPTION_IDS = {"A", "B", "C", "D"}
-VALID_SOURCE_TYPES = {"transcript", "note", "ppt"}
-
-
-def _normalize_option(option: dict) -> Optional[dict]:
-    if not isinstance(option, dict):
-        return None
-    opt_id = option.get("id")
-    text = option.get("text")
-    if not opt_id or not text:
-        return None
-    opt_id = str(opt_id).upper()
-    if opt_id not in VALID_OPTION_IDS:
-        return None
-    return {
-        "id": opt_id,
-        "text": str(text),
-        "explanation": str(option.get("explanation", "")),
-    }
-
-
-def _normalize_question(question: dict) -> Optional[dict]:
-    if not isinstance(question, dict):
-        return None
-    q_id = question.get("id")
-    q_text = question.get("question")
-    if not q_id or not q_text:
-        return None
-
-    raw_options = question.get("options", [])
-    if not isinstance(raw_options, list):
-        return None
-
-    options = []
-    for opt in raw_options:
-        normalized = _normalize_option(opt)
-        if normalized:
-            options.append(normalized)
-
-    if len(options) != 4:
-        return None
-    option_ids = {o["id"] for o in options}
-    if option_ids != VALID_OPTION_IDS:
-        return None
-
-    answer = str(question.get("answer", "")).upper()
-    if answer not in option_ids:
-        return None
-
-    raw_source = question.get("source", {})
-    if not isinstance(raw_source, dict):
-        raw_source = {}
-    source_type = raw_source.get("source_type", "note")
-    if source_type not in VALID_SOURCE_TYPES:
-        source_type = "note"
-    page = raw_source.get("page")
-    if not isinstance(page, int):
-        page = None
-
-    return {
-        "id": str(q_id),
-        "question": str(q_text),
-        "options": options,
-        "answer": answer,
-        "explanation": str(question.get("explanation", "")),
-        "source": {
-            "source_type": source_type,
-            "snippet": str(raw_source.get("snippet", "")),
-            "page": page,
-        },
-    }
-
-
-def normalize_quiz_data(data: dict) -> dict:
-    """Normalize and validate the quiz bank data structure."""
-    if not isinstance(data, dict):
-        raise ValueError("AI 返回的 JSON 不是对象")
-
-    raw_questions = data.get("questions", [])
-    if not isinstance(raw_questions, list):
-        raise ValueError("AI 返回的 JSON 中 questions 不是列表")
-
-    questions = []
-    for q in raw_questions:
-        normalized = _normalize_question(q)
-        if normalized:
-            questions.append(normalized)
-
-    if not questions:
-        raise ValueError("AI 返回的 JSON 中没有有效的题目")
-
-    return {
-        "title": str(data.get("title", "本节课测验")),
-        "questions": questions,
-    }
-
-
 # ── Async task helpers ──
 
 def _get_latest_task(session_id: str, db: DBSessionType) -> Task | None:
@@ -299,10 +230,10 @@ def _task_payload(task: Task | None) -> dict:
     }
 
 
-# ── Core: generate question bank (synchronous, called from thread) ──
+# ── Core: generate question bank via QuizAgent ──
 
-def _generate_question_bank_sync(session_id: str, user: User, db: DBSessionType) -> dict:
-    """Call DeepSeek to generate a question bank. Returns normalized bank data."""
+def _generate_question_bank_sync(session_id: str, user: User, db: DBSessionType, task: Task | None = None) -> dict:
+    """Generate a question bank via the QuizAgent."""
     if not DEEPSEEK_API_KEY:
         raise ValueError("未配置 DEEPSEEK_API_KEY，无法生成测验")
 
@@ -314,56 +245,29 @@ def _generate_question_bank_sync(session_id: str, user: User, db: DBSessionType)
     if not note:
         raise ValueError("No note content found")
 
+    notebook = db.query(Notebook).filter(Notebook.id == session.notebook_id).first()
+    if not notebook:
+        raise ValueError("Notebook not found")
+
     content_text = _extract_content_for_prompt(note)
     if not content_text.strip():
         raise ValueError("No indexable content in note")
 
-    keywords = ", ".join(session.keywords) if session.keywords else "无"
-    prompt_template = load_prompt("quiz_bank")
-    prompt = prompt_template.render(
-        title=session.title or "未命名课次",
-        keywords=keywords,
-        content=content_text[:8000],
+    agent = get_agent("quiz")
+    ctx = AgentContext(
+        session_id=session_id,
+        user=user,
+        db=db,
+        note=note,
+        session=session,
+        notebook=notebook,
+        task=task,
     )
+    result = agent.run(ctx)
+    if not result.success:
+        raise ValueError(result.error_message or "题库生成失败")
 
-    client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
-    try:
-        response = client.chat.completions.create(
-            model=DEEPSEEK_MODEL,
-            messages=[
-                {"role": "system", "content": prompt_template.system},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.4,
-            max_tokens=8000,
-        )
-    except Exception as e:
-        error_msg = str(e)
-        if "timeout" in error_msg.lower() or "timed out" in error_msg.lower():
-            raise ValueError("题库生成失败: DeepSeek 请求超时，请稍后重试")
-        raise ValueError(f"题库生成失败: {error_msg}")
-
-    raw = response.choices[0].message.content.strip()
-
-    # Strip markdown code fences
-    if raw.startswith("```"):
-        lines = raw.split("\n")
-        lines = [l for l in lines if not l.startswith("```")]
-        raw = "\n".join(lines)
-
-    try:
-        bank_data = json.loads(raw)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"AI 返回的 JSON 格式无效: {e}")
-
-    bank_data = normalize_quiz_data(bank_data)
-
-    # Save bank to vocabulary
-    content_hash = _compute_session_content_hash(note)
-    _set_quiz_bank_in_vocabulary(note, bank_data, content_hash)
-    db.commit()
-
-    return bank_data
+    return result.data if result.data else {}
 
 
 # ── Async task runner ──
@@ -382,7 +286,7 @@ def _run_quiz_bank_task(task_id: str, session_id: str, user_id: str):
         task.error_message = None
         db.commit()
 
-        _generate_question_bank_sync(session_id, user, db)
+        _generate_question_bank_sync(session_id, user, db, task=task)
 
         task = db.query(Task).filter(Task.id == task_id).first()
         if task:
@@ -492,40 +396,42 @@ def start_bank_generation(session_id: str, user: User, db: DBSessionType, force:
     if not content_text.strip():
         raise ValueError("No indexable content in note")
 
-    # Always reuse active task if one exists
-    active_task = _get_active_task(session_id, db)
-    if active_task:
-        return {
-            "session_id": session_id,
-            "status": "generating",
-            "question_count": 0,
-            **_task_payload(active_task),
-        }
+    with _get_start_lock(session_id, TASK_TYPE):
+        # Re-check inside the lock to close the race window.
+        db.expire_all()
 
-    # If not forced and bank is ready, return it
-    if not force:
-        bank_status = get_bank_status(session_id, user, db)
-        if bank_status["status"] == "ready":
-            return bank_status
+        # Always reuse active task if one exists
+        active_task = _get_active_task(session_id, db)
+        if active_task:
+            return {
+                "session_id": session_id,
+                "status": "generating",
+                "question_count": 0,
+                **_task_payload(active_task),
+            }
 
-    # Create new task
-    task = Task(
-        session_id=session_id,
-        task_type=TASK_TYPE,
-        status="pending",
-        progress=0.0,
-        error_message=None,
-    )
-    db.add(task)
-    db.commit()
-    db.refresh(task)
+        # If not forced and bank is ready, return it
+        if not force:
+            bank_status = get_bank_status(session_id, user, db)
+            if bank_status["status"] == "ready":
+                return bank_status
 
-    thread = threading.Thread(
-        target=_run_quiz_bank_task,
-        args=(task.id, session_id, user.id),
+        # Create new task
+        task = Task(
+            session_id=session_id,
+            task_type=TASK_TYPE,
+            status="pending",
+            progress=0.0,
+            error_message=None,
+        )
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+
+    run_agent_task(
+        target=lambda: _run_quiz_bank_task(task.id, session_id, user.id),
         daemon=True,
     )
-    thread.start()
     logger.info(
         "quiz_bank_task_started task_id=%s session_id=%s user_id=%s",
         task.id, session_id, user.id,

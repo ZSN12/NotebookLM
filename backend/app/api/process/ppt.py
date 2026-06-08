@@ -103,42 +103,90 @@ def insert_ppt_into_transcript(
         return {"blocks": [{"type": "text", "content": transcript.strip()}]}
 
     # ── Build result blocks with sliding-window PPT matching ──
-    # Single-short-sentence matching (e.g. "图书馆中饰 / 设计模式的分析")
-    # often lacks enough signal to cross the alignment threshold. Using a
-    # 2–4 sentence sliding window gives the aligner richer context.
-    WINDOW_MIN = 2   # minimum sentences per match window
-    WINDOW_MAX = 4   # maximum sentences per match window
+    # Exclude the title/cover slide (page 1) from alignment — it has no
+    # meaningful content and tends to steal matches because its text is broad.
+    content_slides = [s for s in slides if s.get("page", 0) > 1]
+    if content_slides:
+        request_aligner.set_slides(content_slides)
+        # Re-map content-slide index → original slide list index
+        idx_map = {i: slides.index(s) for i, s in enumerate(content_slides)}
+    else:
+        content_slides = slides
+        idx_map = {i: i for i in range(len(slides))}
+
+    # Use a tight window (max 2 sentences) to avoid *lookahead pollution*:
+    # a long window that includes the next slide's keywords pulls the current
+    # sentence forward into the wrong slide.
+    WINDOW_MIN = 2
+    WINDOW_MAX = 2
+    THRESHOLD = 0.15
+    STICKY_MARGIN = 0.08
 
     blocks: list[dict] = []
     matched_pages: set[int] = set()
     seg_idx = 0
+    current_slide_idx: int | None = None
+
+    def _match_window(start: int, end: int, th: float) -> int | None:
+        text = "".join(sentences[start:end])
+        if not text.strip():
+            return None
+        return request_aligner.match(text, threshold=th)
 
     while seg_idx < len(sentences):
-        # Expand window until we have WINDOW_MAX sentences or reach end
         window_end = min(seg_idx + WINDOW_MAX, len(sentences))
-        window_text = "".join(sentences[seg_idx:window_end])
-
-        # Try matching the full window first
-        matched_idx = request_aligner.match(window_text, threshold=0.10)
+        matched_idx = _match_window(seg_idx, window_end, THRESHOLD)
 
         if matched_idx is None and window_end - seg_idx >= WINDOW_MIN:
-            # Also try a shorter window (min size) — long windows can dilute signal
             short_end = min(seg_idx + WINDOW_MIN, len(sentences))
-            short_text = "".join(sentences[seg_idx:short_end])
-            matched_idx = request_aligner.match(short_text, threshold=0.12)
+            matched_idx = _match_window(seg_idx, short_end, THRESHOLD)
 
-        if matched_idx is not None and matched_idx not in matched_pages:
-            matched_pages.add(matched_idx)
-            slide = slides[matched_idx]
-            if slide.get("image_path"):
-                blocks.append({
-                    "type": "image",
-                    "src": f"/api/media/slides/{session_id}/{slide['image_path']}",
-                    "page": slide["page"],
-                    "title": slide.get("title", ""),
-                })
+        # ── Sequential constraint + opening guard ──
+        if matched_idx is not None:
+            matched_page = content_slides[matched_idx]["page"]
 
-        # Push the matched sentences as text; merge with previous text block
+            if current_slide_idx is None:
+                # Opening phase: don't jump to a late slide (summary etc.)
+                # The first real content is usually page 2 or 3.
+                if matched_page > 3:
+                    matched_idx = None
+            else:
+                current_page = content_slides[current_slide_idx]["page"]
+                # No back-jumps — once we passed slide N, we don't return
+                if matched_page < current_page:
+                    matched_idx = current_slide_idx
+
+        # ── Sticky logic ──
+        if (
+            matched_idx is not None
+            and current_slide_idx is not None
+            and matched_idx != current_slide_idx
+        ):
+            window_text = "".join(sentences[seg_idx:window_end])
+            best_score = request_aligner.get_slide_score(window_text, matched_idx)
+            current_score = request_aligner.get_slide_score(
+                window_text, current_slide_idx
+            )
+            if current_score >= THRESHOLD and (
+                current_score + STICKY_MARGIN
+            ) >= best_score:
+                matched_idx = current_slide_idx
+
+        if matched_idx is not None:
+            current_slide_idx = matched_idx
+            orig_idx = idx_map[matched_idx]
+            slide = slides[orig_idx]
+            page_num = slide["page"]
+            if page_num not in matched_pages:
+                matched_pages.add(page_num)
+                if slide.get("image_path"):
+                    blocks.append({
+                        "type": "image",
+                        "src": f"/api/media/slides/{session_id}/{slide['image_path']}",
+                        "page": page_num,
+                        "title": slide.get("title", ""),
+                    })
+
         first_sentence = sentences[seg_idx]
         if first_sentence:
             if blocks and blocks[-1]["type"] == "text":
@@ -147,6 +195,19 @@ def insert_ppt_into_transcript(
                 blocks.append({"type": "text", "content": first_sentence})
 
         seg_idx += 1
+
+    # ── Post-process: merge consecutive image blocks of the same slide ──
+    # (shouldn't happen with matched_pages set, but kept for safety)
+    deduped: list[dict] = []
+    last_img_page: int | None = None
+    for b in blocks:
+        if b["type"] == "image":
+            if b["page"] != last_img_page:
+                deduped.append(b)
+                last_img_page = b["page"]
+        else:
+            deduped.append(b)
+    blocks = deduped
 
     return {"blocks": blocks}
 

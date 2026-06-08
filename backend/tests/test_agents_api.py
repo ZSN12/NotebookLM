@@ -1,0 +1,322 @@
+"""Tests for the multi-agent pipeline endpoints.
+
+Covers:
+- Parallel agent vocabulary race-condition safety
+- Stale detection on single-agent endpoint
+- Active task reuse
+- Truncation (finish_reason=length) detection
+- Single-agent endpoint returns 200 (not 202)
+"""
+
+import json
+import os
+import sys
+import tempfile
+import time
+from pathlib import Path
+from unittest.mock import patch, MagicMock
+
+BACKEND_DIR = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(BACKEND_DIR))
+
+TEST_DB = Path(tempfile.gettempdir()) / "nootbook_test_agents_api.db"
+for suffix in ("", "-shm", "-wal"):
+    try:
+        (Path(f"{TEST_DB}{suffix}")).unlink()
+    except FileNotFoundError:
+        pass
+
+os.environ["SECRET_KEY"] = "test-agents-api-secret-key-at-least-32-bytes!!"
+os.environ["ADMIN_DEFAULT_EMAIL"] = "admin"
+os.environ["ADMIN_DEFAULT_PASSWORD"] = "admin123"
+os.environ["DATABASE_URL"] = f"sqlite:///{TEST_DB.as_posix()}"
+os.environ["SKIP_ASR_PRELOAD"] = "1"
+os.environ["DEEPSEEK_API_KEY"] = "test-key-for-agents"
+
+from fastapi.testclient import TestClient
+from app.main import app
+from app.core.database import SessionLocal
+from app.models import User
+from app.core.auth import hash_password
+
+
+def auth_headers(client: TestClient) -> dict[str, str]:
+    resp = client.post(
+        "/api/auth/login",
+        json={"email": "admin", "password": "admin123"},
+    )
+    assert resp.status_code == 200, resp.text
+    return {
+        "Authorization": f"Bearer {resp.json()['access_token']}",
+        "Origin": "http://localhost:5173",
+    }
+
+
+def _create_notebook_session_note(client: TestClient, headers: dict, content: str = ""):
+    """Create notebook + session + note with content."""
+    nb = client.post("/api/notebooks", json={"title": "Agent Test NB"}, headers=headers)
+    assert nb.status_code == 201
+    notebook_id = nb.json()["id"]
+
+    sess = client.post(
+        f"/api/sessions?notebook_id={notebook_id}",
+        json={"title": "Agent Test Session", "summary": "Testing agents", "keywords": ["test"]},
+        headers=headers,
+    )
+    assert sess.status_code == 201
+    session_id = sess.json()["id"]
+
+    client.put(
+        f"/api/notes/session/{session_id}",
+        json={
+            "content": content,
+            "layout_blocks": [{"id": "t1", "type": "transcript", "content": content}],
+        },
+        headers=headers,
+    )
+
+    return notebook_id, session_id
+
+
+def _wait_for_agent_status(
+    client: TestClient,
+    session_id: str,
+    headers: dict,
+    role: str,
+    expected: set[str],
+    timeout: float = 5.0,
+):
+    deadline = time.time() + timeout
+    last = None
+    while time.time() < deadline:
+        resp = client.get(f"/api/agents/session/{session_id}/tasks", headers=headers)
+        assert resp.status_code == 200, resp.text
+        agents = resp.json().get("agents", [])
+        for a in agents:
+            if a.get("task_type") == f"agent_{role}":
+                last = a
+                if a["status"] in expected:
+                    return a
+        time.sleep(0.05)
+    raise AssertionError(f"Timed out waiting for {expected}, last={last}")
+
+
+MOCK_SUMMARY = {"summary": "这是一节关于测试的课程。"}
+MOCK_MINDMAP = {
+    "title": "测试导图",
+    "summary": "测试摘要",
+    "nodes": [
+        {
+            "id": "n1",
+            "title": "根节点",
+            "type": "topic",
+            "importance": "high",
+            "description": "这是一个测试节点的描述，长度超过50字以确保通过验证。",
+            "sources": [{"source_type": "transcript", "snippet": "测试片段", "page": None}],
+            "children": []
+        }
+    ],
+    "relations": [],
+}
+MOCK_QUIZ = {
+    "title": "测试题库",
+    "questions": [
+        {
+            "id": "q1",
+            "question": "测试题1",
+            "options": [
+                {"id": "A", "text": "选项A"},
+                {"id": "B", "text": "选项B"},
+                {"id": "C", "text": "选项C"},
+                {"id": "D", "text": "选项D"},
+            ],
+            "answer": "A",
+            "explanation": "因为A正确",
+        }
+    ],
+}
+
+
+def _mock_response_for_agent(role: str):
+    """Return a mock response object for the given agent role."""
+    response = MagicMock()
+    response.choices = [MagicMock()]
+    response.choices[0].finish_reason = "stop"
+
+    if role == "summary":
+        response.choices[0].message.content = json.dumps(MOCK_SUMMARY)
+    elif role == "mindmap":
+        response.choices[0].message.content = json.dumps(MOCK_MINDMAP)
+    elif role == "quiz":
+        response.choices[0].message.content = json.dumps(MOCK_QUIZ)
+    else:
+        response.choices[0].message.content = "{}"
+
+    return response
+
+
+# ── Tests ──
+
+@patch("app.agents.base.OpenAI")
+def test_single_agent_returns_200_and_ready(mock_openai_cls):
+    """Single agent run should return 200 with data, not 202."""
+    mock_client = MagicMock()
+    mock_openai_cls.return_value = mock_client
+    mock_client.chat.completions.create.return_value = _mock_response_for_agent("summary")
+
+    with TestClient(app) as client:
+        headers = auth_headers(client)
+        _, session_id = _create_notebook_session_note(client, headers, content="测试内容")
+
+        resp = client.post(f"/api/agents/session/{session_id}/run/summary", headers=headers)
+        assert resp.status_code == 200, f"Expected 200, got {resp.status_code}: {resp.text}"
+        data = resp.json()
+        assert data["status"] == "success"
+        assert data["data"] is not None
+
+
+@patch("app.agents.base.OpenAI")
+def test_single_agent_reuses_active_task(mock_openai_cls):
+    """When an active task exists, the endpoint should reuse it."""
+    mock_client = MagicMock()
+    mock_openai_cls.return_value = mock_client
+    mock_client.chat.completions.create.return_value = _mock_response_for_agent("summary")
+
+    with TestClient(app) as client:
+        headers = auth_headers(client)
+        _, session_id = _create_notebook_session_note(client, headers, content="测试内容")
+
+        # Manually create an active (running) task in the DB.
+        from app.core.database import SessionLocal
+        from app.models import Task
+
+        db = SessionLocal()
+        try:
+            active_task = Task(
+                session_id=session_id,
+                task_type="agent_summary",
+                status="running",
+                progress=0.5,
+                error_message=None,
+            )
+            db.add(active_task)
+            db.commit()
+            db.refresh(active_task)
+            task_id = active_task.id
+        finally:
+            db.close()
+
+        # Call endpoint without force — should reuse the active task.
+        resp = client.post(
+            f"/api/agents/session/{session_id}/run/summary", headers=headers
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["status"] == "generating"
+        assert data["task_id"] == task_id
+        # Should NOT have called the LLM.
+        assert mock_client.chat.completions.create.call_count == 0
+
+
+@patch("app.agents.base.OpenAI")
+def test_single_agent_stale_after_content_change(mock_openai_cls):
+    """After content changes, existing agent output should be considered stale."""
+    mock_client = MagicMock()
+    mock_openai_cls.return_value = mock_client
+    mock_client.chat.completions.create.return_value = _mock_response_for_agent("summary")
+
+    with TestClient(app) as client:
+        headers = auth_headers(client)
+        _, session_id = _create_notebook_session_note(
+            client, headers, content="原始内容"
+        )
+
+        # First run
+        resp = client.post(f"/api/agents/session/{session_id}/run/summary", headers=headers)
+        assert resp.status_code == 200
+
+        # Change content
+        client.put(
+            f"/api/notes/session/{session_id}",
+            json={
+                "content": "完全不同的新内容",
+                "layout_blocks": [{"id": "t1", "type": "transcript", "content": "完全不同的新内容"}],
+            },
+            headers=headers,
+        )
+
+        # Second run (not forced) should regenerate because stale.
+        resp2 = client.post(f"/api/agents/session/{session_id}/run/summary", headers=headers)
+        assert resp2.status_code == 200
+        # Should have triggered a new run, not returned "ready".
+        assert resp2.json()["status"] in ("success", "generating")
+
+        # Wait for completion
+        task = _wait_for_agent_status(client, session_id, headers, "summary", {"success"})
+        # Should have generated twice.
+        assert mock_client.chat.completions.create.call_count == 2
+
+
+@patch("app.agents.base.OpenAI")
+def test_truncate_finish_reason_raises_error(mock_openai_cls):
+    """If DeepSeek returns finish_reason='length', the agent should fail."""
+    mock_client = MagicMock()
+    mock_openai_cls.return_value = mock_client
+    mock_response = MagicMock()
+    mock_response.choices = [MagicMock()]
+    mock_response.choices[0].finish_reason = "length"
+    mock_response.choices[0].message.content = '{"summary": "truncated...'
+    mock_client.chat.completions.create.return_value = mock_response
+
+    with TestClient(app) as client:
+        headers = auth_headers(client)
+        _, session_id = _create_notebook_session_note(client, headers, content="测试内容")
+
+        resp = client.post(f"/api/agents/session/{session_id}/run/summary", headers=headers)
+        assert resp.status_code == 502
+        assert "截断" in resp.json()["detail"] or "length" in resp.json()["detail"]
+
+
+# The vocabulary race-condition is tested directly in
+# test_agents_vocabulary_race.py by exercising BaseAgent.save_to_vocabulary()
+# from two concurrent threads. This avoids encoding issues when mocking LLM
+# responses for the full orchestration path.
+
+
+@patch("app.agents.base.OpenAI")
+def test_run_all_agents_reuses_active_tasks(mock_openai_cls):
+    """run_all_agents should reuse active tasks instead of spawning duplicates."""
+    mock_client = MagicMock()
+    mock_openai_cls.return_value = mock_client
+
+    def slow_response(*args, **kwargs):
+        time.sleep(0.5)
+        return _mock_response_for_agent("summary")
+
+    mock_client.chat.completions.create.side_effect = slow_response
+
+    with TestClient(app) as client:
+        headers = auth_headers(client)
+        _, session_id = _create_notebook_session_note(client, headers, content="测试")
+
+        # Start via run_all (async, returns 202 immediately)
+        first = client.post(
+            f"/api/agents/session/{session_id}/run",
+            json={"roles": ["summary"]},
+            headers=headers,
+        )
+        assert first.status_code == 202
+        first_task_id = first.json()["agents"][0]["task_id"]
+
+        # While still running, call run_all again — should reuse.
+        second = client.post(
+            f"/api/agents/session/{session_id}/run",
+            json={"roles": ["summary"]},
+            headers=headers,
+        )
+        assert second.status_code == 200
+        assert second.json().get("reused") is True
+        assert second.json()["agents"][0]["task_id"] == first_task_id
+
+        _wait_for_agent_status(client, session_id, headers, "summary", {"success"})
+        assert mock_client.chat.completions.create.call_count == 1

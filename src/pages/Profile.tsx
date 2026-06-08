@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import { useNavigate } from "react-router-dom";
+import { toast } from "sonner";
 import { getProfile, updateProfile, changePassword, uploadAvatar, getAvatarUrl, logout } from "@/services/auth";
 import { getToken } from "@/services/auth";
 import { User, Lock, Upload, LogOut, ArrowLeft, CheckCircle2, AlertCircle, Camera } from "lucide-react";
@@ -70,7 +71,7 @@ export default function Profile() {
       const url = await uploadAvatar(file);
       setProfile((p: any) => ({ ...p, avatar_url: url }));
     } catch (e: any) {
-      alert(e.message);
+      toast.error(e.message);
     } finally { setAvatarUploading(false); }
   };
 
