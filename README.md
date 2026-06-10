@@ -1,4 +1,4 @@
-# Nootbook
+# Notero
 
 面向中文课堂的开源 NotebookLM：把课堂录音、PPT、随堂笔记整理成可搜索、可追溯、可复习的 AI 学习工作台。
 
