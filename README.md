@@ -198,6 +198,3 @@ Each developer should configure their own PostgreSQL database, AI API keys, and 
 - 错题间隔重复复习
 - 更完善的模型 provider 切换
 
-## License
-
-License has not been selected yet. If you plan to accept external contributions, add a license such as MIT, Apache-2.0, or AGPL-3.0 before publishing broadly.
