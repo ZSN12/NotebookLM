@@ -1,14 +1,28 @@
+import re
 import shutil
 import uuid
 import os
 from pathlib import Path
 from app.config import AUDIO_DIR, PPT_DIR, IMAGE_DIR, MAX_AUDIO_SIZE, MAX_PPT_SIZE
 
+# Allowed UUID pattern for session_id validation
+_RE_SAFE_ID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+
+def _validate_session_id(session_id: str) -> str:
+    """Validate session_id is a safe UUID string."""
+    sid = str(session_id)
+    if not _RE_SAFE_ID.match(sid):
+        raise ValueError(f"Invalid session_id format: {sid}")
+    return sid
+
+
 def _safe_upload_name(file_name: str) -> str:
     """Return a filesystem-safe basename for an uploaded file."""
     original = Path(file_name or "upload").name
     safe_name = "".join(ch if ch.isalnum() or ch in "._- " else "_" for ch in original).strip()
     return safe_name or "upload"
+
 
 def get_upload_path(file_type: str, session_id: str, file_name: str) -> Path:
     """Get the absolute upload path for a file."""
@@ -17,17 +31,21 @@ def get_upload_path(file_type: str, session_id: str, file_name: str) -> Path:
     if directory is None:
         raise ValueError(f"Invalid file type: {file_type}")
 
-    target = (directory / f"{session_id}_{uuid.uuid4().hex}_{safe_name}").resolve()
+    sid = _validate_session_id(session_id)
+    target = (directory / f"{sid}_{uuid.uuid4().hex}_{safe_name}").resolve()
     base = directory.resolve()
     if not target.is_relative_to(base):
         raise ValueError("Invalid upload path")
     return target
 
+
 def get_image_dir(session_id: str) -> Path:
     """Get the image output directory for a session."""
-    dir_path = IMAGE_DIR / str(session_id)
+    sid = _validate_session_id(session_id)
+    dir_path = IMAGE_DIR / sid
     dir_path.mkdir(parents=True, exist_ok=True)
     return dir_path
+
 
 def save_file(file_type: str, session_id: str, file_name: str, file_content: bytes) -> Path:
     """Save uploaded file and return its path."""
@@ -43,33 +61,46 @@ def save_file(file_type: str, session_id: str, file_name: str, file_content: byt
         f.write(file_content)
     return file_path
 
+
 def delete_file(file_path: Path) -> None:
-    """Delete a file if it exists."""
-    if file_path and file_path.exists():
-        file_path.unlink()
+    """Delete a file if it exists and is within an allowed directory."""
+    if not file_path:
+        return
+    resolved = file_path.resolve()
+    allowed_bases = [AUDIO_DIR.resolve(), PPT_DIR.resolve(), IMAGE_DIR.resolve()]
+    if not any(resolved.is_relative_to(base) for base in allowed_bases):
+        raise ValueError("Attempted to delete file outside allowed directories")
+    if resolved.exists():
+        resolved.unlink()
+
 
 def delete_session_files(session_id: str, delete_audio: bool = False) -> None:
     """Delete all files associated with a session."""
-    sid = str(session_id)
+    sid = _validate_session_id(session_id)
 
     # Delete audio (only if requested - audio is kept by default)
     if delete_audio:
-        for f in AUDIO_DIR.glob(f"{sid}_*"):
-            f.unlink(missing_ok=True)
+        prefix = f"{sid}_"
+        for f in AUDIO_DIR.iterdir():
+            if f.is_file() and f.name.startswith(prefix):
+                f.unlink(missing_ok=True)
 
     # Delete PPT (always deleted)
-    for f in PPT_DIR.glob(f"{sid}_*"):
-        f.unlink(missing_ok=True)
+    prefix = f"{sid}_"
+    for f in PPT_DIR.iterdir():
+        if f.is_file() and f.name.startswith(prefix):
+            f.unlink(missing_ok=True)
 
     # Delete images
     image_dir = IMAGE_DIR / sid
     if image_dir.exists():
         shutil.rmtree(image_dir)
 
+
 def delete_notebook_files(notebook_id: str, db) -> None:
     """Delete all files for all sessions in a notebook."""
-    from app.models import Session, File
+    from app.models import Session
 
-    sessions = db.query(Session).filter(Session.notebook_id == notebook_id).all()
+    sessions = db.query(Session).filter(Session.notebook_id == notebook_id).yield_per(50)
     for session in sessions:
         delete_session_files(session.id, delete_audio=True)

@@ -2,13 +2,20 @@ import os
 from pathlib import Path
 from dotenv import load_dotenv
 
-# Load .env file
-load_dotenv(Path(__file__).resolve().parent.parent / ".env")
-
 BASE_DIR = Path(__file__).resolve().parent.parent
+ROOT_DIR = BASE_DIR.parent
+
+# Load repo-level .env first; keep backend/.env as a local override option.
+load_dotenv(ROOT_DIR / ".env")
+load_dotenv(BASE_DIR / ".env", override=True)
 
 # Database
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./nootbook.db")
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError(
+        "DATABASE_URL is required. Nootbook now expects PostgreSQL, for example "
+        "postgresql://postgres:postgres@localhost:5432/nootbook"
+    )
 
 # File Storage
 UPLOAD_DIR = BASE_DIR / "uploads"

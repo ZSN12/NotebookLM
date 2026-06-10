@@ -1,13 +1,13 @@
 import { useState, useEffect, useRef } from "react";
 import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
-import { getProfile, updateProfile, changePassword, uploadAvatar, getAvatarUrl, logout } from "@/services/auth";
+import { getProfile, updateProfile, changePassword, uploadAvatar, getAvatarUrl, logout, type UserProfile } from "@/services/auth";
 import { getToken } from "@/services/auth";
 import { User, Lock, Upload, LogOut, ArrowLeft, CheckCircle2, AlertCircle, Camera } from "lucide-react";
 
 export default function Profile() {
   const navigate = useNavigate();
-  const [profile, setProfile] = useState<any>(null);
+  const [profile, setProfile] = useState<UserProfile | null>(null);
   const [loading, setLoading] = useState(true);
 
   const [username, setUsername] = useState("");
@@ -46,8 +46,8 @@ export default function Profile() {
       const updated = await updateProfile(username);
       setProfile(updated);
       setUsernameMsg({ type: "success", text: "用户名已更新" });
-    } catch (e: any) {
-      setUsernameMsg({ type: "error", text: e.message });
+    } catch (e: unknown) {
+      setUsernameMsg({ type: "error", text: e instanceof Error ? e.message : '更新失败' });
     } finally { setSaving(false); }
   };
 
@@ -60,8 +60,8 @@ export default function Profile() {
       await changePassword(oldPwd, newPwd);
       setPwdMsg({ type: "success", text: "密码修改成功" });
       setOldPwd(""); setNewPwd(""); setConfirmPwd("");
-    } catch (e: any) {
-      setPwdMsg({ type: "error", text: e.message });
+    } catch (e: unknown) {
+      setPwdMsg({ type: "error", text: e instanceof Error ? e.message : '修改失败' });
     } finally { setPwdSaving(false); }
   };
 
@@ -69,9 +69,9 @@ export default function Profile() {
     setAvatarUploading(true);
     try {
       const url = await uploadAvatar(file);
-      setProfile((p: any) => ({ ...p, avatar_url: url }));
-    } catch (e: any) {
-      toast.error(e.message);
+      setProfile((p) => (p ? { ...p, avatar_url: url } : null));
+    } catch (e: unknown) {
+      toast.error(e instanceof Error ? e.message : '上传失败');
     } finally { setAvatarUploading(false); }
   };
 

@@ -189,7 +189,7 @@ export function useRecording(sessionId: string | undefined) {
     setIsPaused(false);
   }, [_startTimerOnly]);
 
-  const stopRecording = useCallback(async (onTranscriptUpdate: (text: string) => void) => {
+  const stopRecording = useCallback(async (onTranscriptUpdate: (text: string) => void): Promise<{ note?: any } | undefined> => {
     // 1. Cleanup audio
     if (streamRef.current) { streamRef.current.getTracks().forEach((track) => track.stop()); streamRef.current = null; }
     if (audioContextRef.current) { await audioContextRef.current.close(); audioContextRef.current = null; }
@@ -213,26 +213,30 @@ export function useRecording(sessionId: string | undefined) {
         await updateSessionDuration(sessionId, Date.now() - startTimeRef.current - pausedDurationRef.current);
       }
 
-      // 4. Fetch updated note and apply final transcript
+      // 4. Call audio-finish (runs finalization on backend) and apply result
+      let finalNote: any = undefined;
       if (sessionId) {
-        const note = await fetchNote(sessionId);
-        if (note?.transcript && note.transcript.length > 0) {
-          const sorted = [...note.transcript].sort(
+        const finishResult = await finishRecording(sessionId);
+        finalNote = finishResult.note;
+        if (finalNote?.transcript && finalNote.transcript.length > 0) {
+          const sorted = [...finalNote.transcript].sort(
             (a: any, b: any) => (a.chunk_index || 0) - (b.chunk_index || 0)
           );
           const hasFinalTranscript = sorted.some((c: any) => c.correction_stage === 'final');
-          if (!hasFinalTranscript) return;
-          const dbText = sorted
-            .map((c: any) => c.display_text || c.text || c.raw_text || '')
-            .filter(Boolean)
-            .join('\n\n')
-            .trim();
-          if (dbText && dbText.length > 0) {
-            onTranscriptUpdate(dbText);
+          if (hasFinalTranscript) {
+            const dbText = sorted
+              .map((c: any) => c.display_text || c.corrected_text || c.text || c.raw_text || '')
+              .filter(Boolean)
+              .join('\n\n')
+              .trim();
+            if (dbText && dbText.length > 0) {
+              onTranscriptUpdate(dbText);
+            }
           }
         }
         setAudioPlaybackUrl(getAudioUrl(sessionId));
       }
+      return { note: finalNote };
     } catch (error: any) {
       console.error('Failed to finish recording:', error);
       setIsError(true);

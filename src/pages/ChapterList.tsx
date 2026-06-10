@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { ArrowLeft, Plus, Search, Share2, Download } from 'lucide-react';
 import { useStore } from '@/store/useStore';
-import { getProfile, getAvatarUrl } from '@/services/auth';
+import { getProfile, getAvatarUrl, type UserProfile } from '@/services/auth';
 import SessionCard from '@/components/SessionCard';
 import CreateDialog from '@/components/CreateDialog';
 import ThemeToggle from '@/components/ThemeToggle';
@@ -13,7 +13,7 @@ export default function ChapterList() {
   const { notebooks, sessions, loading, error, openDialog, loadSessions } = useStore();
   const [searchQuery, setSearchQuery] = useState('');
   const [copyFeedback, setCopyFeedback] = useState('');
-  const [profile, setProfile] = useState<any>(null);
+  const [profile, setProfile] = useState<UserProfile | null>(null);
 
   const notebook = notebooks.find((n) => n.id === id);
   const notebookSessions = sessions.filter((s) => s.notebookId === id);

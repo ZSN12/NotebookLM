@@ -8,6 +8,8 @@ class UserCreate(BaseModel):
     username: str
     email: str
     password: str
+    security_question: Optional[str] = None
+    security_answer: Optional[str] = None
 
     @field_validator("username")
     @classmethod
@@ -28,6 +30,20 @@ class UserCreate(BaseModel):
     def password_length(cls, v: str) -> str:
         if len(v) < 8:
             raise ValueError("Password must be at least 8 characters")
+        return v
+
+    @field_validator("security_question")
+    @classmethod
+    def security_question_length(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and len(v) > 500:
+            raise ValueError("Security question must be <= 500 characters")
+        return v
+
+    @field_validator("security_answer")
+    @classmethod
+    def security_answer_length(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and len(v) > 500:
+            raise ValueError("Security answer must be <= 500 characters")
         return v
 
 class UserLogin(BaseModel):
@@ -229,7 +245,15 @@ class TokenRefreshResponse(BaseModel):
 
 class PasswordReset(BaseModel):
     email: str
+    security_answer: str
     new_password: str
+
+    @field_validator("security_answer")
+    @classmethod
+    def security_answer_required(cls, v: str) -> str:
+        if not v or len(v.strip()) == 0:
+            raise ValueError("Security answer is required")
+        return v.strip()
 
     @field_validator("new_password")
     @classmethod

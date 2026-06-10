@@ -40,7 +40,7 @@ def upgrade() -> None:
     sa.Column('color', sa.String(length=50), nullable=True),
     sa.Column('session_count', sa.Integer(), nullable=True),
     sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('(CURRENT_TIMESTAMP)'), nullable=True),
-    sa.ForeignKeyConstraint(['user_id'], ['users.id'], ),
+    sa.ForeignKeyConstraint(['user_id'], ['users.id'], ondelete='CASCADE'),
     sa.PrimaryKeyConstraint('id')
     )
     op.create_table('sessions',
@@ -54,7 +54,7 @@ def upgrade() -> None:
     sa.Column('share_enabled', sa.Boolean(), nullable=True),
     sa.Column('share_token', sa.String(length=64), nullable=True),
     sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('(CURRENT_TIMESTAMP)'), nullable=True),
-    sa.ForeignKeyConstraint(['notebook_id'], ['notebooks.id'], ),
+    sa.ForeignKeyConstraint(['notebook_id'], ['notebooks.id'], ondelete='CASCADE'),
     sa.PrimaryKeyConstraint('id')
     )
     op.create_table('vocabulary',
@@ -65,7 +65,7 @@ def upgrade() -> None:
     sa.Column('definition', sa.Text(), nullable=True),
     sa.Column('source', sa.String(length=50), nullable=True),
     sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('(CURRENT_TIMESTAMP)'), nullable=True),
-    sa.ForeignKeyConstraint(['notebook_id'], ['notebooks.id'], ),
+    sa.ForeignKeyConstraint(['notebook_id'], ['notebooks.id'], ondelete='CASCADE'),
     sa.PrimaryKeyConstraint('id')
     )
     op.create_table('files',
@@ -76,7 +76,7 @@ def upgrade() -> None:
     sa.Column('file_path', sa.Text(), nullable=False),
     sa.Column('file_size', sa.Integer(), nullable=True),
     sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('(CURRENT_TIMESTAMP)'), nullable=True),
-    sa.ForeignKeyConstraint(['session_id'], ['sessions.id'], ),
+    sa.ForeignKeyConstraint(['session_id'], ['sessions.id'], ondelete='CASCADE'),
     sa.PrimaryKeyConstraint('id')
     )
     op.create_table('notes',
@@ -87,7 +87,7 @@ def upgrade() -> None:
     sa.Column('ppt_images', sa.JSON(), nullable=True),
     sa.Column('vocabulary', sa.JSON(), nullable=True),
     sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('(CURRENT_TIMESTAMP)'), nullable=True),
-    sa.ForeignKeyConstraint(['session_id'], ['sessions.id'], ),
+    sa.ForeignKeyConstraint(['session_id'], ['sessions.id'], ondelete='CASCADE'),
     sa.PrimaryKeyConstraint('id')
     )
     op.create_table('tasks',
@@ -98,7 +98,7 @@ def upgrade() -> None:
     sa.Column('progress', sa.Float(), nullable=True),
     sa.Column('error_message', sa.Text(), nullable=True),
     sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('(CURRENT_TIMESTAMP)'), nullable=True),
-    sa.ForeignKeyConstraint(['session_id'], ['sessions.id'], ),
+    sa.ForeignKeyConstraint(['session_id'], ['sessions.id'], ondelete='CASCADE'),
     sa.PrimaryKeyConstraint('id')
     )
     op.create_table('vector_chunks',
@@ -114,9 +114,9 @@ def upgrade() -> None:
     sa.Column('embedding', sa.LargeBinary(), nullable=True),
     sa.Column('content_hash', sa.String(length=64), nullable=True),
     sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('(CURRENT_TIMESTAMP)'), nullable=True),
-    sa.ForeignKeyConstraint(['notebook_id'], ['notebooks.id'], ),
-    sa.ForeignKeyConstraint(['session_id'], ['sessions.id'], ),
-    sa.ForeignKeyConstraint(['user_id'], ['users.id'], ),
+    sa.ForeignKeyConstraint(['notebook_id'], ['notebooks.id'], ondelete='CASCADE'),
+    sa.ForeignKeyConstraint(['session_id'], ['sessions.id'], ondelete='CASCADE'),
+    sa.ForeignKeyConstraint(['user_id'], ['users.id'], ondelete='CASCADE'),
     sa.PrimaryKeyConstraint('id')
     )
     op.create_index(op.f('ix_vector_chunks_notebook_id'), 'vector_chunks', ['notebook_id'], unique=False)

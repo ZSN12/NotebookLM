@@ -23,6 +23,12 @@ from app.core.database import SessionLocal, get_db
 from app.core.task_runner import run_agent_task
 from app.models import Notebook, Note, Session as DBSession, Task, User
 from app.services.vector_service import _compute_session_content_hash
+from app.services.state_service import (
+    set_running as set_state_running,
+    set_ready as set_state_ready,
+    set_error as set_state_error,
+    get_session_processing_status,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -84,20 +90,17 @@ def _notebook_for_note(note: Note, db: Session) -> Notebook | None:
     return None
 
 
-def _should_auto_trigger_agents(note: Note) -> bool:
-    """Return True when the note has a final AI-corrected transcript.
+def _should_auto_trigger_agents(db: Session, session_id: str) -> bool:
+    """Return True when transcript is finalized and vector index is ready.
 
-    This guards against triggering agents on raw / locally-cleaned transcripts
-    or on transcripts whose DeepSeek restructure failed.
+    DeepSeek fallback (transcript_finalize.fallback) does NOT auto-trigger
+    mindmap/quiz generation — only vector index is built automatically.
     """
-    if not note or not note.transcript:
-        return False
-    if not isinstance(note.transcript, list) or not note.transcript:
-        return False
-    last = note.transcript[-1]
-    if not isinstance(last, dict):
-        return False
-    return last.get("correction_stage") == "final" and bool(last.get("is_ai_corrected"))
+    status = get_session_processing_status(db, session_id)
+    stages = status.get("stages", {})
+    vector_ok = stages.get("vector_index", {}).get("status") == "ready"
+    transcript_ok = stages.get("transcript_finalize", {}).get("status") == "ready"
+    return vector_ok and transcript_ok
 
 
 def auto_run_agents(
@@ -140,9 +143,9 @@ def auto_run_agents(
             )
             return None
 
-        if not _should_auto_trigger_agents(note):
+        if not _should_auto_trigger_agents(db, session_id):
             logger.info(
-                "auto_run_agents_skipped session_id=%s reason=not_final_or_not_ai_corrected",
+                "auto_run_agents_skipped session_id=%s reason=vector_or_transcript_not_ready",
                 session_id,
             )
             return None
@@ -312,6 +315,10 @@ def _maybe_return_ready_or_stale(
     }
 
 
+def _role_to_stage(role: str) -> str:
+    return "quiz_bank" if role == "quiz" else role
+
+
 def _run_single_agent_sync(
     session_id: str,
     role: str,
@@ -351,6 +358,7 @@ def _run_single_agent_sync(
 
     agent = get_agent(role)
     task_type = f"agent_{role}"
+    stage = _role_to_stage(role)
 
     ready = _maybe_return_ready_or_stale(
         session_id, role, agent, note, db, user, notebook, force
@@ -370,6 +378,8 @@ def _run_single_agent_sync(
     db.commit()
     db.refresh(task)
 
+    set_state_running(db, session_id, stage, progress=0.1, commit=False)
+
     ctx = AgentContext(
         session_id=session_id,
         user=user,
@@ -385,12 +395,16 @@ def _run_single_agent_sync(
         result = agent.run(ctx)
         task = db.query(Task).filter(Task.id == task.id).first()
         if not task:
+            set_state_error(db, session_id, stage, error_message="Task lost", commit=False)
+            db.commit()
             return {"session_id": session_id, "role": role, "status": "error", "error": "Task lost"}
 
         if result.success:
             task.status = "success"
             task.progress = 1.0
             task.error_message = None
+            current_hash = _compute_session_content_hash(note)
+            set_state_ready(db, session_id, stage, content_hash=current_hash, commit=False)
             db.commit()
             return {
                 "session_id": session_id,
@@ -403,6 +417,7 @@ def _run_single_agent_sync(
         task.status = "error"
         task.progress = 1.0
         task.error_message = result.error_message or "未知错误"
+        set_state_error(db, session_id, stage, error_message=result.error_message or "未知错误", commit=False)
         db.commit()
         raise ValueError(task.error_message)
     except Exception as e:
@@ -413,6 +428,8 @@ def _run_single_agent_sync(
             task.progress = 1.0
             task.error_message = str(e)
             db.commit()
+        set_state_error(db, session_id, stage, error_message=str(e), commit=False)
+        db.commit()
         logger.exception("single_agent_run_failed session_id=%s role=%s", session_id, role)
         raise ValueError(str(e))
 
@@ -425,6 +442,7 @@ def _run_agent_thread(
 ) -> None:
     """Thread worker: owns a fresh DB session and runs one agent to completion."""
     db = SessionLocal()
+    stage = _role_to_stage(role)
     try:
         task = db.query(Task).filter(Task.id == task_id).first()
         user = db.query(User).filter(User.id == user_id).first()
@@ -435,6 +453,9 @@ def _run_agent_thread(
         task.status = "running"
         task.progress = 0.1
         task.error_message = None
+        db.commit()
+
+        set_state_running(db, session_id, stage, progress=0.1, commit=False)
         db.commit()
 
         session = (
@@ -469,12 +490,16 @@ def _run_agent_thread(
 
         task = db.query(Task).filter(Task.id == task_id).first()
         if not task:
+            set_state_error(db, session_id, stage, error_message="Task lost", commit=False)
+            db.commit()
             return
 
         if result.success:
             task.status = "success"
             task.progress = 1.0
             task.error_message = None
+            current_hash = _compute_session_content_hash(note)
+            set_state_ready(db, session_id, stage, content_hash=current_hash, commit=False)
             db.commit()
             logger.info(
                 "agent_task_success session_id=%s role=%s task_id=%s",
@@ -484,6 +509,7 @@ def _run_agent_thread(
             task.status = "error"
             task.progress = 1.0
             task.error_message = result.error_message or "未知错误"
+            set_state_error(db, session_id, stage, error_message=result.error_message or "未知错误", commit=False)
             db.commit()
             logger.warning(
                 "agent_task_error session_id=%s role=%s task_id=%s error=%s",
@@ -497,6 +523,8 @@ def _run_agent_thread(
             task.progress = 1.0
             task.error_message = str(e)
             db.commit()
+        set_state_error(db, session_id, stage, error_message=str(e), commit=False)
+        db.commit()
         logger.exception(
             "agent_thread_failed session_id=%s role=%s task_id=%s",
             session_id, role, task_id,

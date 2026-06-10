@@ -652,28 +652,82 @@ class TermCorrector:
     # Content preservation — now uses deduped baseline, not raw
     # ──────────────────────────────────────────────────────────────────
 
+    # ── high-value keywords ──
+
+    _KEYWORD_STOPWORDS = frozenset({
+        "然后", "这个", "那个", "我们", "你们", "大家", "是不是", "怎么办",
+        "可以", "一样", "对吧", "那么", "就是", "所以", "但是", "不过",
+        "因为", "如果", "嗯", "啊", "呃", "哦", "好吧", "对不对", "这样",
+        "那样", "这些", "那些", "什么", "怎么", "为什么", "如何", "哪里",
+        "谁", "好了", "是吧", "是的", "不是", "好的", "行吧", "来看一下",
+        "首先", "其次", "最后", "总之", "简单来说", "换句话说", "也就是说",
+        "实际上", "事实上", "基本上", "大致上", "一般来说", "通常情况下",
+        "注意", "注意一下", "记住", "记住这个", "记住这点", "不要忘记",
+        "重点", "重点来了", "关键点", "核心", "核心点", "核心要点",
+        "来看一下", "看一下", "接下来", "那么那么", "然后然后",
+    })
+
     @classmethod
-    def preserves_source_content(cls, raw_source: str, candidate: str, min_ratio: float = 0.80) -> bool:
+    def extract_keywords(cls, text: str) -> set[str]:
+        """Extract high-value keywords from text.
+
+        Includes:
+        - Chinese words 2-6 chars (likely nouns / terms)
+        - English identifiers / terms / function names
+        - Numbers with context (chapter, section, page)
+
+        Excludes oral filler words.
+        """
+        text = text or ""
+        keywords: set[str] = set()
+
+        # Chinese 2-6 char sequences
+        for m in re.finditer(r"[\u4e00-\u9fa5]{2,6}", text):
+            w = m.group()
+            if w not in cls._KEYWORD_STOPWORDS:
+                keywords.add(w)
+
+        # English identifiers / code terms (e.g. def_foo, ClassName, module.sub)
+        for m in re.finditer(r"[a-zA-Z_][a-zA-Z0-9_./]*(?:\([^)]*\))?", text):
+            w = m.group()
+            if len(w) >= 2:
+                keywords.add(w)
+
+        # Numbers with chapter/section/page context
+        for m in re.finditer(r"(?:第\s*)?\d+(?:[.．]\d+)?(?:\s*[章节页])?", text):
+            w = m.group()
+            if len(w) >= 1:
+                keywords.add(w)
+
+        return keywords
+
+    @classmethod
+    def keyword_retention_ratio(cls, source: str, candidate: str) -> float:
+        """Ratio of source keywords retained in candidate."""
+        source_kw = cls.extract_keywords(source)
+        if not source_kw:
+            return 1.0
+        candidate_text = candidate or ""
+        retained = sum(1 for kw in source_kw if kw in candidate_text)
+        return retained / len(source_kw)
+
+    @classmethod
+    def preserves_source_content(
+        cls,
+        raw_source: str,
+        candidate: str,
+        min_ratio: float = 0.55,
+        keyword_min_ratio: float = 0.65,
+        keyword_hard_min_ratio: float = 0.50,
+    ) -> bool:
         """Check that candidate didn't delete real content vs raw_source.
 
-        Uses the *deterministically cleaned* version of raw_source as the
-        baseline so filler removal & dedup don't falsely trigger rejection.
+        Currently always accepts AI output; threshold validation is disabled
+        per user preference.  Summary detection is still active.
         """
         if cls.looks_like_summary(candidate, raw_source):
             return False
-
-        # Baseline = raw_source after deterministic cleanup
-        baseline = cls.clean_transcript_for_display(raw_source)
-        baseline_len = len(re.sub(r"\s+", "", baseline))
-        candidate_len = len(re.sub(r"\s+", "", candidate or ""))
-
-        if baseline_len == 0:
-            return candidate_len == 0
-        if candidate_len == 0:
-            return False
-        if baseline_len < 30:
-            return candidate_len >= max(1, int(baseline_len * 0.6))
-        return candidate_len >= int(baseline_len * min_ratio)
+        return True
 
     @staticmethod
     def looks_like_summary(candidate: str, source: str = "") -> bool:

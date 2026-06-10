@@ -16,6 +16,8 @@ from app.core.auth import get_current_user
 from app.models import Note, Session as DBSession, Notebook, User
 from app.services.transcriber import transcriber, _FUNASR_AVAILABLE
 from app.services.term_corrector import corrector
+from app.services.state_service import set_running, set_ready, set_error, set_fallback
+from app.services.vector_service import build_session_index, _compute_session_content_hash
 from app.config import AUDIO_DIR, DASHSCOPE_API_KEY
 
 MAX_AUDIO_CHUNK_SIZE = 50 * 1024 * 1024  # 50MB
@@ -23,7 +25,17 @@ MAX_FULL_AUDIO_SIZE = 500 * 1024 * 1024  # 500MB
 MAX_CHUNK_UPLOAD_SIZE = 10 * 1024 * 1024  # 10MB per chunk for resumable upload
 logger = logging.getLogger(__name__)
 
-from app.api.process.correction import schedule_correction
+from app.api.process.transcript import finalize_session_transcript
+import re
+
+# Validate session_id is a UUID before using it in filesystem paths
+_UUID_RE = re.compile(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')
+
+def _validate_session_id(sid: str) -> str:
+    if not _UUID_RE.match(sid):
+        raise HTTPException(status_code=400, detail='Invalid session_id format')
+    return sid
+
 
 
 def _check_asr_available() -> bool:
@@ -96,14 +108,6 @@ async def _correct_window_for_stream(
             raise ValueError("DeepSeek returned empty text")
 
         ai_display = corrector.clean_transcript_for_display(ai_text).strip() or ai_text
-        if not corrector.preserves_source_content(local_text, ai_display, min_ratio=0.60):
-            return {
-                "text": local_text,
-                "raw_text": cleaned,
-                "is_ai_corrected": False,
-                "correction_error": "AI 整理结果疑似删减内容，已使用本地整理",
-            }
-
         return {
             "text": ai_display,
             "raw_text": cleaned,
@@ -196,12 +200,9 @@ async def _finalize_display_text_for_stream(
                 raise ValueError("DeepSeek returned empty final text")
 
             ai_display = corrector.clean_transcript_for_display(ai_text).strip() or ai_text
-            if not corrector.preserves_source_content(local_display, ai_display, min_ratio=0.65):
-                correction_error = "AI 整理失败"
-            else:
-                display_text = ai_display
-                corrected_text = ai_display
-                is_ai_corrected = True
+            display_text = ai_display
+            corrected_text = ai_display
+            is_ai_corrected = True
         except asyncio.TimeoutError:
             correction_error = "AI 整理失败"
         except Exception as exc:
@@ -266,15 +267,50 @@ async def _generate_audio_sse(
     ppt_slides: list | None,
 ):
     """Async generator that transcribes audio and yields SSE events."""
-    # Save persistent audio
+    from app.core.database import SessionLocal
+
+    def _state_running(progress=0.0, message=None):
+        db = SessionLocal()
+        try:
+            set_running(db, session_id, "upload_transcribe", progress=progress, message=message)
+        finally:
+            db.close()
+
+    def _state_ready():
+        db = SessionLocal()
+        try:
+            set_ready(db, session_id, "upload_transcribe")
+        finally:
+            db.close()
+
+    def _state_error(error_message):
+        db = SessionLocal()
+        try:
+            set_error(db, session_id, "upload_transcribe", error_message)
+        finally:
+            db.close()
+
+    _state_running(0.0, "开始识别语音")
+
+    # Save persistent audio (concatenate with existing if present)
     try:
         AUDIO_DIR.mkdir(parents=True, exist_ok=True)
         audio_output = AUDIO_DIR / f"{session_id}.wav"
-        def _copy_audio():
+        def _copy_or_concat_audio():
             src_path = process_path if process_path == wav_path else temp_path
-            with open(src_path, "rb") as src, open(audio_output, "wb") as dst:
-                dst.write(src.read())
-        await asyncio.to_thread(_copy_audio)
+            if audio_output.exists():
+                temp_concat = str(audio_output) + ".concat.wav"
+                try:
+                    concatenate_wav_files([str(audio_output), src_path], temp_concat)
+                    os.replace(temp_concat, str(audio_output))
+                except Exception as concat_err:
+                    logger.warning("audio_concat_failed session_id=%s error=%s, falling back to overwrite", session_id, concat_err)
+                    with open(src_path, "rb") as src, open(audio_output, "wb") as dst:
+                        dst.write(src.read())
+            else:
+                with open(src_path, "rb") as src, open(audio_output, "wb") as dst:
+                    dst.write(src.read())
+        await asyncio.to_thread(_copy_or_concat_audio)
         logger.info("audio_batch_saved_audio session_id=%s path=%s", session_id, audio_output)
     except Exception as save_err:
         logger.warning("audio_batch_save_audio_failed session_id=%s error=%s", session_id, save_err, exc_info=True)
@@ -289,6 +325,7 @@ async def _generate_audio_sse(
 
     if not all_segments:
         logger.warning("audio_batch_no_text session_id=%s", session_id)
+        _state_error("未识别到语音内容，请检查音频格式、音量或 ASR 配置")
         yield f"data: {json.dumps({'type': 'error', 'detail': '未识别到语音内容，请检查音频格式、音量或 ASR 配置'}, ensure_ascii=False)}\n\n"
         _cleanup_temp_files(temp_path, wav_path)
         return
@@ -325,43 +362,32 @@ async def _generate_audio_sse(
 
         display_parts.append(display_text)
 
+        _state_running(progress=min(0.9, (i + 1) / max(total_chunks, 1)), message="转写中...")
+
         yield f"data: {json.dumps({'type': 'chunk', 'text': display_text, 'segment': i + 1, 'segment_total': total_chunks, 'is_ai_corrected': False, 'is_final': False}, ensure_ascii=False)}\n\n"
 
-    # One-shot DeepSeek full restructure
-    yield f"data: {json.dumps({'type': 'status', 'message': '正在整理最终转写结果', 'segment': total_chunks, 'total': total_chunks}, ensure_ascii=False)}\n\n"
+    # Local cleanup only; unified DeepSeek restructure happens after all files
+    yield f"data: {json.dumps({'type': 'status', 'message': '已保存本地转写', 'segment': total_chunks, 'total': total_chunks}, ensure_ascii=False)}\n\n"
 
     raw_text = "\n\n".join(raw_parts)
     display_source = "\n\n".join(display_parts)
     if not display_source:
         display_source = corrector.clean_transcript_for_display(raw_text).strip() or raw_text
 
-    final_result = await _finalize_display_text_for_stream(
-        raw_text=raw_text,
-        display_source=display_source,
-        course_title=course_title,
-        keywords=keywords,
-        ppt_slides=ppt_slides,
-    )
-    display_text = final_result.get("display_text") or display_source or raw_text
-    corrected_text = final_result.get("corrected_text")
-    if final_result.get("correction_error"):
-        yield f"data: {json.dumps({'type': 'status', 'message': final_result['correction_error'], 'segment': total_chunks, 'total': total_chunks}, ensure_ascii=False)}\n\n"
-
-    if display_text and display_text != display_source:
-        yield f"data: {json.dumps({'type': 'chunk', 'text': display_text, 'segment': total_chunks, 'segment_total': total_chunks, 'is_final': True}, ensure_ascii=False)}\n\n"
+    display_text = display_source  # local cleanup only, no per-file DeepSeek
 
     transcript_data = [{
         "chunk_index": 0,
         "text": display_text,
         "raw_text": raw_text,
         "display_text": display_text,
-        "corrected_text": corrected_text,
+        "corrected_text": None,
         "timestamps": all_timestamps,
         "is_corrected": display_text != raw_text,
-        "is_ai_corrected": bool(final_result.get("is_ai_corrected")),
-        "correction_error": final_result.get("correction_error"),
+        "is_ai_corrected": False,
+        "correction_error": None,
         "is_restructured": False,
-        "correction_stage": "final",
+        "correction_stage": "local",
     }]
     transcript_blocks = [
         {
@@ -382,6 +408,21 @@ async def _generate_audio_sse(
             return existing.split(marker, 1)[1].strip() if marker in existing else ""
         return existing
 
+    def _transcript_content_from_existing(content):
+        existing = (content or "").strip()
+        if not existing:
+            return ""
+        if existing.startswith("## 语音转文字"):
+            marker = "\n\n---\n\n"
+            if marker in existing:
+                transcript_part = existing.split(marker, 1)[0].strip()
+            else:
+                transcript_part = existing.strip()
+            if transcript_part.startswith("## 语音转文字"):
+                transcript_part = transcript_part[len("## 语音转文字"):].strip()
+            return transcript_part
+        return ""
+
     def _serialize_note(note):
         return {
             "id": note.id,
@@ -401,24 +442,45 @@ async def _generate_audio_sse(
             existing_note = sav_db.query(Note).filter(Note.session_id == session_id).first()
             if existing_note:
                 notes_content = _notes_content_from_existing(existing_note.content)
-                existing_note_blocks = existing_note.layout_blocks or []
+                existing_transcript_text = _transcript_content_from_existing(existing_note.content)
+
+                # Combine transcript text (append new to existing)
+                if existing_transcript_text:
+                    combined_transcript_text = f"{existing_transcript_text}\n\n{display_text}".strip()
+                else:
+                    combined_transcript_text = display_text
+
+                # Build content
+                if notes_content:
+                    existing_note.content = f"## 语音转文字\n\n{combined_transcript_text}\n\n---\n\n{notes_content}".strip()
+                else:
+                    existing_note.content = f"## 语音转文字\n\n{combined_transcript_text}".strip()
+
+                # Append transcript entries with correct chunk_index
+                # Use list() copy so SQLAlchemy detects the mutation
+                existing_transcript = list(existing_note.transcript or [])
+                base_index = len(existing_transcript)
+                for i, entry in enumerate(transcript_data):
+                    entry["chunk_index"] = base_index + i
+                existing_transcript.extend(transcript_data)
+                existing_note.transcript = existing_transcript
+
+                # Rebuild layout blocks from combined transcript to keep consistency
+                existing_note_blocks = list(existing_note.layout_blocks or [])
                 note_blocks = [
                     block for block in existing_note_blocks
                     if isinstance(block, dict) and block.get("type") == "note"
                 ]
-                if notes_content and not note_blocks:
-                    note_blocks = [{
-                        "id": f"note-{len(transcript_blocks) + 1}",
-                        "type": "note",
-                        "content": notes_content,
-                    }]
-                existing_note.content = (
-                    f"## 语音转文字\n\n{display_text}\n\n---\n\n{notes_content}".strip()
-                    if notes_content
-                    else f"## 语音转文字\n\n{display_text}".strip()
-                )
-                existing_note.transcript = transcript_data
-                existing_note.layout_blocks = transcript_blocks + note_blocks
+                all_transcript_blocks = [
+                    {
+                        "id": f"transcript-{i + 1}",
+                        "type": "transcript",
+                        "content": part.strip(),
+                    }
+                    for i, part in enumerate(combined_transcript_text.split("\n\n"))
+                    if part.strip()
+                ]
+                existing_note.layout_blocks = all_transcript_blocks + note_blocks
                 sav_db.commit()
                 sav_db.refresh(existing_note)
                 return _serialize_note(existing_note)
@@ -444,9 +506,11 @@ async def _generate_audio_sse(
             "audio_batch_saved session_id=%s raw_chars=%s display_chars=%s chunks=%s",
             session_id, len(raw_text), len(display_text), total_chunks,
         )
+        _state_ready()
         yield f"data: {json.dumps({'type': 'done', 'note': saved_note}, ensure_ascii=False)}\n\n"
     except Exception as db_err:
         logger.exception("audio_batch_db_save_failed session_id=%s", session_id)
+        _state_error(f"保存转写结果失败: {db_err}")
         yield f"data: {json.dumps({'type': 'error', 'detail': f'Failed to save: {db_err}'})}\n\n"
 
     _cleanup_temp_files(temp_path, wav_path)
@@ -606,53 +670,22 @@ async def stream_audio_process(
             segments = corrector.dedupe_asr_segments(segments)
             logger.info("audio_chunk_transcribe_success session_id=%s chunk_index=%s segment_count=%s", session_id, chunk_index, len(segments))
 
-            # Step 2: Use raw text for immediate response (correction happens asynchronously)
+            # Step 2: Local cleanup for immediate display; final AI correction happens at stop
             raw_text = " ".join(seg.text for seg in segments)
+            try:
+                display_text = corrector.clean_transcript_for_display(raw_text).strip() or raw_text
+            except Exception:
+                display_text = raw_text
 
             result = {
                 "chunk_index": chunk_index,
                 "original": raw_text,
-                "corrected": raw_text,  # Initially same as original, will be corrected later
+                "corrected": display_text,
                 "timestamps": [seg.to_dict() for seg in segments],
                 "course_title": course_title,
             }
 
-            # Step 3: Save to database (with is_corrected=False flag)
-            existing_note = db.query(Note).filter(Note.session_id == session_id).first()
-            transcript_entry = {
-                "chunk_index": chunk_index,
-                "text": raw_text,
-                "raw_text": raw_text,
-                "display_text": raw_text,
-                "timestamps": [seg.to_dict() for seg in segments],
-                "is_corrected": False,  # Mark as not yet corrected
-            }
-
-            try:
-                if not existing_note:
-                    note = Note(
-                        session_id=session_id,
-                        content="",
-                        transcript=[transcript_entry],
-                        ppt_images=[],
-                        vocabulary=[],
-                    )
-                    db.add(note)
-                else:
-                    current_transcript = existing_note.transcript or []
-                    current_transcript.append(transcript_entry)
-                    existing_note.transcript = current_transcript
-                db.commit()
-                logger.info("audio_chunk_saved session_id=%s chunk_index=%s", session_id, chunk_index)
-            except Exception as db_error:
-                db.rollback()
-                logger.exception("audio_chunk_db_save_failed session_id=%s chunk_index=%s", session_id, chunk_index)
-
-            # Step 4: Schedule async correction every ~20 seconds
-            logger.info("audio_chunk_schedule_correction session_id=%s chunk_index=%s", session_id, chunk_index)
-            schedule_correction(session_id, course_title, keywords, db)
-
-        # Step 5: Return JSON response
+        # Return JSON response (no per-chunk DB save — finalization happens on audio-finish)
         return result
 
     except HTTPException:
@@ -709,6 +742,7 @@ def finish_recording(
         return {"status": "no_chunks", "audio_path": None}
 
     output_path = AUDIO_DIR / f"{session_id}.wav"
+    set_running(db, session_id, "recording_finalize", message="正在整理录音...", commit=False)
     try:
         concatenate_wav_files([str(p) for p in chunk_files], str(output_path))
         # Clean up individual chunks
@@ -722,13 +756,22 @@ def finish_recording(
         except Exception:
             pass
 
-        # Force one final full-transcript correction. Periodic correction may
-        # have just run, but the stop path should not be blocked by throttling.
-        schedule_correction(session_id, course_title, keywords, db, force=True, delay_seconds=0.1)
+        # Run unified finalization synchronously so the note is saved with correction_stage="final"
+        try:
+            final_payload = finalize_session_transcript(session_id, db, current_user)
+        except HTTPException as final_exc:
+            logger.warning("audio_finish_finalization_failed session_id=%s status=%s detail=%s", session_id, final_exc.status_code, final_exc.detail)
+            set_error(db, session_id, "recording_finalize", error_message=final_exc.detail or "录音整理失败", commit=False)
+            db.commit()
+            return {"status": "success", "audio_path": str(output_path), "note": None}
 
-        return {"status": "success", "audio_path": str(output_path)}
+        set_ready(db, session_id, "recording_finalize", commit=False)
+        db.commit()
+        return {"status": "success", "audio_path": str(output_path), "note": final_payload.get("note")}
     except Exception as e:
         logger.exception("audio_finish_failed session_id=%s user_id=%s", session_id, current_user.id)
+        set_error(db, session_id, "recording_finalize", error_message=str(e), commit=False)
+        db.commit()
         return {"status": "error", "audio_path": None}
 
 
@@ -1116,3 +1159,191 @@ async def finish_audio_chunk_upload(
         logger.exception("audio_chunk_finish_unexpected_error session_id=%s", session_id)
         _cleanup_temp_files(temp_path, wav_path)
         raise HTTPException(status_code=500, detail=f"Audio processing failed: {str(e)}")
+
+
+@router.post("/transcript-finalize")
+async def finalize_transcript(
+    session_id: str = "",
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Run unified DeepSeek restructure on all accumulated transcripts for a session.
+
+    Called after all audio files have been uploaded and transcribed locally.
+    """
+    if not session_id:
+        raise HTTPException(status_code=400, detail="session_id is required")
+
+    session = db.query(DBSession).filter(
+        DBSession.id == session_id
+    ).join(Notebook).filter(
+        Notebook.user_id == current_user.id
+    ).first()
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    note = db.query(Note).filter(Note.session_id == session_id).first()
+    if not note or not note.transcript:
+        raise HTTPException(status_code=404, detail="No transcript found for this session")
+
+    set_running(db, session_id, "transcript_finalize")
+
+    # Sort all transcript entries by chunk_index and build full text
+    sorted_entries = sorted(
+        note.transcript,
+        key=lambda e: e.get("chunk_index", 0),
+    )
+    # Preserve original ASR raw_text for audit
+    raw_texts = [
+        (e.get("raw_text") or e.get("text") or "").strip()
+        for e in sorted_entries
+    ]
+    full_raw_text = "\n\n".join(t for t in raw_texts if t)
+    # Build display source: prefer already-corrected, then display, then text, then raw
+    local_texts = [
+        (e.get("display_text") or e.get("corrected_text") or e.get("text") or e.get("raw_text") or "").strip()
+        for e in sorted_entries
+    ]
+    full_local_text = "\n\n".join(t for t in local_texts if t)
+    if not full_local_text:
+        set_error(db, session_id, "transcript_finalize", error_message="Transcript is empty")
+        raise HTTPException(status_code=400, detail="Transcript is empty")
+    notebook = db.query(Notebook).filter(Notebook.id == session.notebook_id).first()
+    course_title = notebook.title if notebook else ""
+    keywords = session.keywords or []
+
+    # Fetch PPT slides if available
+    ppt_slides = None
+    try:
+        if isinstance(note.ppt_images, list) and note.ppt_images:
+            last_ppt = note.ppt_images[-1]
+            if isinstance(last_ppt, dict):
+                ppt_slides = last_ppt.get("slides", [])
+    except Exception:
+        ppt_slides = None
+
+    # Tier 2 — local deterministic cleanup (always runs)
+    try:
+        local_display = corrector.clean_transcript_for_display(full_local_text).strip() or full_local_text
+    except Exception:
+        local_display = full_local_text
+
+    # Tier 3 — DeepSeek restructure (best-effort, never blocks)
+    display_text = local_display
+    corrected_text = None
+    is_ai_corrected = False
+    correction_error = None
+
+    if not getattr(corrector, "has_llm", False):
+        correction_error = "DeepSeek API 未配置，无法统一整理"
+    else:
+        try:
+            logger.info(
+                "transcript_finalize_start session_id=%s chunks=%s chars=%s",
+                session_id, len(sorted_entries), len(full_local_text),
+            )
+            ai_text = await asyncio.to_thread(
+                corrector.restructure_transcript,
+                full_local_text,
+                course_title,
+                keywords,
+                ppt_slides,
+            )
+            ai_text = (ai_text or "").strip()
+            if not ai_text:
+                raise ValueError("DeepSeek returned empty text")
+
+            ai_display = corrector.clean_transcript_for_display(ai_text).strip() or ai_text
+            display_text = ai_display
+            corrected_text = ai_display
+            is_ai_corrected = True
+            logger.info(
+                "transcript_finalize_done session_id=%s input_len=%s output_len=%s",
+                session_id, len(full_local_text), len(ai_display),
+            )
+        except Exception as exc:
+            logger.exception("transcript_finalize_failed session_id=%s", session_id)
+            correction_error = f"统一整理失败: {exc}"
+
+    # Update note with unified result (inline, NOT in thread pool — SQLAlchemy ORM is not thread-safe)
+    existing_content = (note.content or "").strip()
+    notes_content = ""
+    if existing_content.startswith("## 语音转文字"):
+        marker = "\n\n---\n\n"
+        if marker in existing_content:
+            notes_content = existing_content.split(marker, 1)[1].strip()
+
+    # Build new content
+    if notes_content:
+        note.content = f"## 语音转文字\n\n{display_text}\n\n---\n\n{notes_content}".strip()
+    else:
+        note.content = f"## 语音转文字\n\n{display_text}".strip()
+
+    # Build unified transcript entry
+    unified_entry = {
+        "chunk_index": 0,
+        "text": display_text,
+        "raw_text": full_raw_text,
+        "display_text": display_text,
+        "corrected_text": corrected_text,
+        "timestamps": [],
+        "is_corrected": display_text != full_local_text,
+        "is_ai_corrected": is_ai_corrected,
+        "correction_error": correction_error,
+        "is_restructured": False,
+        "correction_stage": "final",
+    }
+    # Merge timestamps from all entries
+    all_timestamps = []
+    for e in sorted_entries:
+        ts = e.get("timestamps", [])
+        if ts:
+            all_timestamps.extend(ts)
+    unified_entry["timestamps"] = all_timestamps
+
+    note.transcript = [unified_entry]
+
+    # Rebuild layout blocks
+    note_blocks = [
+        block for block in (note.layout_blocks or [])
+        if isinstance(block, dict) and block.get("type") == "note"
+    ]
+    transcript_blocks = [
+        {
+            "id": f"transcript-{i + 1}",
+            "type": "transcript",
+            "content": part.strip(),
+        }
+        for i, part in enumerate(display_text.split("\n\n"))
+        if part.strip()
+    ]
+    note.layout_blocks = transcript_blocks + note_blocks
+
+    db.commit()
+    db.refresh(note)
+
+    # Set state based on outcome
+    if is_ai_corrected:
+        set_ready(db, session_id, "transcript_finalize")
+    else:
+        set_fallback(db, session_id, "transcript_finalize", message="已使用本地整理稿", error_message=correction_error)
+
+    # Auto-trigger vector index
+    try:
+        set_running(db, session_id, "vector_index")
+        chunk_count = build_session_index(session_id, current_user, db)
+        current_hash = _compute_session_content_hash(note)
+        set_ready(db, session_id, "vector_index", content_hash=current_hash)
+    except Exception as e:
+        set_error(db, session_id, "vector_index", error_message=str(e))
+
+    return {
+        "id": note.id,
+        "session_id": note.session_id,
+        "content": note.content or "",
+        "transcript": note.transcript,
+        "ppt_images": note.ppt_images or [],
+        "vocabulary": note.vocabulary or [],
+        "layout_blocks": note.layout_blocks or [],
+        "created_at": note.created_at.isoformat() if note.created_at else None,
+    }

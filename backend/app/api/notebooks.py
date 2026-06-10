@@ -1,10 +1,11 @@
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 from app.core.database import get_db
 from app.core.auth import get_current_user
 from app.api.schemas import NotebookCreate, NotebookUpdate, NotebookResponse, NotebookPackage, NoteCreate
-from app.models import Notebook, User, Session as DBSession, Note
+from app.models import Notebook, User, Session as DBSession, Note, VectorChunk
 from app.services.file_service import delete_notebook_files
+from sqlalchemy import func as sql_func
 
 router = APIRouter(prefix="/api/notebooks", tags=["notebooks"])
 
@@ -79,6 +80,13 @@ def delete_notebook(
     ).first()
     if not notebook:
         raise HTTPException(status_code=404, detail="Notebook not found")
+
+    # Remove vector_chunks for all sessions under this notebook to avoid
+    # FK constraint violations (SQLite does not support ON DELETE CASCADE).
+    db.query(VectorChunk).filter(VectorChunk.notebook_id == notebook_id).delete(
+        synchronize_session=False
+    )
+
     delete_notebook_files(notebook_id, db)
     db.delete(notebook)
     db.commit()
@@ -100,12 +108,16 @@ def export_notebook(
         raise HTTPException(status_code=404, detail="Notebook not found")
 
     sessions_data = []
-    sessions = db.query(DBSession).filter(
-        DBSession.notebook_id == notebook_id
-    ).order_by(DBSession.created_at.asc()).all()
+    sessions = (
+        db.query(DBSession)
+        .filter(DBSession.notebook_id == notebook_id)
+        .order_by(DBSession.created_at.asc())
+        .options(joinedload(DBSession.notes))
+        .all()
+    )
 
     for sess in sessions:
-        note = db.query(Note).filter(Note.session_id == sess.id).first()
+        note = sess.notes[0] if sess.notes else None
 
         bundle = {
             "title": sess.title,
@@ -157,7 +169,6 @@ def import_notebook(
         session = DBSession(notebook_id=notebook.id, title=sess_data.title, summary=sess_data.summary, keywords=sess_data.keywords or [])
         db.add(session)
         db.flush()
-        notebook.session_count += 1
 
         if sess_data.content or sess_data.transcript or sess_data.ppt_images or sess_data.layout_blocks:
             note = Note(session_id=session.id, content=sess_data.content or "", transcript=sess_data.transcript, ppt_images=sess_data.ppt_images)
@@ -165,6 +176,11 @@ def import_notebook(
                 note.layout_blocks = sess_data.layout_blocks
             db.add(note)
 
+    db.commit()
+    # Recalculate session_count atomically
+    notebook.session_count = db.query(sql_func.count(DBSession.id)).filter(
+        DBSession.notebook_id == notebook.id
+    ).scalar() or 0
     db.commit()
     db.refresh(notebook)
     return notebook

@@ -1,85 +1,203 @@
 # Nootbook
 
-AI-assisted course notebook for recording lectures, transcribing audio, aligning PPT slides, searching course content, sharing sessions, and generating knowledge mind maps.
+面向中文课堂的开源 NotebookLM：把课堂录音、PPT、随堂笔记整理成可搜索、可追溯、可复习的 AI 学习工作台。
+
+Nootbook 不是一个简单的“AI 总结器”。它更关注真实课堂里的完整链路：录音转写、PPT 对齐、AI 语义整理、本地兜底、RAG 引用溯源、知识导图、题库生成和长任务状态恢复。
+
+> 当前项目优先打磨 Web 端体验，后续可复用同一套后端状态模型迁移到 Pad 端。
+
+## Demo
+
+你可以在发布前把截图和演示视频放到这里：
+
+- 产品截图：`docs/assets/screenshot-note.png`
+- 知识导图截图：`docs/assets/screenshot-mindmap.png`
+- RAG 引用溯源截图：`docs/assets/screenshot-rag.png`
+- 演示视频：`docs/assets/demo.mp4`
+
+建议 README 发布时放一张首屏截图和一个 30-60 秒演示视频，效果会比单纯文字强很多。
+
+## Features
+
+- 录音转写：支持实时录音和上传录音文件，基于 FunASR / DashScope 进行语音识别。
+- 三层转写兜底：保存 `raw_text -> local_clean -> ai_corrected`，DeepSeek 不可用时也能保留本地整理稿。
+- PPT 处理与对齐：上传 PPT 后提取页面内容，辅助把课件插入到对应课堂文本附近。
+- RAG 引用溯源：基于本地向量索引回答问题，并展示转写、PPT、笔记来源卡片。
+- 知识导图：从最终课堂稿生成复习用知识地图，支持节点详情和来源查看。
+- 题库与测验：自动生成题库，测验优先覆盖错题和未做题。
+- 多 Agent 自动化：转写完成后自动建立索引，并生成 summary、mindmap、quiz bank。
+- 统一状态机：将转写、AI 整理、索引、导图、题库等长任务状态落库，刷新后可恢复。
+- 分享与导出：支持课次分享、导出和基础权限控制。
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A["录音 / PPT / 笔记输入"] --> B["ASR 转写"]
+  B --> C["本地清洗 local_clean"]
+  C --> D["DeepSeek AI 整理"]
+  D --> E["Final Transcript"]
+  C --> E
+  E --> F["向量索引"]
+  F --> G["RAG 问答 + 引用溯源"]
+  E --> H["知识导图 Agent"]
+  E --> I["题库 Agent"]
+  E --> J["Summary Agent"]
+  K["Session Processing State"] --> B
+  K --> D
+  K --> F
+  K --> H
+  K --> I
+```
 
 ## Tech Stack
 
-- Frontend: React 18, TypeScript, Vite, Tailwind CSS
-- Backend: FastAPI, SQLAlchemy, SQLite by default
-- AI/audio: FunASR, OpenAI-compatible DeepSeek API, local lightweight vector search
+- Frontend: React 18, TypeScript, Vite, Tailwind CSS, React Flow, ELK
+- Backend: FastAPI, SQLAlchemy, Alembic, PostgreSQL
+- AI: DeepSeek OpenAI-compatible API, DashScope embedding / ASR fallback
+- Audio: FunASR, FunASR streaming model, FFmpeg
+- Search: local vector index with neural embedding fallback
+- Tests: Pytest, Vitest, GitHub Actions
+
+## Requirements
+
+- Node.js 20+
+- Python 3.10+ or 3.11+
+- PostgreSQL 15+
+- FFmpeg
+- Optional but recommended: CUDA / GPU for faster local ASR
+
+FunASR models are not stored in this repository. The first run may download models from ModelScope, which can take several minutes depending on your network.
 
 ## Quick Start
 
-Install frontend dependencies:
+### 1. Install frontend dependencies
 
 ```bash
 npm install
 ```
 
-Install backend dependencies:
+### 2. Install backend dependencies
 
 ```bash
 cd backend
 pip install -r requirements.txt
 ```
 
-Create a `.env` file for backend settings as needed:
+### 3. Configure environment
+
+Copy the example file and fill in your own values:
 
 ```bash
-SECRET_KEY=replace-with-at-least-32-characters
-ADMIN_DEFAULT_EMAIL=admin
-ADMIN_DEFAULT_PASSWORD=admin123
-DATABASE_URL=sqlite:///./nootbook.db
-DEEPSEEK_API_KEY=your-key
-DEEPSEEK_BASE_URL=https://api.deepseek.com
-DEEPSEEK_MODEL=deepseek-chat
+cp .env.example .env
 ```
 
-Run the backend:
+Required:
+
+```env
+DATABASE_URL=postgresql://postgres:postgres@localhost:5432/nootbook
+SECRET_KEY=change-this-to-a-long-random-string
+```
+
+Recommended AI keys:
+
+```env
+DEEPSEEK_API_KEY=your-deepseek-key
+DASHSCOPE_API_KEY=your-dashscope-key
+QWEN_VL_API_KEY=your-qwen-vl-key
+```
+
+### 4. Prepare PostgreSQL
+
+Create the database if it does not exist:
+
+```sql
+CREATE DATABASE nootbook;
+```
+
+The backend runs Alembic migrations on startup.
+
+### 5. Run backend
 
 ```bash
 cd backend
-uvicorn app.main:app --reload
+uvicorn app.main:app --reload --port 8000
 ```
 
-Run the frontend in another terminal:
+### 6. Run frontend
 
 ```bash
 npm run dev
 ```
 
-## Useful Commands
+Open the Vite URL shown in the terminal, usually `http://localhost:5173`.
 
-Frontend checks:
+## Docker
+
+Docker Compose includes PostgreSQL and the backend image. Copy `.env.example` to `.env`, adjust AI keys, then run:
+
+```bash
+docker-compose up --build
+```
+
+The backend will be available at `http://localhost:8000`.
+
+For frontend local development, `npm run dev` is still recommended.
+
+## Testing
+
+Frontend:
 
 ```bash
 npm run build
-npm run check
-npm run lint
+npm run test
 ```
 
-Backend tests:
+Backend tests require PostgreSQL. Use a separate database whose name contains `test`:
 
 ```bash
-python -m pytest backend/tests
+set TEST_DATABASE_URL=postgresql://postgres:postgres@localhost:5432/nootbook_test
+py -3.10 -m pytest backend/tests/test_rag.py backend/tests/test_vector.py -q
 ```
 
-On this Windows workspace, use the installed Python 3.10 directly if the WindowsApps Python launcher is first on `PATH`:
+On macOS/Linux:
 
 ```bash
-C:\Users\root\AppData\Local\Programs\Python\Python310\python.exe -m pytest backend/tests
+export TEST_DATABASE_URL=postgresql://postgres:postgres@localhost:5432/nootbook_test
+python -m pytest backend/tests/test_rag.py backend/tests/test_vector.py -q
 ```
 
-## Common Issues
+## Open Source Notes
 
-- Mind map generation stays in progress: confirm `DEEPSEEK_API_KEY`, `DEEPSEEK_BASE_URL`, and network access. The API is asynchronous, so the frontend polls until `ready` or `error`.
-- Audio upload fails: confirm microphone permission, file size limits, and that FFmpeg or pydub can convert uploaded audio formats.
-- PPT upload fails: confirm the uploaded file is a valid `.pptx` and backend dependencies are installed.
-- Search returns no results: rebuild the vector index for the session after editing transcript, notes, or PPT content.
-- Login fails in local tests: the app creates the default admin user from `ADMIN_DEFAULT_EMAIL` and `ADMIN_DEFAULT_PASSWORD` during startup.
+This repository intentionally does not include:
 
-## Notes
+- `.env` files or API keys
+- PostgreSQL data
+- uploaded audio / PPT files
+- generated slide images
+- FunASR model cache
+- coverage artifacts
 
-- Generated media is stored under backend asset directories configured in `app.config`.
-- Knowledge mind maps are stored inside the note vocabulary JSON as `kind="mind_map"`.
-- Vector search is local and lightweight; it does not require an external vector database.
+Each developer should configure their own PostgreSQL database, AI API keys, and local ASR environment.
+
+## Project Highlights
+
+如果你是从简历或项目展示页点进来的，可以重点看这些工程点：
+
+- 设计三层转写稿保存模型，避免 AI 不可用时回退到 raw ASR。
+- 构建统一课次处理状态机，管理转写、索引、导图、题库等长任务状态。
+- 实现课堂 RAG 问答，支持转写/PPT/笔记多源检索与引用溯源。
+- 使用 Agent pipeline 自动生成 summary、mindmap、quiz bank。
+- 将 PostgreSQL、Alembic、Docker、CI 接入完整开发流程。
+
+## Roadmap
+
+- 更稳定的 Pad 端适配
+- 更细粒度的音频时间戳与段落溯源
+- RAG 多轮对话记忆
+- 错题间隔重复复习
+- 更完善的模型 provider 切换
+
+## License
+
+License has not been selected yet. If you plan to accept external contributions, add a license such as MIT, Apache-2.0, or AGPL-3.0 before publishing broadly.

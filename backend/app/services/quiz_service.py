@@ -24,6 +24,7 @@ from sqlalchemy.orm import Session as DBSessionType
 from app.core.database import SessionLocal
 from app.core.task_runner import run_agent_task
 from app.services.vector_service import _compute_session_content_hash
+from app.services.state_service import set_running, set_ready, set_error
 
 
 logger = logging.getLogger(__name__)
@@ -138,6 +139,53 @@ def _update_quiz_in_vocabulary(note: Note, quiz_id: str, updated_entry: dict):
         else:
             next_items.append(item)
     note.vocabulary = next_items
+
+
+def _sample_questions_for_attempt(all_questions: list[dict], quizzes: list[dict], count: int) -> list[dict]:
+    """Sample questions with review-friendly priority.
+
+    Priority:
+    1. Previously answered wrong questions.
+    2. Questions not used in submitted attempts yet.
+    3. Previously answered correctly / already used questions.
+    """
+    by_id = {q.get("id"): q for q in all_questions if isinstance(q, dict) and q.get("id")}
+    used_ids: set[str] = set()
+    wrong_ids: set[str] = set()
+
+    for quiz in quizzes:
+        snapshot = quiz.get("questions_snapshot", [])
+        for q in snapshot:
+            if isinstance(q, dict) and q.get("id"):
+                used_ids.add(q["id"])
+
+        submission = quiz.get("submission")
+        if isinstance(submission, dict):
+            for result in submission.get("results", []):
+                if isinstance(result, dict) and result.get("correct") is False and result.get("question_id"):
+                    wrong_ids.add(result["question_id"])
+
+    def pick(ids: list[str], remaining: int) -> list[dict]:
+        candidates = [by_id[qid] for qid in ids if qid in by_id]
+        random.shuffle(candidates)
+        return candidates[:remaining]
+
+    selected: list[dict] = []
+    selected_ids: set[str] = set()
+
+    for ids in (
+        list(wrong_ids),
+        [qid for qid in by_id if qid not in used_ids],
+        [qid for qid in by_id if qid not in wrong_ids],
+    ):
+        remaining = count - len(selected)
+        if remaining <= 0:
+            break
+        for q in pick([qid for qid in ids if qid not in selected_ids], remaining):
+            selected.append(q)
+            selected_ids.add(q["id"])
+
+    return selected
 
 
 # ── Content extraction ──
@@ -286,13 +334,22 @@ def _run_quiz_bank_task(task_id: str, session_id: str, user_id: str):
         task.error_message = None
         db.commit()
 
+        set_running(db, session_id, "quiz_bank", progress=0.1)
+
         _generate_question_bank_sync(session_id, user, db, task=task)
+
+        # Re-fetch note before saving to reduce race window with other agents
+        note = db.query(Note).filter(Note.session_id == session_id).first()
+        if note:
+            db.refresh(note)
 
         task = db.query(Task).filter(Task.id == task_id).first()
         if task:
             task.status = "success"
             task.progress = 1.0
             task.error_message = None
+            current_hash = _compute_session_content_hash(note) if note else ""
+            set_ready(db, session_id, "quiz_bank", content_hash=current_hash)
             db.commit()
         logger.info(
             "quiz_bank_task_success task_id=%s session_id=%s elapsed_ms=%s",
@@ -306,6 +363,7 @@ def _run_quiz_bank_task(task_id: str, session_id: str, user_id: str):
             task.progress = 1.0
             task.error_message = str(e)
             db.commit()
+        set_error(db, session_id, "quiz_bank", error_message=str(e))
         logger.exception(
             "quiz_bank_task_failed task_id=%s session_id=%s",
             task_id, session_id,
@@ -474,7 +532,7 @@ def generate_quiz(session_id: str, user: User, db: DBSessionType) -> dict:
     # Sample questions from bank
     all_questions = bank_entry["questions"]
     count = min(QUESTIONS_PER_QUIZ, len(all_questions))
-    sampled = random.sample(all_questions, count)
+    sampled = _sample_questions_for_attempt(all_questions, _get_quizzes_from_vocabulary(note), count)
 
     quiz_id = str(uuid.uuid4())
 

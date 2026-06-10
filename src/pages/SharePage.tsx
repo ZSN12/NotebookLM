@@ -7,6 +7,11 @@ import { sanitizeHTML } from '@/lib/sanitize';
 import type { NoteLayoutBlock } from '@/lib/noteLayout';
 import { API_BASE } from '@/config';
 
+interface TranscriptChunk {
+  chunk_index?: number;
+  text?: string;
+}
+
 interface SharedData {
   session: {
     id: string;
@@ -23,8 +28,8 @@ interface SharedData {
   };
   note: {
     content: string | null;
-    transcript: any[] | null;
-    ppt_images: any[] | null;
+    transcript: TranscriptChunk[] | null;
+    ppt_images: unknown[] | null;
     layout_blocks: NoteLayoutBlock[] | null;
   } | null;
 }
@@ -34,8 +39,8 @@ function fallbackLayoutFromNote(note: SharedData['note']): NoteLayoutBlock[] {
   let transcriptText = '';
   if (note.transcript && Array.isArray(note.transcript) && note.transcript.length > 0) {
     transcriptText = note.transcript
-      .sort((a: any, b: any) => (a.chunk_index || 0) - (b.chunk_index || 0))
-      .map((chunk: any) => chunk.text || '')
+      .sort((a, b) => (a.chunk_index || 0) - (b.chunk_index || 0))
+      .map((chunk) => chunk.text || '')
       .join(' ')
       .trim();
   }

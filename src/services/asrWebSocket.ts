@@ -125,22 +125,22 @@ export class ASRWebSocketClient {
     }
   }
 
-  private handleMessage(data: any) {
+  private handleMessage(data: Record<string, unknown>) {
     switch (data.type) {
       case 'partial':
-        this.callbacks.onPartial(data.text, data.start_ms, data.end_ms);
+        this.callbacks.onPartial(data.text as string, data.start_ms as number, data.end_ms as number);
         break;
       case 'final':
-        this.callbacks.onFinal(data.text, data.start_ms, data.end_ms);
+        this.callbacks.onFinal(data.text as string, data.start_ms as number, data.end_ms as number);
         break;
       case 'status':
-        this.callbacks.onStatus(data.message);
+        this.callbacks.onStatus(data.message as string);
         break;
       case 'error':
-        this.callbacks.onError(data.detail);
+        this.callbacks.onError(data.detail as string);
         break;
       case 'done':
-        this.callbacks.onDone(data.note || null);
+        this.callbacks.onDone((data.note as BackendNote | undefined) || null);
         if (this._endResolve) {
           this._endResolve();
           this._endResolve = null;

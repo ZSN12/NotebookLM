@@ -5,15 +5,17 @@ from pathlib import Path
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.api import auth, notebooks, sessions, process, notes, public, vector, mindmap, quiz, agents
+from app.api import auth, notebooks, sessions, process, notes, public, vector, mindmap, quiz, agents, rag
 from app.api.process.asr_ws import router as asr_ws_router
 from app.core.database import get_db, SessionLocal
 from app.core.auth import hash_password, get_current_user
 from app.middleware.rate_limit import RateLimitMiddleware
 from app.middleware.csrf import CSRFMiddleware
-from app.models import Notebook, Session as DBSession, User
+from app.models import Base, Notebook, Session as DBSession, User
+from app.core.database import engine
 from app.config import SLIDE_DIR, AUDIO_DIR, ALLOWED_ORIGINS, ADMIN_DEFAULT_EMAIL, ADMIN_DEFAULT_PASSWORD
 
 # ── Logging ──
@@ -45,6 +47,7 @@ app.include_router(vector.router)
 app.include_router(mindmap.router)
 app.include_router(quiz.router)
 app.include_router(agents.router)
+app.include_router(rag.router)
 app.include_router(asr_ws_router)
 
 
@@ -104,6 +107,12 @@ async def on_startup():
         print("[INFO] Database migrations applied.")
     except Exception as e:
         print(f"[WARN] Alembic upgrade failed (may already be up to date): {e}")
+        # Fallback: create tables directly for test environments
+        try:
+            Base.metadata.create_all(bind=engine)
+            print("[INFO] Tables created via Base.metadata.create_all.")
+        except Exception as ce:
+            print(f"[WARN] create_all also failed: {ce}")
 
     db = SessionLocal()
     try:
@@ -119,9 +128,13 @@ async def on_startup():
                     password_hash=hash_password(password),
                 )
                 db.add(admin)
-                db.commit()
-                print(f"[INFO] Admin user created ({ADMIN_DEFAULT_EMAIL}).")
-                print("[INFO] Please change the password immediately after first login.")
+                try:
+                    db.commit()
+                    print(f"[INFO] Admin user created ({ADMIN_DEFAULT_EMAIL}).")
+                    print("[INFO] Please change the password immediately after first login.")
+                except IntegrityError:
+                    db.rollback()
+                    print(f"[INFO] Admin user already exists ({ADMIN_DEFAULT_EMAIL}).")
     finally:
         db.close()
     print("Database ready.")
@@ -144,7 +157,14 @@ async def _preload_asr_model():
 
 @app.get("/api/health")
 def health_check():
-    return {"status": "ok"}
+    from sqlalchemy import text
+    from app.core.database import engine
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        return {"status": "ok", "database": "connected"}
+    except Exception as e:
+        return {"status": "degraded", "database": str(e)}
 
 if __name__ == "__main__":
     import uvicorn

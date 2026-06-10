@@ -45,8 +45,8 @@ export interface SessionNoteBundle {
   summary?: string;
   keywords?: string[];
   content?: string;
-  transcript?: any[];
-  ppt_images?: any[];
+  transcript?: unknown[];
+  ppt_images?: unknown[];
   layout_blocks?: import('@/lib/noteLayout').NoteLayoutBlock[];
 }
 

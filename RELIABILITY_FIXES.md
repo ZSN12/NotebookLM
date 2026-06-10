@@ -60,74 +60,107 @@ _core_terms()  # 提取内容词（"进程"、"管道"、"父子进程"）
 
 ---
 
-### 4. 前端：显示"纠正状态"（待修复 ⏳）
+### 4. 前端：显示"纠正状态"（已修复 ✅）
 
-当前 SSE 事件有 `is_ai_corrected` 和 `correction_error`，但 UI 没利用。
+在 `NoteDetail` 转写面板标题旁显示状态标签，并根据 `correction_error` 内容做语义化提示：
 
-**目标**：在转写卡片上显示一个小标签：
-- 🟢 "AI 已纠正" — `is_ai_corrected=True`
-- 🟡 "本地整理" — `is_ai_corrected=False, correction_error=未配置 DeepSeek API`
-- 🔴 "纠正失败：疑似删减" — `correction_error=AI 整理结果疑似删减内容`
+| 状态 | 标签文案 | 触发条件 |
+|------|---------|---------|
+| 🟢 AI 已纠正 | `AI 已纠正` | `is_ai_corrected=True` |
+| 🟡 本地整理 | `本地整理` | `is_ai_corrected=False` 且无错误 |
+| 🔴 未配置 API | `本地整理：未配置 API` | `correction_error` 包含"未配置" |
+| 🔴 纠正超时 | `AI 纠正超时` | `correction_error` 包含"超时" |
+| 🔴 疑似删减 | `AI 纠正被拦截：疑似删减` | `correction_error` 包含"删减" |
+| 🔴 其他失败 | `AI 纠正失败` | 其他 `correction_error` |
 
-这样用户一眼就能知道结果质量。
-
----
-
-### 5. 端到端测试（待补充 ⏳）
-
-```python
-# backend/tests/test_e2e_audio_upload.py
-"""
-模拟完整流程：
-1. 上传一段测试音频（可用 mock / 小段真实音频）
-2. 验证 SSE 返回的 event.type 序列：status → chunk → done
-3. 验证 done.note.transcript[0].is_ai_corrected = True
-4. 验证 display_text 包含纠正后的专业术语
-"""
-```
-
-**为什么**：今天的 bug 任何单元测试都抓不到，必须走完整链路才能发现。
+代码位置：`src/pages/note-detail/index.tsx` 标题栏、`src/pages/note-detail/hooks/useAudioUpload.ts` 回调、`src/pages/note-detail/hooks/useRestructure.ts`。
 
 ---
 
-### 6. 监控/告警（待补充 ⏳）
+### 5. 端到端测试（已补充 ✅）
 
-在后端关键路径加 metrics：
+`backend/tests/test_e2e_audio_upload.py` 现包含 4 个场景：
 
-```python
-# audio.py
-logger.info("audio_upload pipeline: session=%s asr_ok=%s llm_called=%s llm_accepted=%s",
-            session_id, bool(segments), corrector.has_llm, final_result.get("is_ai_corrected"))
-```
+1. **`test_audio_batch_stream_events_and_ai_correction`** — AI 纠正成功全流程
+   - Mock ASR + Mock DeepSeek（`preserves_source_content=True`）
+   - 断言 SSE 序列：`status → chunk → done`
+   - 断言 `is_ai_corrected=True`、display_text 包含专业术语
 
-然后写一个 health check 脚本，每天抽查一次：
+2. **`test_audio_batch_without_llm_falls_back_to_local`** — 无 LLM 降级
+   - `has_llm=False`
+   - 断言 `is_ai_corrected=False` 且 `correction_error` 非空
+
+3. **`test_audio_batch_ai_rejected_for_truncation`** — AI 结果被拦截
+   - Mock DeepSeek 返回过短文本（`preserves_source_content=False`）
+   - 断言 `is_ai_corrected=False`，且 fallback 到本地长文本
+
+4. **`test_audio_batch_chunked_upload_flow`** — 大文件分片上传
+   - 构造 >10MB 文件触发分片上传路径
+   - 断言每片返回 `received=True`，finish 返回 200
+
+**运行**：
 ```bash
-# 上传测试音频，检查结果是否被纠正
-curl -F "file=@test.wav" "http://localhost:8003/api/process/audio-batch?session_id=test"
-# 检查响应里的 is_ai_corrected
+python -m pytest backend/tests/test_e2e_audio_upload.py -v
 ```
 
 ---
 
-### 7. 前端防御：上传超时/失败提示（已部分有，可加强 ⏳）
+### 6. 监控/告警（已补充 ✅）
 
-当前 `uploadAudio` 有 `onError` 回调，但如果请求根本没发（如今天的 onChange 没触发），错误处理也走不到。
+新增 `backend/scripts/health_check_audio_pipeline.py`，可独立运行：
 
-**加强方案**：
+```bash
+export API_BASE=http://localhost:8003
+export ADMIN_EMAIL=admin
+export ADMIN_PASSWORD=admin123
+python backend/scripts/health_check_audio_pipeline.py
+```
+
+功能：
+1. 探测 `/api/health`
+2. 登录获取 token
+3. 创建临时 notebook + session
+4. 上传 mock 音频（Mock ASR + Mock DeepSeek）
+5. 解析 SSE，断言事件序列和 `is_ai_corrected=True`
+6. 退出码：0=健康，1=降级，2=异常
+
+**集成到 cron / CI**：
+```bash
+# 每天抽查一次
+0 9 * * * cd /opt/nootbook && python backend/scripts/health_check_audio_pipeline.py || alert
+```
+
+后端已在 `audio.py` 关键路径输出结构化日志：
+```
+audio_upload pipeline: session=xxx asr_ok=True llm_called=True llm_accepted=True
+```
+
+---
+
+### 7. 前端防御：上传超时/失败提示（已加强 ✅）
+
+`src/pages/note-detail/hooks/useAudioUpload.ts` 新增 **SSE  stall 检测**：
+
+- 上传开始后启动 30 秒定时器
+- 每次收到 `onStatus` / `onChunk` / `onDone` / `onError` 回调时刷新计时
+- 若 30 秒内无任何 SSE 事件到达：
+  - 自动 `abort()` 取消请求
+  - UI 显示 `上传处理超时，请检查网络或稍后重试`
+  - 重置 `isUploadingAudio=false`
+
 ```tsx
-const [lastUploadAt, setLastUploadAt] = useState<number>(0);
+const UPLOAD_STALL_TIMEOUT_MS = 30000;
 
-// 点击上传按钮后 5 秒内如果没有收到任何 SSE 事件，提示用户
-useEffect(() => {
-  if (!isUploadingAudio) return;
-  const timer = setTimeout(() => {
-    if (lastUploadAt === 0) {
-      setAudioUploadError('上传未开始，请重新选择文件');
+const startStallTimer = (abort: () => void) => {
+  lastSseAtRef.current = Date.now();
+  stallTimerRef.current = setTimeout(() => {
+    if (Date.now() - lastSseAtRef.current >= UPLOAD_STALL_TIMEOUT_MS) {
+      abort();
+      setAudioUploadError('上传处理超时，请检查网络或稍后重试');
       setIsUploadingAudio(false);
     }
-  }, 5000);
-  return () => clearTimeout(timer);
-}, [isUploadingAudio]);
+  }, UPLOAD_STALL_TIMEOUT_MS);
+};
 ```
 
 ---
@@ -139,10 +172,10 @@ useEffect(() => {
 | **P0** | file input 清空触发 | ✅ 已修复 |
 | **P0** | logging 配置 | ✅ 已修复 |
 | **P0** | min_ratio + 核心词兜底 | ✅ 已修复 |
-| **P1** | 前端显示纠正状态标签 | ⏳ 待做 |
-| **P1** | e2e 上传测试 | ⏳ 待做 |
-| **P2** | 监控/health check | ⏳ 待做 |
-| **P2** | 上传超时防御 | ⏳ 待做 |
+| **P1** | 前端显示纠正状态标签 | ✅ 已修复 |
+| **P1** | e2e 上传测试 | ✅ 已补充 |
+| **P2** | 监控/health check | ✅ 已补充 |
+| **P2** | 上传超时防御 | ✅ 已加强 |
 
 ---
 

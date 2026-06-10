@@ -28,8 +28,8 @@ export default function Login() {
       }
       await login(email, password);
       navigate("/", { replace: true });
-    } catch (err: any) {
-      setError(err.message);
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : '登录失败');
     } finally {
       setLoading(false);
     }
@@ -52,8 +52,8 @@ export default function Login() {
       await resetPassword(resetEmail, resetNewPassword);
       setResetMessage("密码已重置，请登录");
       setTimeout(closeResetModal, 2000);
-    } catch (err: any) {
-      setError(err.message);
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : '密码重置失败');
     } finally {
       setResetLoading(false);
     }

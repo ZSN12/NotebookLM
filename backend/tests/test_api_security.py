@@ -1,22 +1,10 @@
 import os
 import sys
-import tempfile
 from pathlib import Path
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BACKEND_DIR))
 
-TEST_DB = Path(tempfile.gettempdir()) / "nootbook_test_api_security.db"
-for suffix in ("", "-shm", "-wal"):
-    try:
-        (Path(f"{TEST_DB}{suffix}")).unlink()
-    except FileNotFoundError:
-        pass
-
-os.environ["SECRET_KEY"] = "test-secret-key-with-at-least-32-bytes"
-os.environ["ADMIN_DEFAULT_EMAIL"] = "admin"
-os.environ["ADMIN_DEFAULT_PASSWORD"] = "admin123"
-os.environ["DATABASE_URL"] = f"sqlite:///{TEST_DB.as_posix()}"
 os.environ["SKIP_ASR_PRELOAD"] = "1"
 
 from fastapi.testclient import TestClient
@@ -55,7 +43,13 @@ def test_password_reset_allows_account_only_reset():
     with TestClient(app) as client:
         resp = client.post(
             "/api/auth/register",
-            json={"username": "Reset User", "email": "reset@example.com", "password": "oldpass123"},
+            json={
+                "username": "Reset User",
+                "email": "reset@example.com",
+                "password": "oldpass123",
+                "security_question": "What is your favorite color?",
+                "security_answer": "blue",
+            },
         )
         assert resp.status_code == 201
 
@@ -63,6 +57,7 @@ def test_password_reset_allows_account_only_reset():
             "/api/auth/reset-password",
             json={
                 "email": "reset@example.com",
+                "security_answer": "blue",
                 "new_password": "newpass123",
             },
         )

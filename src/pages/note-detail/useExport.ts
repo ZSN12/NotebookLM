@@ -1,5 +1,6 @@
 import { toast } from "sonner";
 import { useState } from 'react';
+import DOMPurify from 'dompurify';
 import { exportNotebook, getMediaUrl } from '@/services/api';
 import type { NoteLayoutBlock } from '@/lib/noteLayout';
 
@@ -81,13 +82,14 @@ export function useExport(session: Session | undefined | null, notebook: Noteboo
       const html2pdf = (await import('html2pdf.js')).default;
       let bodyHtml = '';
 
+      const sanitize = (html: string) => DOMPurify.sanitize(html, { ALLOWED_TAGS: [], ALLOWED_ATTR: [] });
       if (layoutBlocks && layoutBlocks.length > 0) {
         // Export using layout blocks order
         for (const block of layoutBlocks) {
           switch (block.type) {
             case 'transcript':
               if (block.content?.trim()) {
-                bodyHtml += `<div style="margin-bottom:12px;line-height:1.8">${block.content.trim()}</div>`;
+                bodyHtml += `<div style="margin-bottom:12px;line-height:1.8">${sanitize(block.content.trim())}</div>`;
               }
               break;
             case 'ppt':
@@ -103,7 +105,7 @@ export function useExport(session: Session | undefined | null, notebook: Noteboo
               if (block.content?.trim()) {
                 bodyHtml += `<div style="margin-bottom:16px;padding:12px;background:#fffbeb;border:1px solid #fde68a;border-radius:8px">`;
                 bodyHtml += `<h4 style="margin:0 0 8px;color:#92400e;font-size:12px">随堂笔记</h4>`;
-                bodyHtml += `<div style="line-height:1.8">${block.content.trim()}</div>`;
+                bodyHtml += `<div style="line-height:1.8">${sanitize(block.content.trim())}</div>`;
                 bodyHtml += `</div>`;
               }
               break;
@@ -111,10 +113,10 @@ export function useExport(session: Session | undefined | null, notebook: Noteboo
         }
       } else {
         // Fallback: old-style export
-        bodyHtml += `<div style="white-space:pre-wrap;line-height:1.7">${transcriptText.trim()}</div>`;
+        bodyHtml += `<div style="white-space:pre-wrap;line-height:1.7">${sanitize(transcriptText.trim())}</div>`;
         if (notes.some(n => n.content.trim())) {
           const notesHtml = notes.filter(n => n.content.trim()).map((n, i) =>
-            `<div style="margin-bottom:12px"><h4 style="color:#475569;margin:0 0 4px">笔记 ${i + 1}</h4><div>${n.content}</div></div>`
+            `<div style="margin-bottom:12px"><h4 style="color:#475569;margin:0 0 4px">笔记 ${i + 1}</h4><div>${sanitize(n.content)}</div></div>`
           ).join('');
           bodyHtml += `<h2 style="font-size:16px;border-bottom:2px solid #e2e8f0;padding-bottom:6px;margin:20px 0 12px;color:#1e293b">📖 随堂笔记</h2>${notesHtml}`;
         }
@@ -168,9 +170,9 @@ export function useExport(session: Session | undefined | null, notebook: Noteboo
       a.download = `${notebook.title}.nootbook`;
       a.click();
       setTimeout(() => URL.revokeObjectURL(url), 2000);
-    } catch (err: any) {
+    } catch (err: unknown) {
       console.error('Notebook package export failed:', err);
-      toast.error(err.message || "导出失败");
+      toast.error(err instanceof Error ? err.message : '导出失败');
     } finally {
       setIsExportingPackage(false);
       setShowExportMenu(false);

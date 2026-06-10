@@ -5,23 +5,11 @@ Two agents saving concurrently should each preserve their entry.
 
 import os
 import sys
-import tempfile
 from pathlib import Path
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BACKEND_DIR))
 
-TEST_DB = Path(tempfile.gettempdir()) / "nootbook_test_vocab_race.db"
-for suffix in ("", "-shm", "-wal"):
-    try:
-        (Path(f"{TEST_DB}{suffix}")).unlink()
-    except FileNotFoundError:
-        pass
-
-os.environ["SECRET_KEY"] = "test-vocab-race-secret-key-at-least-32-bytes!!"
-os.environ["ADMIN_DEFAULT_EMAIL"] = "admin"
-os.environ["ADMIN_DEFAULT_PASSWORD"] = "admin123"
-os.environ["DATABASE_URL"] = f"sqlite:///{TEST_DB.as_posix()}"
 os.environ["SKIP_ASR_PRELOAD"] = "1"
 
 from app.core.database import SessionLocal, engine

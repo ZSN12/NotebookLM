@@ -34,6 +34,8 @@ def register(data: UserCreate, db: Session = Depends(get_db)):
         username=data.username,
         email=data.email,
         password_hash=hash_password(data.password),
+        security_question=data.security_question,
+        security_answer_hash=hash_password(data.security_answer) if data.security_answer else None,
     )
     db.add(user)
     db.commit()
@@ -110,6 +112,15 @@ def reset_password(data: PasswordReset, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.email == data.email).first()
     if user is None:
         raise HTTPException(status_code=404, detail="User not found")
+
+    if not user.security_question or not user.security_answer_hash:
+        raise HTTPException(
+            status_code=400,
+            detail="This account does not have a security question set. Please contact support."
+        )
+
+    if not verify_password(data.security_answer, user.security_answer_hash):
+        raise HTTPException(status_code=403, detail="Incorrect security answer")
 
     user.password_hash = hash_password(data.new_password)
     db.commit()

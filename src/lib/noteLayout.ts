@@ -25,11 +25,11 @@ export function normalizeHtmlText(value?: string | null): string {
   return trimmed === '<br>' || trimmed === '<br />' || /^[-\s]+$/.test(trimmed) ? '' : trimmed;
 }
 
-export function transcriptTextFromRawTranscript(transcript?: any[] | null): string {
+export function transcriptTextFromRawTranscript(transcript?: unknown[] | null): string {
   if (!Array.isArray(transcript) || transcript.length === 0) return '';
   return [...transcript]
-    .sort((a, b) => (a?.chunk_index || 0) - (b?.chunk_index || 0))
-    .map((chunk) => chunk?.text || '')
+    .sort((a, b) => Number((a as Record<string, unknown>)?.chunk_index || 0) - Number((b as Record<string, unknown>)?.chunk_index || 0))
+    .map((chunk) => (chunk as Record<string, unknown>)?.text || '')
     .join(' ')
     .trim();
 }
@@ -137,7 +137,7 @@ export function layoutFromNoteParts(
 
 export function fallbackLayoutFromNote(note: {
   content?: string | null;
-  transcript?: any[] | null;
+  transcript?: unknown[] | null;
   layout_blocks?: NoteLayoutBlock[] | null;
 }): NoteLayoutBlock[] {
   if (Array.isArray(note.layout_blocks) && note.layout_blocks.length > 0) return note.layout_blocks;

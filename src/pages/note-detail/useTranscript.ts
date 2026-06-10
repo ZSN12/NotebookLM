@@ -58,7 +58,8 @@ export function useTranscript(
   const dedupeKey = useCallback((value: string) => {
     return normalizeEditableHtml(value)
       .toLowerCase()
-      .replace(/[\s，。！？,.!?；;：:、"'“”‘’（）()《》<>【】\[\]\-—_]+/g, '');
+      // eslint-disable-next-line no-useless-escape, no-empty-character-class
+      .replace(/[\]\[\s，。！？,.!?；;：:、"'“”‘’（）()《》<>【—_-]+/g, '');
   }, [normalizeEditableHtml]);
 
   const isRepeatedText = useCallback((candidate: string, previous: string) => {
@@ -134,6 +135,8 @@ export function useTranscript(
       setContentBlocks([]);
     }
   }, []);
+
+  const clearContentBlocks = useCallback(() => setContentBlocks([]), []);
 
   // ── WebSocket streaming actions ──
   const receivePartial = useCallback((text: string) => {
@@ -283,13 +286,13 @@ export function useTranscript(
     if (!note?.transcript || !Array.isArray(note.transcript) || note.transcript.length === 0) return '';
     return [...note.transcript]
       .sort((a: any, b: any) => (a.chunk_index || 0) - (b.chunk_index || 0))
-      .map((chunk: any) => chunk.display_text || chunk.text || chunk.raw_text || '')
+      .map((chunk: any) => chunk.display_text || chunk.corrected_text || chunk.text || chunk.raw_text || '')
       .filter(Boolean)
       .join('\n\n')
       .trim();
   }, []);
 
-  const appendTranscriptText = useCallback((newText: string) => {
+  const appendTranscriptText = useCallback((newText: string, skipDedup = false) => {
     markLocalChanged(false);
     setSentencesWithTime([]);
     setActiveSentenceIndex(null);
@@ -298,31 +301,36 @@ export function useTranscript(
       if (!trimmed) return prev;
       const prevTrimmed = prev.trim();
 
-      // Sentence-level dedup against recent chunks, not just paragraph-level.
-      // ASR can emit the same sentence twice inside adjacent windows.
-      const prevSentences = prevTrimmed
-        .split(/(?<=[。！？.!?\n])/)
-        .map(s => s.trim())
-        .filter(Boolean)
-        .slice(-8);
-      if (prevSentences.some(s => isRepeatedText(trimmed, s))) {
-        return prev;
+      if (!skipDedup) {
+        // Sentence-level dedup against recent chunks, not just paragraph-level.
+        // ASR can emit the same sentence twice inside adjacent windows.
+        const prevSentences = prevTrimmed
+          .split(/(?<=[。！？.!?\n])/)
+          .map(s => s.trim())
+          .filter(Boolean)
+          .slice(-8);
+        if (prevSentences.some(s => isRepeatedText(trimmed, s))) {
+          return prev;
+        }
+
+        const recentParts = prevTrimmed.split(/\n{2,}/).filter(Boolean).slice(-3);
+        if (recentParts.some((part) => isRepeatedText(trimmed, part))) {
+          return prev;
+        }
       }
 
-      const recentParts = prevTrimmed.split(/\n{2,}/).filter(Boolean).slice(-3);
-      if (recentParts.some((part) => isRepeatedText(trimmed, part))) {
-        return prev;
-      }
       return prevTrimmed ? `${prevTrimmed}\n\n${trimmed}` : trimmed;
     });
   }, [isRepeatedText, markLocalChanged]);
 
   const loadHistory = useCallback(async () => {
     if (!sessionId) return;
+    const currentId = sessionId;
     setIsLoaded(false);
     setLoadedNote(null);
     try {
       const note = await fetchNote(sessionId);
+      if (sessionId !== currentId) return; // ignore stale response
       if (note) {
         setLoadedNote(note); // Share with parent so it can skip its own fetch
         // Prefer user-edited transcript from note.content, but if a final
@@ -331,20 +339,16 @@ export function useTranscript(
         let transcriptRestored = false;
         const backendTranscript = transcriptTextFromNote(note);
         const hasFinalTranscript = note.transcript?.some?.(
-          (chunk: any) => chunk.correction_stage === 'final' || chunk.is_corrected,
+          (chunk: any) => chunk.correction_stage === 'final',
         );
-        if (note.content) {
+        // Always prefer final backend transcript so we never fall back to raw ASR
+        if (hasFinalTranscript && backendTranscript) {
+          setTranscriptText(cleanTranscriptText(backendTranscript));
+          transcriptRestored = true;
+        } else if (note.content) {
           const match = note.content.match(/^## 语音转文字\n\n([\s\S]*?)(?:\n\n---\n\n[\s\S]*)?$/);
           const contentTranscript = match?.[1]?.trim() ? cleanTranscriptText(match[1]) : '';
-          const useBackendFinal = Boolean(
-            hasFinalTranscript
-            && backendTranscript
-            && (!contentTranscript || contentTranscript.length > backendTranscript.length * 1.35),
-          );
-          if (useBackendFinal) {
-            setTranscriptText(cleanTranscriptText(backendTranscript));
-            transcriptRestored = true;
-          } else if (contentTranscript) {
+          if (contentTranscript) {
             setTranscriptText(contentTranscript);
             transcriptRestored = true;
           }
@@ -372,7 +376,7 @@ export function useTranscript(
               if (blocks.blocks?.some((b: ContentBlock) => b.type === 'image')) {
                 updateContentBlocks(blocks.blocks, false, false);
               }
-            } catch {}
+            } catch { /* ignore */ }
           }, 500);
         }
       }
@@ -434,7 +438,7 @@ export function useTranscript(
             if (parsed.length > 0) setSentencesWithTime(parsed);
           }
         }
-      } catch {}
+      } catch { /* ignore */ }
     }, CORRECTION_POLL_MS);
     return () => clearInterval(interval);
   }, [isRecording, sessionId, transcriptText, parseSentencesWithTime, receiveAiText, transcriptTextFromNote]);
@@ -473,7 +477,7 @@ export function useTranscript(
           }
           return;
         }
-      } catch {}
+      } catch { /* ignore */ }
 
       if (attempts >= FINAL_CORRECTION_MAX_ATTEMPTS) {
         stopped = true;
@@ -579,6 +583,7 @@ export function useTranscript(
       parseSentencesWithTime,
       setSentencesWithTime,
       clearDerivedTranscriptViews,
+      clearContentBlocks,
       receivePartial,
       receiveFinal,
       clearStreamingState,

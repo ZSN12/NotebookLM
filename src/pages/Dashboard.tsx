@@ -42,9 +42,9 @@ export default function Dashboard() {
       await importNotebook(pkg);
       toast.success('笔记本导入成功');
       loadNotebooks();
-    } catch (err: any) {
+    } catch (err: unknown) {
       console.error('Import failed:', err);
-      toast.error(err.message || '导入失败，请检查文件格式');
+      toast.error(err instanceof Error ? err.message : '导入失败，请检查文件格式');
     } finally {
       setIsImporting(false);
       if (importFileRef.current) importFileRef.current.value = '';

@@ -1,11 +1,13 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 from datetime import datetime, timezone, timedelta
+from sqlalchemy import func as sql_func
 from app.core.database import get_db
 from app.core.auth import get_current_user
 from app.api.schemas import SessionCreate, SessionUpdate, SessionResponse
-from app.models import Session as DBSession, Notebook, User
+from app.models import Session as DBSession, Notebook, User, VectorChunk
 from app.services.file_service import delete_session_files
+from app.services.state_service import get_session_processing_status
 import secrets
 
 router = APIRouter(prefix="/api/sessions", tags=["sessions"])
@@ -44,7 +46,11 @@ def create_session(
         raise HTTPException(status_code=404, detail="Notebook not found")
     session = DBSession(notebook_id=notebook_id, **data.model_dump())
     db.add(session)
-    notebook.session_count += 1
+    db.commit()
+    # Atomically increment session_count to avoid race conditions
+    db.query(Notebook).filter(Notebook.id == notebook_id).update(
+        {"session_count": Notebook.session_count + 1}
+    )
     db.commit()
     db.refresh(session)
     return session
@@ -94,10 +100,16 @@ def delete_session(
     ).join(Notebook).filter(Notebook.user_id == current_user.id).first()
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
+    # Remove vector_chunks for this session to avoid FK constraint violations.
+    db.query(VectorChunk).filter(VectorChunk.session_id == session_id).delete(
+        synchronize_session=False
+    )
+
     delete_session_files(session_id, delete_audio=False)
-    notebook = db.query(Notebook).filter(Notebook.id == session.notebook_id).first()
-    if notebook:
-        notebook.session_count = max(0, notebook.session_count - 1)
+    # Atomically decrement session_count
+    db.query(Notebook).filter(Notebook.id == session.notebook_id).update(
+        {"session_count": sql_func.greatest(Notebook.session_count - 1, 0)}
+    )
     db.delete(session)
     db.commit()
     return None
@@ -184,3 +196,19 @@ def get_share_status(
         "share_max_views": session.share_max_views,
         "share_view_count": session.share_view_count,
     }
+
+
+@router.get("/{session_id}/processing-status")
+def get_processing_status(
+    session_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Return unified processing status for all stages of a session."""
+    session = db.query(DBSession).filter(
+        DBSession.id == session_id
+    ).join(Notebook).filter(Notebook.user_id == current_user.id).first()
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    return get_session_processing_status(db, session_id)

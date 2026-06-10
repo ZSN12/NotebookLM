@@ -14,6 +14,7 @@ The frontend protocol remains the same:
 import asyncio
 import logging
 import os
+import threading
 import wave
 from typing import List, Optional
 
@@ -133,8 +134,10 @@ class StreamingRecognizer:
         self.is_paused = False
 
     def finalize(self) -> dict:
-        """End of stream: flush remaining audio, do full DeepSeek
-        restructure, save note, and return serialized note.
+        """End of stream: flush remaining audio, do local cleanup, and return payload.
+
+        DeepSeek finalization is deferred to the audio-finish endpoint so that
+        the unified restructure runs on the complete session transcript.
         """
         self.is_ended = True
 
@@ -168,31 +171,11 @@ class StreamingRecognizer:
         # Tier 2: local deterministic cleanup — ALWAYS runs
         local_display = corrector.clean_transcript_for_display(raw_text).strip() or raw_text
 
-        # Tier 3: DeepSeek enhancement — best-effort, never blocks saving
+        # Tier 3 is deferred to audio-finish / restructure endpoint
         display_text = local_display
         corrected_text = None
         is_ai_corrected = False
         correction_error = None
-
-        if getattr(corrector, "has_llm", False) and local_display:
-            try:
-                ai_text = corrector.restructure_transcript(
-                    local_display,
-                    self.course_title,
-                    self.keywords,
-                )
-                ai_text = (ai_text or "").strip()
-                if ai_text and corrector.preserves_source_content(local_display, ai_text, min_ratio=0.50):
-                    display_text = corrector.clean_transcript_for_display(ai_text).strip() or ai_text
-                    corrected_text = display_text
-                    is_ai_corrected = True
-                else:
-                    correction_error = "AI 整理失败"
-            except Exception as exc:
-                logger.warning("streaming_final_deepseek_failed session_id=%s error=%s", self.session_id, exc)
-                correction_error = "AI 整理失败"
-        else:
-            correction_error = "AI 整理失败，已使用本地整理稿"
 
         # Save full audio WAV
         self._save_audio_wav()
@@ -209,7 +192,7 @@ class StreamingRecognizer:
             "is_ai_corrected": is_ai_corrected,
             "correction_error": correction_error,
             "is_restructured": False,
-            "correction_stage": "final",
+            "correction_stage": "local",
         }
 
         note_payload = {
@@ -247,14 +230,26 @@ class StreamingRecognizer:
         try:
             AUDIO_DIR.mkdir(parents=True, exist_ok=True)
             output_path = AUDIO_DIR / f"{self.session_id}.wav"
+
+            # Read existing audio data if present and concatenate
+            existing_frames = bytearray()
+            if output_path.exists():
+                try:
+                    with wave.open(str(output_path), "rb") as wf:
+                        existing_frames = bytearray(wf.readframes(wf.getnframes()))
+                except Exception:
+                    pass
+
+            combined = existing_frames + self.audio_buffer
+
             with wave.open(str(output_path), "wb") as wf:
                 wf.setnchannels(1)
                 wf.setsampwidth(BYTES_PER_SAMPLE)
                 wf.setframerate(SAMPLE_RATE)
-                wf.writeframes(self.audio_buffer)
+                wf.writeframes(combined)
             logger.info(
-                "streaming_audio_saved session_id=%s path=%s bytes=%s",
-                self.session_id, output_path, len(self.audio_buffer),
+                "streaming_audio_saved session_id=%s path=%s existing_bytes=%s new_bytes=%s total_bytes=%s",
+                self.session_id, output_path, len(existing_frames), len(self.audio_buffer), len(combined),
             )
         except Exception as exc:
             logger.warning("streaming_audio_save_failed session_id=%s error=%s", self.session_id, exc)
@@ -265,6 +260,7 @@ class StreamingASRManager:
 
     _instance: Optional["StreamingASRManager"] = None
     _recognizers: dict[str, StreamingRecognizer]
+    _lock = threading.Lock()
 
     def __new__(cls) -> "StreamingASRManager":
         if cls._instance is None:
@@ -283,15 +279,18 @@ class StreamingASRManager:
             course_title=course_title,
             keywords=keywords,
         )
-        self._recognizers[session_id] = rec
+        with self._lock:
+            self._recognizers[session_id] = rec
         logger.info("streaming_recognizer_created session_id=%s", session_id)
         return rec
 
     def get_recognizer(self, session_id: str) -> Optional[StreamingRecognizer]:
-        return self._recognizers.get(session_id)
+        with self._lock:
+            return self._recognizers.get(session_id)
 
     def remove_recognizer(self, session_id: str) -> None:
-        rec = self._recognizers.pop(session_id, None)
+        with self._lock:
+            rec = self._recognizers.pop(session_id, None)
         if rec:
             rec.cleanup()
             logger.info("streaming_recognizer_removed session_id=%s", session_id)

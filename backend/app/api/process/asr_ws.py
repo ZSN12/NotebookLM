@@ -157,23 +157,120 @@ async def asr_websocket(
 
                 elif msg_type == "end":
                     payload = recognizer.finalize()
-                    # Also save note to DB
+                    # Also save note to DB (append mode)
                     db = SessionLocal()
                     try:
                         note = db.query(Note).filter(Note.session_id == session_id).first()
                         transcript_data = payload.get("transcript", [])
+
+                        # Helper: extract notes content from existing note.content
+                        def _extract_notes_content(content: str | None) -> str:
+                            existing = (content or "").strip()
+                            if not existing:
+                                return ""
+                            marker = "\n\n---\n\n"
+                            if existing.startswith("## 语音转文字"):
+                                return existing.split(marker, 1)[1].strip() if marker in existing else ""
+                            return existing
+
+                        # Helper: extract transcript text from existing note.content
+                        def _extract_transcript_text(content: str | None) -> str:
+                            existing = (content or "").strip()
+                            if not existing:
+                                return ""
+                            if existing.startswith("## 语音转文字"):
+                                marker = "\n\n---\n\n"
+                                if marker in existing:
+                                    transcript_part = existing.split(marker, 1)[0].strip()
+                                else:
+                                    transcript_part = existing.strip()
+                                if transcript_part.startswith("## 语音转文字"):
+                                    transcript_part = transcript_part[len("## 语音转文字"):].strip()
+                                return transcript_part
+                            return ""
+
                         if note:
-                            note.transcript = transcript_data
+                            notes_content = _extract_notes_content(note.content)
+                            existing_transcript_text = _extract_transcript_text(note.content)
+
+                            # Get new display text from payload
+                            new_display_text = ""
+                            if transcript_data:
+                                new_display_text = (
+                                    transcript_data[0].get("display_text")
+                                    or transcript_data[0].get("text")
+                                    or ""
+                                ).strip()
+
+                            # Combine transcript text
+                            if existing_transcript_text and new_display_text:
+                                combined_transcript_text = f"{existing_transcript_text}\n\n{new_display_text}".strip()
+                            elif new_display_text:
+                                combined_transcript_text = new_display_text
+                            else:
+                                combined_transcript_text = existing_transcript_text
+
+                            # Update content
+                            if notes_content and combined_transcript_text:
+                                note.content = f"## 语音转文字\n\n{combined_transcript_text}\n\n---\n\n{notes_content}".strip()
+                            elif combined_transcript_text:
+                                note.content = f"## 语音转文字\n\n{combined_transcript_text}".strip()
+                            else:
+                                note.content = notes_content
+
+                            # Append transcript entries
+                            # Use list() copy so SQLAlchemy detects the mutation
+                            existing_transcript = list(note.transcript or [])
+                            base_index = len(existing_transcript)
+                            for i, entry in enumerate(transcript_data):
+                                entry["chunk_index"] = base_index + i
+                            existing_transcript.extend(transcript_data)
+                            note.transcript = existing_transcript
+
+                            # Rebuild layout blocks
+                            existing_layout = list(note.layout_blocks or [])
+                            note_blocks = [
+                                block for block in existing_layout
+                                if isinstance(block, dict) and block.get("type") == "note"
+                            ]
+                            all_transcript_blocks = [
+                                {
+                                    "id": f"transcript-{i + 1}",
+                                    "type": "transcript",
+                                    "content": part.strip(),
+                                }
+                                for i, part in enumerate(combined_transcript_text.split("\n\n"))
+                                if part.strip()
+                            ]
+                            note.layout_blocks = all_transcript_blocks + note_blocks
+
                             db.commit()
                             db.refresh(note)
                         else:
+                            display_text = ""
+                            if transcript_data:
+                                display_text = (
+                                    transcript_data[0].get("display_text")
+                                    or transcript_data[0].get("text")
+                                    or ""
+                                ).strip()
                             note = Note(
                                 session_id=session_id,
                                 transcript=transcript_data,
-                                content="",
+                                content=f"## 语音转文字\n\n{display_text}".strip() if display_text else "",
                                 ppt_images=[],
                                 vocabulary=[],
                             )
+                            if display_text:
+                                note.layout_blocks = [
+                                    {
+                                        "id": f"transcript-{i + 1}",
+                                        "type": "transcript",
+                                        "content": part.strip(),
+                                    }
+                                    for i, part in enumerate(display_text.split("\n\n"))
+                                    if part.strip()
+                                ]
                             db.add(note)
                             db.commit()
                             db.refresh(note)

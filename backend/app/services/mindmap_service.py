@@ -20,6 +20,7 @@ from app.core.task_runner import run_agent_task, wait_for_agent_threads
 from app.models import Note, Session, Notebook, User, Task
 from sqlalchemy.orm import Session as DBSessionType
 from app.services.vector_service import _compute_session_content_hash
+from app.services.state_service import set_running, set_ready, set_error
 
 
 logger = logging.getLogger(__name__)
@@ -226,13 +227,22 @@ def _run_mind_map_task(task_id: str, session_id: str, user_id: str):
         task.error_message = None
         db.commit()
 
+        set_running(db, session_id, "mindmap", progress=0.1)
+
         generate_mind_map(session_id, user, db)
+
+        # Re-fetch note before saving to reduce race window with other agents
+        note = db.query(Note).filter(Note.session_id == session_id).first()
+        if note:
+            db.refresh(note)
 
         task = db.query(Task).filter(Task.id == task_id).first()
         if task:
             task.status = "success"
             task.progress = 1.0
             task.error_message = None
+            current_hash = _compute_session_content_hash(note) if note else ""
+            set_ready(db, session_id, "mindmap", content_hash=current_hash)
             db.commit()
         logger.info(
             "mind_map_task_success task_id=%s session_id=%s user_id=%s elapsed_ms=%s",
@@ -249,6 +259,7 @@ def _run_mind_map_task(task_id: str, session_id: str, user_id: str):
             task.progress = 1.0
             task.error_message = str(e)
             db.commit()
+        set_error(db, session_id, "mindmap", error_message=str(e))
         logger.exception(
             "mind_map_task_failed task_id=%s session_id=%s user_id=%s",
             task_id,

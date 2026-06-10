@@ -1,17 +1,17 @@
-import { useParams, useNavigate } from 'react-router-dom';
+import { useParams, useNavigate, useLocation } from 'react-router-dom';
 import { toast } from 'sonner';
 import {
   ArrowLeft, Play, Pause, ChevronUp, ChevronDown, Edit3, Loader2, AlertCircle, ImagePlus,
   X, FileText, Square, Download, Bold, List, Share2, Trash2, Mic, MicOff, Search,
   ChevronDown as ChevronDownIcon, Database, RefreshCw, BrainCircuit, Copy, Check,
-  ClipboardCheck, CircleDot
+  ClipboardCheck, CircleDot, Sparkles
 } from 'lucide-react';
 import { useStore } from '@/store/useStore';
 import { useState, useRef, useCallback, useEffect, useMemo } from 'react';
 import { getProfile, getAvatarUrl } from '@/services/auth';
 import ThemeToggle from '@/components/ThemeToggle';
 import RichTextEditor from '@/components/RichTextEditor';
-import { API_BASE, deleteAudio, uploadPPT, insertPPTIntoTranscript, uploadAudio, getMediaUrl, fetchNotebookDetail, fetchSessionById, enableShare, disableShare, getShareStatus, rebuildSessionVectorIndex, getSessionVectorStatus, searchVectors, VectorIndexStatus, VectorSearchResult, getSessionMindMap, generateSessionMindMap, deleteSessionMindMap, MindMapStatus, MindMapNode, MindMapData, getSessionQuizzes, generateSessionQuiz, getQuizDetail, submitQuizAnswers, deleteQuiz, getQuizBankStatus, rebuildQuizBank, QuizListItem, QuizDetail, QuizQuestion, QuizBankStatus, runAllAgents, getAgentTasks, fetchNote, restructureTranscript } from '@/services/api';
+import { API_BASE, deleteAudio, uploadPPT, insertPPTIntoTranscript, uploadAudio, getMediaUrl, fetchNotebookDetail, fetchSessionById, enableShare, disableShare, getShareStatus, rebuildSessionVectorIndex, getSessionMindMap, generateSessionMindMap, deleteSessionMindMap, MindMapStatus, MindMapNode, MindMapData, getSessionQuizzes, generateSessionQuiz, getQuizDetail, submitQuizAnswers, deleteQuiz, getQuizBankStatus, rebuildQuizBank, QuizListItem, QuizDetail, QuizQuestion, QuizBankStatus, runAllAgents, fetchNote } from '@/services/api';
 import { sanitizeHTML } from '@/lib/sanitize';
 import { layoutFromNoteParts } from '@/lib/noteLayout';
 import type { Notebook, Session } from '@/types';
@@ -21,8 +21,17 @@ import { useTranscript, StudentNote } from './useTranscript';
 import { usePPT } from './usePPT';
 import { useNotes } from './useNotes';
 import { useExport } from './useExport';
+import { useShare } from './hooks/useShare';
+import { useVectorIndex } from './hooks/useVectorIndex';
+import { useRAG } from './hooks/useRAG';
+import { useMindMap } from './hooks/useMindMap';
+import { useQuiz } from './hooks/useQuiz';
+import { useAudioUpload } from './hooks/useAudioUpload';
+import { useAutoGenerate } from './hooks/useAutoGenerate';
+import { useRestructure } from './hooks/useRestructure';
+import { useProcessingStatus } from './hooks/useProcessingStatus';
 import MindMapCanvas, { computeDefaultExpanded } from './MindMapCanvas';
-import type { ContentBlock } from '@/services/api';
+import type { ContentBlock, RAGSource } from '@/services/api';
 
 const TEXT_COLORS = [
   { name: '红色', value: '#ef4444' },
@@ -34,6 +43,7 @@ const TEXT_COLORS = [
 export default function NoteDetail() {
   const { id, sessionId } = useParams<{ id: string; sessionId: string }>();
   const navigate = useNavigate();
+  const location = useLocation();
   const { notebooks, sessions } = useStore();
 
   const notebook = notebooks.find((n) => n.id === id);
@@ -74,81 +84,113 @@ export default function NoteDetail() {
   const notesHook = useNotes();
   const transcript = useTranscript(sessionId, recording.state.isRecording, ppt.state.slides);
   const exportTools = useExport(displaySession, displayNotebook);
+  const processing = useProcessingStatus(sessionId);
+
+  const share = useShare();
+  const vectorIndex = useVectorIndex(sessionId, processing.processingStatus);
+  const rag = useRAG();
+  const mindMap = useMindMap(sessionId, processing.processingStatus);
+  const quiz = useQuiz(sessionId, processing.processingStatus);
+  const audioUpload = useAudioUpload(sessionId);
+  const autoGen = useAutoGenerate(sessionId, processing.processingStatus);
+  const restructure = useRestructure();
 
   const [isLoading, setIsLoading] = useState(true);
-  const [showShareModal, setShowShareModal] = useState(false);
-  const [shareLink, setShareLink] = useState('');
-  const [shareToken, setShareToken] = useState('');
-  const [shareEnabled, setShareEnabled] = useState(false);
-  const [shareLoading, setShareLoading] = useState(false);
-  const [shareExpiresAt, setShareExpiresAt] = useState<string | null>(null);
-  const [shareMaxViews, setShareMaxViews] = useState<number | null>(null);
-  const [shareViewCount, setShareViewCount] = useState(0);
-  const [shareExpiresIn, setShareExpiresIn] = useState<number | ''>('');
-  const [shareMaxViewsInput, setShareMaxViewsInput] = useState<number | ''>('');
-  const [copySuccess, setCopySuccess] = useState(false);
   const [showLeftPanel, setShowLeftPanel] = useState(false); // tablet sidebar
-  const [isUploadingAudio, setIsUploadingAudio] = useState(false);
-  const [audioUploadStatus, setAudioUploadStatus] = useState<string | null>(null);
-  const [audioUploadError, setAudioUploadError] = useState<string | null>(null);
-  const [aiCorrectionStatus, setAiCorrectionStatus] = useState<{ type: 'idle' | 'corrected' | 'local' | 'error'; message?: string }>({ type: 'idle' });
+  const [aiCorrectionStatus, setAiCorrectionStatus] = useState<{ type: 'idle' | 'processing' | 'corrected' | 'local' | 'error'; message?: string }>({ type: 'idle' });
 
-  // Auto-generate study materials setting (default true)
-  const [autoGenerateStudyMaterials, setAutoGenerateStudyMaterials] = useState(() => {
-    try {
-      const raw = localStorage.getItem('nootbook_auto_generate_study_materials');
-      return raw === null ? true : JSON.parse(raw);
-    } catch {
-      return true;
-    }
-  });
-  useEffect(() => {
-    localStorage.setItem('nootbook_auto_generate_study_materials', JSON.stringify(autoGenerateStudyMaterials));
-  }, [autoGenerateStudyMaterials]);
-
-  // Auto-generate toast
-  const [autoGenerateToast, setAutoGenerateToast] = useState<string | null>(null);
-
-  // Restructure state
-  const [isRestructuring, setIsRestructuring] = useState(false);
+  const isPendingCorrectionMessage = (message?: string | null) => {
+    if (!message) return false;
+    return message.includes('等待统一 AI 整理') || message.includes('正在统一 AI 整理');
+  };
   const [showRawDebug, setShowRawDebug] = useState(false);
-
-  // Vector index state
-  const [vectorStatus, setVectorStatus] = useState<VectorIndexStatus | null>(null);
-  const [isRebuilding, setIsRebuilding] = useState(false);
-  const [showSearch, setShowSearch] = useState(false);
-  const [searchQuery, setSearchQuery] = useState('');
-  const [searchResults, setSearchResults] = useState<VectorSearchResult[]>([]);
-  const [isSearching, setIsSearching] = useState(false);
-  const [searchScope, setSearchScope] = useState<'session' | 'notebook'>('session');
-  const [searchError, setSearchError] = useState<string | null>(null);
-
-  // Mind map state
-  const [showMindMap, setShowMindMap] = useState(false);
-  const [mindMapStatus, setMindMapStatus] = useState<MindMapStatus | null>(null);
-  const [isGeneratingMindMap, setIsGeneratingMindMap] = useState(false);
-  const [selectedMindMapNode, setSelectedMindMapNode] = useState<MindMapNode | null>(null);
-  const [expandedNodes, setExpandedNodes] = useState<Set<string>>(new Set());
-  const [copyMindMapSuccess, setCopyMindMapSuccess] = useState(false);
-
-  // Quiz state
-  const [showQuiz, setShowQuiz] = useState(false);
-  const [quizList, setQuizList] = useState<QuizListItem[]>([]);
-  const [activeQuiz, setActiveQuiz] = useState<QuizDetail | null>(null);
-  const [isGeneratingQuiz, setIsGeneratingQuiz] = useState(false);
-  const [quizAnswers, setQuizAnswers] = useState<Record<string, string>>({});
-  const [quizSubmitted, setQuizSubmitted] = useState(false);
-  const [quizError, setQuizError] = useState<string | null>(null);
-  const [bankStatus, setBankStatus] = useState<QuizBankStatus | null>(null);
-  const [isRebuildingBank, setIsRebuildingBank] = useState(false);
-  const bankPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
-
   const fileInputRef = useRef<HTMLInputElement>(null);
   const transcriptEditRef = useRef<HTMLDivElement>(null);
   const noteEditRef = useRef<HTMLDivElement>(null);
   const activeTextElRef = useRef<HTMLDivElement | null>(null);
   const lastSentenceIdxRef = useRef(0);
   const paragraphContainerRef = useRef<HTMLDivElement>(null);
+
+  const getRagSourceTypeLabel = useCallback((source: RAGSource) => {
+    const rawType = source.source_type === 'layout'
+      ? String(source.metadata?.block_type || source.source_type)
+      : source.source_type;
+    if (rawType === 'ppt') return 'PPT';
+    if (rawType === 'transcript') return '转写';
+    if (rawType === 'note') return '笔记';
+    return '资料';
+  }, []);
+
+  const highlightTranscriptSnippet = useCallback((snippet?: string | null) => {
+    const container = paragraphContainerRef.current;
+    if (!container || !snippet) return false;
+    const normalize = (value: string) => value.replace(/\s+/g, '').toLowerCase();
+    const target = normalize(snippet).slice(0, 80);
+    if (!target) return false;
+
+    const candidates = Array.from(container.children) as HTMLElement[];
+    const targetEl = candidates.find((el) => normalize(el.textContent || '').includes(target));
+    if (!targetEl) return false;
+
+    targetEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    targetEl.classList.add('ring-2', 'ring-violet-300', 'bg-violet-50', 'dark:bg-violet-900/20');
+    window.setTimeout(() => {
+      targetEl.classList.remove('ring-2', 'ring-violet-300', 'bg-violet-50', 'dark:bg-violet-900/20');
+    }, 3000);
+    return true;
+  }, []);
+
+  const handleRagSourceClick = useCallback((source: RAGSource, closePanel?: () => void) => {
+    closePanel?.();
+    if (source.session_id && source.session_id !== sessionId) {
+      navigate(`/subject/${source.notebook_id}/session/${source.session_id}`, { state: { ragSource: source } });
+      return;
+    }
+
+    const pageNumber = source.page == null ? null : Number(source.page);
+    const typeLabel = getRagSourceTypeLabel(source);
+    if (typeLabel === 'PPT' && Number.isFinite(pageNumber) && pageNumber! > 0) {
+      ppt.actions.setActiveSlideIndex(pageNumber! - 1);
+      return;
+    }
+
+    window.setTimeout(() => {
+      const located = highlightTranscriptSnippet(source.snippet);
+      if (!located) toast.info('已找到来源，但当前页面没有可精确定位的文本块');
+    }, 200);
+  }, [getRagSourceTypeLabel, highlightTranscriptSnippet, navigate, ppt.actions, sessionId]);
+
+  const renderRagSourceCards = useCallback((closePanel?: () => void) => (
+    <div className="space-y-2">
+      {rag.state.ragSources.map((source, index) => (
+        <button
+          key={source.chunk_id}
+          onClick={() => handleRagSourceClick(source, closePanel)}
+          className="w-full text-left rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50/80 dark:bg-slate-900/30 px-3 py-2 hover:border-violet-200 hover:bg-violet-50/60 dark:hover:bg-violet-900/20 transition-colors"
+        >
+          <div className="flex items-center gap-2 mb-1">
+            <span className="text-[10px] font-semibold text-violet-600 dark:text-violet-300 bg-violet-100 dark:bg-violet-900/40 rounded-full px-2 py-0.5">
+              [{index + 1}] {getRagSourceTypeLabel(source)}
+            </span>
+            <span className="text-[10px] text-slate-400 truncate">{source.session_title}</span>
+            {source.page != null && <span className="text-[10px] text-slate-400">第 {source.page} 页</span>}
+            <span className="ml-auto text-[10px] text-slate-400">{Math.round(source.score * 100)}%</span>
+          </div>
+          <p className="text-xs text-slate-600 dark:text-slate-300 leading-relaxed line-clamp-2">{source.snippet}</p>
+        </button>
+      ))}
+    </div>
+  ), [getRagSourceTypeLabel, handleRagSourceClick, rag.state.ragSources]);
+
+  useEffect(() => {
+    const source = (location.state as { ragSource?: RAGSource } | null)?.ragSource;
+    if (!source || source.session_id !== sessionId) return;
+    const timer = window.setTimeout(() => {
+      handleRagSourceClick(source);
+      navigate(location.pathname, { replace: true, state: null });
+    }, 800);
+    return () => window.clearTimeout(timer);
+  }, [handleRagSourceClick, location.pathname, location.state, navigate, sessionId]);
 
   // ---- Load history ----
   // Notes & PPT are restored reactively when the transcript hook finishes its
@@ -179,8 +221,10 @@ export default function NoteDetail() {
       const lastEntry = sorted[sorted.length - 1];
       if (lastEntry?.is_ai_corrected) {
         setAiCorrectionStatus({ type: 'corrected' });
-      } else if (lastEntry?.correction_error) {
+      } else if (lastEntry?.correction_error && !isPendingCorrectionMessage(lastEntry.correction_error)) {
         setAiCorrectionStatus({ type: 'error', message: lastEntry.correction_error });
+      } else if (lastEntry?.correction_error && isPendingCorrectionMessage(lastEntry.correction_error)) {
+        setAiCorrectionStatus({ type: 'local' });
       } else if (lastEntry?.is_corrected === false) {
         setAiCorrectionStatus({ type: 'local' });
       }
@@ -197,7 +241,7 @@ export default function NoteDetail() {
             if (blocks.blocks?.some((b: ContentBlock) => b.type === 'image')) {
               transcript.actions.updateContentBlocks(blocks.blocks, false, false);
             }
-          } catch {}
+          } catch { /* ignore */ }
         }, 500);
       }
     }
@@ -206,7 +250,7 @@ export default function NoteDetail() {
 
   // ---- Auto-save ----
   useEffect(() => {
-    if (!sessionId || !transcript.state.isLoaded || !transcript.state.hasLocalChanges || isUploadingAudio) return;
+    if (!sessionId || !transcript.state.isLoaded || !transcript.state.hasLocalChanges || audioUpload.state.isUploadingAudio) return;
     const timer = setTimeout(() => {
       transcript.actions.saveContent(notesHook.state.notes);
     }, 3000);
@@ -219,17 +263,28 @@ export default function NoteDetail() {
     transcript.state.contentBlocks,
     notesHook.state.notes,
     transcript.actions.saveContent,
-    isUploadingAudio,
+    audioUpload.state.isUploadingAudio,
   ]);
 
   const workflowStatus = useMemo(() => {
+    const stages = processing.processingStatus?.stages;
     if (ppt.state.isUploadingPPT) return { tone: 'blue', text: '正在上传并解析 PPT' };
-    if (isUploadingAudio) return { tone: 'blue', text: audioUploadStatus || '正在上传录音并转写' };
+    if (audioUpload.state.isUploadingAudio) return { tone: 'blue', text: audioUpload.state.audioUploadStatus || '正在上传录音并转写' };
     if (recording.state.isProcessing) return { tone: 'blue', text: '正在初始化录音设备' };
     if (recording.state.isRecording && recording.state.isPaused) return { tone: 'amber', text: '录音已暂停' };
     if (recording.state.isRecording) return { tone: 'red', text: `录音中 ${recording.state.currentTime}` };
-    if (transcript.state.isAiRestructuring) return { tone: 'violet', text: '正在整理转写并匹配 PPT' };
-    if (transcript.state.isTranscribing) return { tone: 'blue', text: '正在等待转写结果' };
+    if (stages?.upload_transcribe?.status === 'running') return { tone: 'blue', text: stages.upload_transcribe.message || '正在上传录音并转写' };
+    if (stages?.recording_finalize?.status === 'running') return { tone: 'blue', text: '正在整理录音...' };
+    if (stages?.transcript_finalize?.status === 'running') return { tone: 'violet', text: '正在统一 AI 整理...' };
+    if (stages?.vector_index?.status === 'running') return { tone: 'blue', text: '正在建立知识索引...' };
+    if (stages?.summary?.status === 'running' || stages?.mindmap?.status === 'running' || stages?.quiz_bank?.status === 'running') return { tone: 'blue', text: autoGen.state.autoGenerateToast || '正在生成学习资料...' };
+    if (stages?.transcript_finalize?.status === 'error') return { tone: 'red', text: stages.transcript_finalize.error_message || '整理失败' };
+    if (stages?.transcript_finalize?.status === 'fallback') return { tone: 'amber', text: '已使用本地整理稿' };
+    if (stages?.upload_transcribe?.status === 'error') return { tone: 'red', text: '上传转写失败' };
+    if (stages?.recording_finalize?.status === 'error') return { tone: 'red', text: '录音整理失败' };
+    if (stages?.vector_index?.status === 'error') return { tone: 'red', text: '知识索引建立失败' };
+    if (stages?.mindmap?.status === 'error' || stages?.quiz_bank?.status === 'error') return { tone: 'red', text: '学习资料生成失败，可手动重试' };
+    if (autoGen.state.autoGenerateToast?.startsWith('正在')) return { tone: 'blue', text: autoGen.state.autoGenerateToast };
     if (transcript.state.isPptMatching) return { tone: 'blue', text: '正在匹配 PPT 页面' };
     if (transcript.state.saveStatus === 'saving') return { tone: 'blue', text: '正在自动保存' };
     if (transcript.state.saveStatus === 'error') return { tone: 'red', text: transcript.state.saveError || '保存失败' };
@@ -241,17 +296,17 @@ export default function NoteDetail() {
     }
     return { tone: 'slate', text: '准备记录' };
   }, [
-    isUploadingAudio,
-    audioUploadStatus,
+    processing.processingStatus?.stages,
+    audioUpload.state.isUploadingAudio,
+    audioUpload.state.audioUploadStatus,
     ppt.state.isUploadingPPT,
     ppt.state.uploadMessage,
     recording.state.currentTime,
     recording.state.isPaused,
     recording.state.isProcessing,
     recording.state.isRecording,
-    transcript.state.isAiRestructuring,
+    autoGen.state.autoGenerateToast,
     transcript.state.isPptMatching,
-    transcript.state.isTranscribing,
     transcript.state.lastSaveTime,
     transcript.state.pptMatchMessage,
     transcript.state.saveError,
@@ -266,7 +321,7 @@ export default function NoteDetail() {
     violet: 'bg-violet-50 text-violet-700 border-violet-200 dark:bg-violet-900/20 dark:text-violet-300 dark:border-violet-800',
     slate: 'bg-slate-50 text-slate-600 border-slate-200 dark:bg-slate-800/60 dark:text-slate-300 dark:border-slate-700',
   }[workflowStatus.tone];
-  const isLiveTranscriptMode = recording.state.isRecording || recording.state.isProcessing;
+  const isLiveTranscriptMode = recording.state.isRecording || recording.state.isProcessing || audioUpload.state.isUploadingAudio;
   // Has PPT blocks with image: show them even during recording
   const hasPptImageBlocks = transcript.state.contentBlocks.some(b => b.type === 'image');
 
@@ -323,69 +378,9 @@ export default function NoteDetail() {
   };
 
   // ---- Share ----
-  const handleShareSession = async () => {
-    if (!sessionId) return;
-    setShowShareModal(true);
-    setShareLoading(true);
-    try {
-      const status = await getShareStatus(sessionId);
-      if (status.share_enabled && status.share_url) {
-        setShareEnabled(true);
-        setShareToken(status.share_token || '');
-        setShareLink(`${window.location.origin}${status.share_url}`);
-        setShareExpiresAt(status.share_expires_at || null);
-        setShareMaxViews(status.share_max_views ?? null);
-        setShareViewCount(status.share_view_count || 0);
-      } else {
-        const expiresIn = typeof shareExpiresIn === 'number' && shareExpiresIn > 0 ? shareExpiresIn : undefined;
-        const maxViews = typeof shareMaxViewsInput === 'number' && shareMaxViewsInput > 0 ? shareMaxViewsInput : undefined;
-        const result = await enableShare(sessionId, expiresIn, maxViews);
-        setShareEnabled(true);
-        setShareToken(result.share_token);
-        setShareLink(`${window.location.origin}${result.share_url}`);
-        setShareExpiresAt(result.share_expires_at || null);
-        setShareMaxViews(result.share_max_views ?? null);
-        setShareViewCount(0);
-        toast.success('分享已开启');
-      }
-    } catch (err: any) {
-      setShareEnabled(false);
-      setShareLink('');
-      setShareToken('');
-      setShareExpiresAt(null);
-      setShareMaxViews(null);
-      setShareViewCount(0);
-      toast.error(err.message || '开启分享失败');
-    } finally {
-      setShareLoading(false);
-    }
-  };
 
-  const handleDisableShare = async () => {
-    if (!sessionId || !window.confirm('关闭分享后，已分享的链接将失效。确定关闭？')) return;
-    setShareLoading(true);
-    try {
-      await disableShare(sessionId);
-      setShareEnabled(false);
-      setShareLink('');
-      setShareToken('');
-      setShareExpiresAt(null);
-      setShareMaxViews(null);
-      setShareViewCount(0);
-      setShareExpiresIn('');
-      setShareMaxViewsInput('');
-    } catch (err: any) {
-      toast.error(err.message || "关闭分享失败");
-    } finally {
-      setShareLoading(false);
-    }
-  };
 
   // ---- Vector Index ----
-  useEffect(() => {
-    if (!sessionId) return;
-    getSessionVectorStatus(sessionId).then(setVectorStatus).catch(() => {});
-  }, [sessionId]);
 
   useEffect(() => {
     if (!transcript.state.hasLocalChanges) return;
@@ -397,282 +392,14 @@ export default function NoteDetail() {
     return () => window.removeEventListener('beforeunload', handleBeforeUnload);
   }, [transcript.state.hasLocalChanges]);
 
-  // ---- Mind Map ----
-  useEffect(() => {
-    if (!sessionId || !showMindMap) return;
-    getSessionMindMap(sessionId).then(setMindMapStatus).catch((err: any) => {
-      setMindMapStatus({ session_id: sessionId, status: 'error', mind_map: null, error: err?.message || '加载知识导图失败' });
-    });
-  }, [sessionId, showMindMap]);
 
-  useEffect(() => {
-    if (!sessionId || !showMindMap || mindMapStatus?.status !== 'generating') return;
-    const timer = setInterval(() => {
-      getSessionMindMap(sessionId).then(setMindMapStatus).catch((err: any) => {
-        setMindMapStatus(prev => prev ? { ...prev, status: 'error', error: err?.message || '获取生成状态失败' } : { session_id: sessionId, status: 'error', mind_map: null, error: '获取生成状态失败' });
-      });
-    }, 2500);
-    return () => clearInterval(timer);
-  }, [sessionId, showMindMap, mindMapStatus?.status]);
 
-  useEffect(() => {
-    if (mindMapStatus?.status === 'ready' && mindMapStatus.mind_map?.nodes && expandedNodes.size === 0) {
-      setExpandedNodes(computeDefaultExpanded(mindMapStatus.mind_map.nodes));
-    }
-  }, [mindMapStatus?.status, mindMapStatus?.mind_map, expandedNodes.size]);
 
-  const handleGenerateMindMap = async (force = false) => {
-    if (!sessionId) return;
-    setIsGeneratingMindMap(true);
-    try {
-      const result = await generateSessionMindMap(sessionId, force);
-      setMindMapStatus(result);
-      // Expand all top-level nodes by default
-      if (result.status === 'ready' && result.mind_map?.nodes) {
-        setExpandedNodes(new Set(result.mind_map.nodes.map(n => n.id)));
-      }
-    } catch (err: any) {
-      setMindMapStatus(prev => prev ? { ...prev, status: 'error', error: err.message || '生成失败' } : { session_id: sessionId, status: 'error', mind_map: null, error: err.message || '生成失败' });
-    } finally {
-      setIsGeneratingMindMap(false);
-    }
-  };
 
-  const handleDeleteMindMap = async () => {
-    if (!sessionId || !window.confirm('确定要删除知识导图吗？')) return;
-    try {
-      await deleteSessionMindMap(sessionId);
-      setMindMapStatus({ session_id: sessionId, status: 'not_generated', mind_map: null, error: null });
-      setSelectedMindMapNode(null);
-    } catch (err: any) {
-      setMindMapStatus(prev => prev ? { ...prev, status: 'error', error: err?.message || '删除导图失败' } : { session_id: sessionId, status: 'error', mind_map: null, error: '删除导图失败' });
-    }
-  };
 
-  const handleCopyMindMapOutline = () => {
-    if (!mindMapStatus?.mind_map) return;
-    const lines: string[] = [];
-    const walk = (nodes: MindMapNode[], depth: number) => {
-      for (const node of nodes) {
-        lines.push('  '.repeat(depth) + '- ' + node.title);
-        if (node.children?.length) walk(node.children, depth + 1);
-      }
-    };
-    lines.push('# ' + mindMapStatus.mind_map.title);
-    if (mindMapStatus.mind_map.summary) lines.push(mindMapStatus.mind_map.summary);
-    walk(mindMapStatus.mind_map.nodes, 0);
-    navigator.clipboard.writeText(lines.join('\n')).then(() => { setCopyMindMapSuccess(true); setTimeout(() => setCopyMindMapSuccess(false), 2000); }).catch(() => {
-      setMindMapStatus(prev => prev ? { ...prev, error: '复制失败，请检查浏览器剪贴板权限' } : prev);
-    });
-  };
 
-  const toggleNodeExpand = (nodeId: string) => {
-    setExpandedNodes(prev => {
-      const next = new Set(prev);
-      if (next.has(nodeId)) next.delete(nodeId); else next.add(nodeId);
-      return next;
-    });
-  };
 
-  const handleMindMapSourceClick = (source: { source_type: string; page?: number | null; block_id?: string; snippet?: string }) => {
-    if (source.source_type === 'ppt' && source.page != null) {
-      ppt.actions.setActiveSlideIndex(source.page - 1);
-      return;
-    }
-    if ((source.source_type === 'transcript' || source.source_type === 'note') && source.snippet) {
-      setShowMindMap(false);
-      setTimeout(() => {
-        const container = paragraphContainerRef.current;
-        if (!container) return;
-        const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
-        const lowerSnippet = source.snippet!.toLowerCase();
-        let node: Text | null;
-        while ((node = walker.nextNode() as Text | null)) {
-          if (node.textContent?.toLowerCase().includes(lowerSnippet)) {
-            const el = node.parentElement;
-            if (el) {
-              el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-              el.classList.add('bg-yellow-100', 'dark:bg-yellow-900/30', 'transition-colors');
-              setTimeout(() => {
-                el.classList.remove('bg-yellow-100', 'dark:bg-yellow-900/30', 'transition-colors');
-              }, 3000);
-            }
-            break;
-          }
-        }
-      }, 300);
-    }
-  };
 
-  // ---- Quiz ----
-  const loadQuizList = async () => {
-    if (!sessionId) return;
-    try {
-      const list = await getSessionQuizzes(sessionId);
-      setQuizList(list);
-    } catch { /* ignore */ }
-  };
-
-  const loadBankStatus = async () => {
-    if (!sessionId) return;
-    try {
-      const status = await getQuizBankStatus(sessionId);
-      setBankStatus(status);
-      return status;
-    } catch { /* ignore */ }
-    return null;
-  };
-
-  // Poll bank status while generating
-  const startBankPolling = () => {
-    if (bankPollRef.current) clearInterval(bankPollRef.current);
-    bankPollRef.current = setInterval(async () => {
-      const status = await loadBankStatus();
-      if (status && status.status !== 'generating') {
-        if (bankPollRef.current) clearInterval(bankPollRef.current);
-        bankPollRef.current = null;
-        setIsRebuildingBank(false);
-      }
-    }, 2000);
-  };
-
-  useEffect(() => {
-    if (sessionId && showQuiz) {
-      loadQuizList();
-      loadBankStatus();
-    }
-    return () => {
-      if (bankPollRef.current) {
-        clearInterval(bankPollRef.current);
-        bankPollRef.current = null;
-      }
-    };
-  }, [sessionId, showQuiz]);
-
-  const handleRebuildBank = async () => {
-    if (!sessionId) return;
-    setIsRebuildingBank(true);
-    setQuizError(null);
-    try {
-      await rebuildQuizBank(sessionId);
-      startBankPolling();
-    } catch (err: any) {
-      setQuizError(err?.message || '生成题库失败');
-      setIsRebuildingBank(false);
-    }
-  };
-
-  const handleGenerateQuiz = async () => {
-    if (!sessionId) return;
-    setIsGeneratingQuiz(true);
-    setQuizError(null);
-    try {
-      const result = await generateSessionQuiz(sessionId);
-      if ('status' in result && (result.status === 'generating' || result.status === 'stale')) {
-        // Bank not ready — start polling
-        setBankStatus(result as QuizBankStatus);
-        if (result.status === 'generating') {
-          startBankPolling();
-        } else {
-          // Need to trigger bank generation
-          await handleRebuildBank();
-        }
-        setIsGeneratingQuiz(false);
-        return;
-      }
-      // Quiz created successfully (no answers in response)
-      const q = result as { quiz_id: string; title: string; questions: Array<{ id: string; question: string; options: Array<{ id: string; text: string }> }> };
-      setActiveQuiz({
-        quiz_id: q.quiz_id,
-        title: q.title,
-        questions: q.questions.map(qq => ({ ...qq, options: qq.options.map(o => ({ id: o.id, text: o.text })) })),
-        generated_at: undefined,
-        submission: undefined,
-      });
-      setQuizAnswers({});
-      setQuizSubmitted(false);
-      await loadQuizList();
-    } catch (err: any) {
-      setQuizError(err?.message || '生成测验失败');
-    } finally {
-      setIsGeneratingQuiz(false);
-    }
-  };
-
-  const handleOpenQuiz = async (quizId: string, alreadySubmitted: boolean) => {
-    if (!sessionId) return;
-    try {
-      const detail = await getQuizDetail(sessionId, quizId);
-      setActiveQuiz(detail);
-      setQuizSubmitted(alreadySubmitted);
-      if (alreadySubmitted && detail.submission) {
-        setQuizAnswers(detail.submission.answers);
-      } else {
-        setQuizAnswers({});
-      }
-    } catch (err: any) {
-      setQuizError(err?.message || '加载测验失败');
-    }
-  };
-
-  const handleSubmitQuiz = async () => {
-    if (!sessionId || !activeQuiz) return;
-    try {
-      await submitQuizAnswers(sessionId, activeQuiz.quiz_id, quizAnswers);
-      // Reload detail to get full explanations
-      const detail = await getQuizDetail(sessionId, activeQuiz.quiz_id);
-      setActiveQuiz(detail);
-      setQuizSubmitted(true);
-      await loadQuizList();
-    } catch (err: any) {
-      setQuizError(err?.message || '提交失败');
-    }
-  };
-
-  const handleDeleteQuiz = async (quizId: string) => {
-    if (!sessionId || !window.confirm('确定要删除这次测验吗？')) return;
-    try {
-      await deleteQuiz(sessionId, quizId);
-      if (activeQuiz?.quiz_id === quizId) {
-        setActiveQuiz(null);
-        setQuizSubmitted(false);
-        setQuizAnswers({});
-      }
-      await loadQuizList();
-    } catch { /* ignore */ }
-  };
-
-  const handleRebuildIndex = async () => {
-    if (!sessionId) return;
-    setIsRebuilding(true);
-    try {
-      const result = await rebuildSessionVectorIndex(sessionId);
-      setVectorStatus({ session_id: sessionId, chunk_count: result.chunk_count, has_content: true, status: 'indexed' });
-    } catch (err: any) {
-      toast.error(err.message || "建立索引失败");
-    } finally {
-      setIsRebuilding(false);
-    }
-  };
-
-  const handleSearch = async () => {
-    if (!searchQuery.trim()) return;
-    setIsSearching(true);
-    setSearchError(null);
-    try {
-      const result = await searchVectors(
-        searchQuery,
-        searchScope === 'session' ? sessionId : undefined,
-        searchScope === 'notebook' ? displayNotebook?.id : undefined,
-      );
-      setSearchResults(result.results);
-    } catch (err: any) {
-      setSearchResults([]);
-      setSearchError(err?.message || '搜索失败，请稍后重试');
-    } finally {
-      setIsSearching(false);
-    }
-  };
 
   // ---- PPT ----
   const handlePPTClick = () => fileInputRef.current?.click();
@@ -684,235 +411,10 @@ export default function NoteDetail() {
     if (fileInputRef.current) fileInputRef.current.value = '';
   };
 
-  const audioInputRef = useRef<HTMLInputElement>(null);
-  const audioUploadAbortRef = useRef<(() => void) | null>(null);
 
-  const handleAudioUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    console.log('[handleAudioUpload] called', e.target.files?.[0]?.name);
-    const file = e.target.files?.[0];
-    if (!file || !sessionId) return;
 
-    setIsUploadingAudio(true);
-    setAudioUploadStatus('正在上传录音文件');
-    setAudioUploadError(null);
-    setAiCorrectionStatus({ type: 'idle' });
 
-    // Clear transcript before streaming new content
-    transcript.actions.clearDerivedTranscriptViews();
-    transcript.actions.clearStreamingTranscriptChunks();
-    transcript.actions.updateTranscriptText('', false);
 
-    const { abort } = uploadAudio(file, sessionId, {
-      onStatus: (message, segment, total) => {
-        if (message) setAudioUploadStatus(message);
-        else if (segment && total) setAudioUploadStatus(`正在识别第 ${segment}/${total} 段`);
-      },
-      onChunk: (text, segment, _segmentTotal, meta) => {
-        setAudioUploadStatus('正在写入转写结果');
-        if (text?.trim()) {
-          transcript.actions.appendTranscriptText(text.trim());
-        }
-        if (meta?.correctionError) {
-          setAudioUploadStatus(meta.correctionError);
-          setAiCorrectionStatus({ type: 'error', message: meta.correctionError });
-        } else if (meta?.isAiCorrected) {
-          setAiCorrectionStatus({ type: 'corrected' });
-        }
-      },
-      onDone: async (note) => {
-        setIsUploadingAudio(false);
-        setAudioUploadStatus(null);
-        transcript.actions.clearStreamingTranscriptChunks();
-        if (audioInputRef.current) audioInputRef.current.value = '';
-        audioUploadAbortRef.current = null;
-        // Use backend final display_text to replace transcript
-        if (note) {
-          const sorted = Array.isArray(note.transcript)
-            ? [...note.transcript].sort((a: any, b: any) => (a.chunk_index || 0) - (b.chunk_index || 0))
-            : [];
-          const lastEntry = sorted[sorted.length - 1];
-          if (lastEntry?.is_ai_corrected) {
-            setAiCorrectionStatus({ type: 'corrected' });
-          } else if (lastEntry?.correction_error) {
-            setAiCorrectionStatus({ type: 'error', message: lastEntry.correction_error });
-          } else {
-            setAiCorrectionStatus({ type: 'local' });
-          }
-          const hasFinal = sorted.some((c: any) => c.correction_stage === 'final');
-          const dbText = sorted
-            .map((c: any) => c.display_text || c.text || c.raw_text || '')
-            .filter(Boolean)
-            .join('\n\n')
-            .trim();
-          if (dbText) {
-            transcript.actions.receiveAiText(dbText, { force: true });
-          }
-          if (!hasFinal) {
-            const sentences = transcript.actions.parseSentencesWithTime(note);
-            if (sentences.length > 0) {
-              transcript.actions.setSentencesWithTime(sentences);
-            }
-          }
-          if (ppt.state.slides.length > 0 && sessionId) {
-            try {
-              const blocks = await insertPPTIntoTranscript(sessionId);
-              if (blocks.blocks?.some((b: ContentBlock) => b.type === 'image')) {
-                transcript.actions.updateContentBlocks(blocks.blocks, false, true);
-              }
-            } catch {}
-          }
-
-          // Auto-trigger study-material agents if enabled and AI correction succeeded
-          if (
-            autoGenerateStudyMaterials &&
-            lastEntry?.correction_stage === 'final' &&
-            lastEntry?.is_ai_corrected
-          ) {
-            setAutoGenerateToast('正在自动生成导图和题库...');
-            runAllAgents(sessionId, ['summary', 'mindmap', 'quiz']).then(() => {
-              pollAgentsUntilDone(sessionId);
-            }).catch((err: any) => {
-              setAutoGenerateToast('自动启动学习资料生成失败，可手动重试');
-              setTimeout(() => setAutoGenerateToast(null), 4000);
-              console.warn('Auto-run agents failed:', err);
-            });
-          } else if (
-            autoGenerateStudyMaterials &&
-            lastEntry?.correction_stage === 'final' &&
-            !lastEntry?.is_ai_corrected
-          ) {
-            setAutoGenerateToast('AI 整理未完成，暂不自动生成学习资料');
-            setTimeout(() => setAutoGenerateToast(null), 4000);
-          }
-        }
-      },
-      onError: (errMsg) => {
-        setAudioUploadError(errMsg || '录音上传失败，请确认格式或稍后重试');
-        setIsUploadingAudio(false);
-        setAudioUploadStatus(null);
-        if (audioInputRef.current) audioInputRef.current.value = '';
-        audioUploadAbortRef.current = null;
-      },
-    });
-
-    audioUploadAbortRef.current = abort;
-  };
-
-  const handleStopRecording = async () => {
-    await recording.actions.stopRecording(transcript.actions.receiveAiText);
-    // After recording stops and transcript is fetched, check auto-generate
-    if (!sessionId) return;
-    try {
-      const note = await fetchNote(sessionId);
-      if (!note?.transcript?.length) return;
-      const sorted = [...note.transcript].sort((a: any, b: any) => (a.chunk_index || 0) - (b.chunk_index || 0));
-      const lastEntry = sorted[sorted.length - 1];
-      if (
-        autoGenerateStudyMaterials &&
-        lastEntry?.correction_stage === 'final' &&
-        lastEntry?.is_ai_corrected
-      ) {
-        setAutoGenerateToast('正在自动生成导图和题库...');
-        try {
-          await runAllAgents(sessionId, ['summary', 'mindmap', 'quiz']);
-          pollAgentsUntilDone(sessionId);
-        } catch {
-          setAutoGenerateToast('自动启动学习资料生成失败，可手动重试');
-          setTimeout(() => setAutoGenerateToast(null), 4000);
-        }
-      } else if (
-        autoGenerateStudyMaterials &&
-        lastEntry?.correction_stage === 'final' &&
-        !lastEntry?.is_ai_corrected
-      ) {
-        setAutoGenerateToast('AI 整理未完成，暂不自动生成学习资料');
-        setTimeout(() => setAutoGenerateToast(null), 4000);
-      }
-    } catch {
-      // ignore fetch/agent errors on stop
-    }
-  };
-
-  const pollAgentsUntilDone = useCallback((sessionId: string) => {
-    const targetRoles = ['agent_summary', 'agent_mindmap', 'agent_quiz'];
-    let attempts = 0;
-    const maxAttempts = 60;
-
-    const tick = async () => {
-      attempts++;
-      try {
-        const status = await getAgentTasks(sessionId);
-        const agents = status.agents || [];
-        const relevant = agents.filter((a: any) => targetRoles.includes(a.task_type));
-        if (relevant.length === 0) {
-          // No tasks created yet, keep polling briefly
-          if (attempts < maxAttempts) {
-            setTimeout(tick, 2500);
-          } else {
-            setAutoGenerateToast(null);
-          }
-          return;
-        }
-        const allDone = relevant.every((a: any) => a.status === 'success' || a.status === 'error');
-        if (allDone) {
-          const anyError = relevant.some((a: any) => a.status === 'error');
-          if (anyError) {
-            setAutoGenerateToast('部分学习资料生成失败，可手动重试');
-          } else {
-            setAutoGenerateToast('导图和题库生成完成');
-          }
-          setTimeout(() => setAutoGenerateToast(null), 4000);
-          return;
-        }
-        if (attempts < maxAttempts) {
-          setTimeout(tick, 2500);
-        } else {
-          setAutoGenerateToast('学习资料生成时间较长，请稍后查看');
-          setTimeout(() => setAutoGenerateToast(null), 4000);
-        }
-      } catch {
-        if (attempts < maxAttempts) {
-          setTimeout(tick, 2500);
-        } else {
-          setAutoGenerateToast(null);
-        }
-      }
-    };
-
-    setTimeout(tick, 2500);
-  }, []);
-
-  const handleRestructure = async () => {
-    if (!sessionId) return;
-    setIsRestructuring(true);
-    try {
-      const note = await restructureTranscript(sessionId, true);
-      if (note?.transcript && note.transcript.length > 0) {
-        const sorted = [...note.transcript].sort((a: any, b: any) => (a.chunk_index || 0) - (b.chunk_index || 0));
-        const lastEntry = sorted[sorted.length - 1];
-        const dbText = sorted
-          .map((c: any) => c.display_text || c.text || '')
-          .filter(Boolean)
-          .join('\n\n')
-          .trim();
-        if (dbText) {
-          transcript.actions.receiveAiText(dbText, { force: true });
-        }
-        if (lastEntry?.is_ai_corrected) {
-          setAiCorrectionStatus({ type: 'corrected' });
-        } else if (lastEntry?.correction_error) {
-          setAiCorrectionStatus({ type: 'error', message: lastEntry.correction_error });
-        } else {
-          setAiCorrectionStatus({ type: 'local' });
-        }
-      }
-    } catch (err: any) {
-      console.error('Restructure failed:', err);
-      setAiCorrectionStatus({ type: 'error', message: err.message || '重新整理失败' });
-    } finally {
-      setIsRestructuring(false);
-    }
-  };
 
   if (isLoading) {
     return (
@@ -966,40 +468,40 @@ export default function NoteDetail() {
                 </div>
               )}
             </div>
-            <button onClick={handleShareSession} className="flex items-center gap-1 px-3 py-2 text-sm text-slate-500 hover:text-blue-600 hover:bg-blue-50 dark:hover:bg-blue-900/20 rounded-lg transition-colors" title="分享">
+            <button onClick={() => share.actions.handleShareSession(sessionId!, share.state.shareExpiresIn, share.state.shareMaxViewsInput)} className="flex items-center gap-1 px-3 py-2 text-sm text-slate-500 hover:text-blue-600 hover:bg-blue-50 dark:hover:bg-blue-900/20 rounded-lg transition-colors" title="分享">
               <Share2 className="w-3.5 h-3.5" />
             </button>
-            <button onClick={() => setShowSearch(!showSearch)} className={`flex items-center gap-1 px-3 py-2 text-sm rounded-lg transition-colors ${showSearch ? 'text-blue-600 bg-blue-50 dark:bg-blue-900/20' : 'text-slate-500 hover:text-blue-600 hover:bg-blue-50 dark:hover:bg-blue-900/20'}`} title="搜索">
+            <button onClick={() => { const willOpen = !rag.state.showSearch; rag.actions.setShowSearch(willOpen); if (willOpen) vectorIndex.actions.ensureIndexed(); }} className={`flex items-center gap-1 px-3 py-2 text-sm rounded-lg transition-colors ${rag.state.showSearch ? 'text-blue-600 bg-blue-50 dark:bg-blue-900/20' : 'text-slate-500 hover:text-blue-600 hover:bg-blue-50 dark:hover:bg-blue-900/20'}`} title="搜索">
               <Search className="w-3.5 h-3.5" />
             </button>
-            <button onClick={() => setShowMindMap(true)} className="flex items-center gap-1 px-3 py-2 text-sm text-slate-500 hover:text-purple-600 hover:bg-purple-50 dark:hover:bg-purple-900/20 rounded-lg transition-colors" title="知识导图">
+            <button onClick={() => { mindMap.actions.setShowMindMap(true); vectorIndex.actions.ensureIndexed(); }} className="flex items-center gap-1 px-3 py-2 text-sm text-slate-500 hover:text-purple-600 hover:bg-purple-50 dark:hover:bg-purple-900/20 rounded-lg transition-colors" title="知识导图">
               <BrainCircuit className="w-3.5 h-3.5" />
             </button>
-            <button onClick={() => { setShowQuiz(true); setActiveQuiz(null); setQuizSubmitted(false); setQuizAnswers({}); setQuizError(null); }} className="flex items-center gap-1 px-3 py-2 text-sm text-slate-500 hover:text-emerald-600 hover:bg-emerald-50 dark:hover:bg-emerald-900/20 rounded-lg transition-colors" title="测验">
+            <button onClick={() => { quiz.actions.setShowQuiz(true); quiz.actions.setActiveQuiz(null); quiz.actions.setQuizSubmitted(false); quiz.actions.setQuizAnswers({}); quiz.actions.setQuizError(null); vectorIndex.actions.ensureIndexed(); }} className="flex items-center gap-1 px-3 py-2 text-sm text-slate-500 hover:text-emerald-600 hover:bg-emerald-50 dark:hover:bg-emerald-900/20 rounded-lg transition-colors" title="测验">
               <ClipboardCheck className="w-3.5 h-3.5" />
             </button>
             <div className="flex items-center gap-1 px-2 py-1 text-xs rounded-lg bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700">
-              {vectorStatus?.status === 'indexed' ? (
+              {vectorIndex.state.vectorStatus?.status === 'indexed' ? (
                 <>
                   <Database className="w-3 h-3 text-green-500" />
-                  <span className="text-green-600 dark:text-green-400">已索引 {vectorStatus.chunk_count}条</span>
-                  <button onClick={handleRebuildIndex} disabled={isRebuilding} className="ml-1 text-slate-400 hover:text-blue-500" title="重建索引">
-                    <RefreshCw className={`w-3 h-3 ${isRebuilding ? 'animate-spin' : ''}`} />
+                  <span className="text-green-600 dark:text-green-400">已索引 {vectorIndex.state.vectorStatus.chunk_count}条</span>
+                  <button onClick={vectorIndex.actions.handleRebuildIndex} disabled={vectorIndex.state.isRebuilding} className="ml-1 text-slate-400 hover:text-blue-500" title="重建索引">
+                    <RefreshCw className={`w-3 h-3 ${vectorIndex.state.isRebuilding ? 'animate-spin' : ''}`} />
                   </button>
                 </>
-              ) : vectorStatus?.status === 'stale' ? (
+              ) : vectorIndex.state.vectorStatus?.status === 'stale' ? (
                 <>
                   <Database className="w-3 h-3 text-amber-500" />
                   <span className="text-amber-600 dark:text-amber-400">内容已变化</span>
-                  <button onClick={handleRebuildIndex} disabled={isRebuilding} className="ml-1 text-amber-500 hover:text-blue-500 font-medium" title="重建索引">
-                    {isRebuilding ? <Loader2 className="w-3 h-3 animate-spin" /> : '重建'}
+                  <button onClick={vectorIndex.actions.handleRebuildIndex} disabled={vectorIndex.state.isRebuilding} className="ml-1 text-amber-500 hover:text-blue-500 font-medium" title="重建索引">
+                    {vectorIndex.state.isRebuilding ? <Loader2 className="w-3 h-3 animate-spin" /> : '重建'}
                   </button>
                 </>
-              ) : vectorStatus?.status === 'not_indexed' ? (
+              ) : vectorIndex.state.vectorStatus?.status === 'not_indexed' ? (
                 <>
                   <Database className="w-3 h-3 text-slate-400" />
-                  <button onClick={handleRebuildIndex} disabled={isRebuilding} className="text-slate-500 hover:text-blue-500" title="建立索引">
-                    {isRebuilding ? <Loader2 className="w-3 h-3 animate-spin" /> : '建立索引'}
+                  <button onClick={vectorIndex.actions.handleRebuildIndex} disabled={vectorIndex.state.isRebuilding} className="text-slate-500 hover:text-blue-500" title="建立索引">
+                    {vectorIndex.state.isRebuilding ? <Loader2 className="w-3 h-3 animate-spin" /> : '建立索引'}
                   </button>
                 </>
               ) : (
@@ -1032,11 +534,31 @@ export default function NoteDetail() {
             </button>
             {ppt.state.slides.length > 0 && <span className="text-xs text-slate-400">{ppt.state.slides.length} 页</span>}
 
-            <input ref={audioInputRef} type="file" accept=".wav,.mp3,.webm,.m4a,.ogg,.flac" onChange={handleAudioUpload} className="hidden" />
-            <button onClick={() => { if (audioInputRef.current) audioInputRef.current.value = ''; audioInputRef.current?.click(); }} disabled={isUploadingAudio}
+            <input ref={audioUpload.refs.audioInputRef} type="file" multiple accept=".wav,.mp3,.webm,.m4a,.ogg,.flac" onChange={(e) => {
+                  const files = e.target.files;
+                  if (!files || files.length === 0) return;
+                  audioUpload.actions.handleAudioUpload(Array.from(files), {
+                    clearDerivedTranscriptViews: transcript.actions.clearDerivedTranscriptViews,
+                    clearStreamingTranscriptChunks: transcript.actions.clearStreamingTranscriptChunks,
+                    updateTranscriptText: transcript.actions.updateTranscriptText,
+                    appendTranscriptText: transcript.actions.appendTranscriptText,
+                    clearStreamingTranscriptChunksFinal: transcript.actions.clearStreamingTranscriptChunks,
+                    clearContentBlocks: transcript.actions.clearContentBlocks,
+                    scrollToBottom: () => {
+                      if (paragraphContainerRef.current) {
+                        paragraphContainerRef.current.scrollTop = paragraphContainerRef.current.scrollHeight;
+                      }
+                    },
+                  }, setAiCorrectionStatus);
+                }} className="hidden" />
+            <button onClick={() => { if (audioUpload.refs.audioInputRef.current) audioUpload.refs.audioInputRef.current.value = ''; audioUpload.refs.audioInputRef.current?.click(); }} disabled={audioUpload.state.isUploadingAudio}
               className="flex items-center gap-1 px-2.5 py-1.5 text-xs text-slate-600 dark:text-slate-300 bg-white dark:bg-slate-700 border border-slate-200 dark:border-slate-600 rounded-lg hover:border-green-300 hover:text-green-600 transition-all disabled:opacity-50">
-              {isUploadingAudio ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Mic className="w-3.5 h-3.5" />}
-              {isUploadingAudio ? '上传中...' : '上传录音'}
+              {audioUpload.state.isUploadingAudio ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Mic className="w-3.5 h-3.5" />}
+              {audioUpload.state.isUploadingAudio
+                ? (audioUpload.state.audioQueueProgress
+                  ? `上传中 ${audioUpload.state.audioQueueProgress.current}/${audioUpload.state.audioQueueProgress.total}`
+                  : '上传中...')
+                : '上传录音'}
             </button>
           </div>
 
@@ -1048,7 +570,9 @@ export default function NoteDetail() {
                 </button>
               ) : recording.state.isError ? (
                 <button onClick={() => {
-                  if (recording.state.isRecording) handleStopRecording();
+                  if (recording.state.isRecording) {
+                    recording.actions.stopRecording(transcript.actions.receiveAiText);
+                  }
                 }}
                   className="w-9 h-9 rounded-full bg-gradient-to-br from-red-500 to-red-600 text-white flex items-center justify-center shadow-lg hover:shadow-xl transition-all hover:scale-105 active:scale-95">
                   <AlertCircle className="w-4 h-4" />
@@ -1098,7 +622,26 @@ export default function NoteDetail() {
             )}
 
             {recording.state.isRecording && (
-              <button onClick={handleStopRecording}
+              <button onClick={() => {
+                setAiCorrectionStatus({ type: 'processing', message: '正在统一 AI 整理...' });
+                recording.actions.stopRecording(transcript.actions.receiveAiText).then((result) => {
+                  const note = result?.note;
+                  if (note) {
+                    const sorted = [...note.transcript].sort((a: any, b: any) => (a.chunk_index || 0) - (b.chunk_index || 0));
+                    const lastEntry = sorted[sorted.length - 1];
+                    if (lastEntry?.is_ai_corrected) {
+                      setAiCorrectionStatus({ type: 'corrected' });
+                    } else if (lastEntry?.correction_error) {
+                      setAiCorrectionStatus({ type: 'error', message: lastEntry.correction_error });
+                    } else {
+                      setAiCorrectionStatus({ type: 'local' });
+                    }
+                  } else {
+                    setAiCorrectionStatus({ type: 'local' });
+                  }
+                  // Backend auto-triggers vector index and agents via processing status
+                });
+              }}
                 className="flex items-center gap-1 px-3 py-2 text-sm font-medium rounded-md bg-red-100 dark:bg-red-900/30 text-red-600 dark:text-red-400 hover:bg-red-200 dark:hover:bg-red-900/50 transition-colors min-h-[44px]">
                 <MicOff className="w-3.5 h-3.5" />
                 停止
@@ -1127,15 +670,15 @@ export default function NoteDetail() {
         </div>
       </div>
 
-      {autoGenerateToast && (
-        <div className={`flex-shrink-0 mx-4 mt-3 px-3 py-2 border rounded-xl flex items-center gap-2 text-xs ${autoGenerateToast.includes('自动生成') && !autoGenerateToast.includes('失败') ? 'bg-emerald-50 text-emerald-700 border-emerald-200 dark:bg-emerald-900/20 dark:text-emerald-300 dark:border-emerald-800' : 'bg-amber-50 text-amber-700 border-amber-200 dark:bg-amber-900/20 dark:text-amber-300 dark:border-amber-800'}`}>
-          {autoGenerateToast === '正在自动生成导图和题库...' ? <Loader2 className="w-3.5 h-3.5 animate-spin flex-shrink-0" /> : <AlertCircle className="w-3.5 h-3.5 flex-shrink-0" />}
-          <span className="flex-1">{autoGenerateToast}</span>
+      {autoGen.state.autoGenerateToast && (
+        <div className={`flex-shrink-0 mx-4 mt-3 px-3 py-2 border rounded-xl flex items-center gap-2 text-xs ${autoGen.state.autoGenerateToast.startsWith('正在') ? 'bg-blue-50 text-blue-700 border-blue-200 dark:bg-blue-900/20 dark:text-blue-300 dark:border-blue-800' : autoGen.state.autoGenerateToast.includes('失败') ? 'bg-red-50 text-red-700 border-red-200 dark:bg-red-900/20 dark:text-red-300 dark:border-red-800' : 'bg-amber-50 text-amber-700 border-amber-200 dark:bg-amber-900/20 dark:text-amber-300 dark:border-amber-800'}`}>
+          {autoGen.state.autoGenerateToast.startsWith('正在') ? <Loader2 className="w-3.5 h-3.5 animate-spin flex-shrink-0" /> : autoGen.state.autoGenerateToast.includes('失败') ? <AlertCircle className="w-3.5 h-3.5 text-red-500 flex-shrink-0" /> : <AlertCircle className="w-3.5 h-3.5 flex-shrink-0" />}
+          <span className="flex-1">{autoGen.state.autoGenerateToast}</span>
         </div>
       )}
 
       <div className={`flex-shrink-0 mx-4 mt-3 px-3 py-2 border rounded-xl flex items-center gap-2 text-xs ${statusClass}`}>
-        {(ppt.state.isUploadingPPT || isUploadingAudio || recording.state.isProcessing || transcript.state.isPptMatching || transcript.state.saveStatus === 'saving') && (
+        {(ppt.state.isUploadingPPT || audioUpload.state.isUploadingAudio || recording.state.isProcessing || transcript.state.isPptMatching || transcript.state.saveStatus === 'saving' || processing.processingStatus?.overall_status === 'running') && (
           <Loader2 className="w-3.5 h-3.5 animate-spin flex-shrink-0" />
         )}
         <span className="flex-1">{workflowStatus.text}</span>
@@ -1143,8 +686,8 @@ export default function NoteDetail() {
           <input
             type="checkbox"
             id="auto-generate"
-            checked={autoGenerateStudyMaterials}
-            onChange={(e) => setAutoGenerateStudyMaterials(e.target.checked)}
+            checked={autoGen.state.autoGenerateStudyMaterials}
+            onChange={(e) => autoGen.actions.setAutoGenerateStudyMaterials(e.target.checked)}
             className="w-3.5 h-3.5 rounded border-slate-300 text-blue-600 focus:ring-blue-500 cursor-pointer"
           />
           <label htmlFor="auto-generate" className="cursor-pointer select-none text-[10px] opacity-80 hover:opacity-100">自动生成</label>
@@ -1176,11 +719,11 @@ export default function NoteDetail() {
         </div>
       )}
 
-      {audioUploadError && (
+      {audioUpload.state.audioUploadError && (
         <div className="flex-shrink-0 mx-4 mt-3 p-3 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-xl flex items-start gap-2">
           <AlertCircle className="w-4 h-4 text-red-500 flex-shrink-0 mt-0.5" />
-          <div className="flex-1"><p className="text-xs text-red-600 dark:text-red-400">{audioUploadError}</p></div>
-          <button onClick={() => setAudioUploadError(null)}
+          <div className="flex-1"><p className="text-xs text-red-600 dark:text-red-400">{audioUpload.state.audioUploadError}</p></div>
+          <button onClick={() => audioUpload.actions.setAudioUploadError(null)}
             className="p-0.5 text-red-400 hover:text-red-600"><X className="w-3.5 h-3.5" /></button>
         </div>
       )}
@@ -1217,7 +760,7 @@ export default function NoteDetail() {
 
         {/* ---- Left (1/3): PPT on top, Notes on bottom ---- */}
         {showLeftPanel && <div onClick={() => setShowLeftPanel(false)} className="lg:hidden fixed inset-0 z-40 bg-black/50 backdrop-blur-sm" />}
-        <aside className={`${showLeftPanel ? 'fixed inset-y-0 left-0 z-50 w-80' : 'hidden'} lg:relative lg:flex w-5/12 flex-shrink-0 bg-white/60 dark:bg-slate-800/60 backdrop-blur-sm border-r border-slate-200/60 dark:border-slate-700/60 flex flex-col overflow-hidden`}>
+        <aside className={`${showLeftPanel ? 'fixed inset-y-0 left-0 z-50 w-80' : 'hidden'} lg:relative lg:flex lg:w-[400px] xl:w-[440px] flex-shrink-0 bg-white/60 dark:bg-slate-800/60 backdrop-blur-sm border-r border-slate-200/60 dark:border-slate-700/60 flex flex-col overflow-hidden`}>
           <div className="lg:hidden flex-shrink-0 px-3 py-2 flex items-center justify-between border-b border-slate-200/60 dark:border-slate-700/60">
             <div className="flex items-center gap-1.5">
               <FileText className="w-3.5 h-3.5 text-blue-500" />
@@ -1303,7 +846,7 @@ export default function NoteDetail() {
         </aside>
 
         {/* ---- Right (2/3): Transcript ---- */}
-        <main className="w-7/12 flex flex-col min-h-0 bg-white/40 dark:bg-slate-900/40 backdrop-blur-sm">
+        <main className="flex-1 flex flex-col min-h-0 bg-white/40 dark:bg-slate-900/40 backdrop-blur-sm">
           <div className="flex-shrink-0 px-4 md:px-6 py-4">
             <div className="flex items-center justify-between mb-3">
               <h2 className="text-sm font-semibold text-slate-600 dark:text-slate-300 flex items-center gap-2">
@@ -1312,22 +855,39 @@ export default function NoteDetail() {
                 {aiCorrectionStatus.type === 'corrected' && (
                   <span className="px-1.5 py-0.5 rounded text-[10px] font-medium bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400" title="DeepSeek AI 已纠正同音字、术语和格式">AI 已纠正</span>
                 )}
+                {aiCorrectionStatus.type === 'processing' && (
+                  <span className="px-1.5 py-0.5 rounded text-[10px] font-medium bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400 inline-flex items-center gap-1" title={aiCorrectionStatus.message || '正在调用 DeepSeek 整理转写'}>
+                    <Loader2 className="w-3 h-3 animate-spin" />
+                    AI 整理中
+                  </span>
+                )}
                 {aiCorrectionStatus.type === 'local' && (
                   <span className="px-1.5 py-0.5 rounded text-[10px] font-medium bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400" title="未配置 DeepSeek API 或 AI 纠正被拦截，使用本地规则整理">本地整理</span>
                 )}
                 {aiCorrectionStatus.type === 'error' && (
-                  <span className="px-1.5 py-0.5 rounded text-[10px] font-medium bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400" title={aiCorrectionStatus.message}>AI 纠正失败</span>
+                  <span
+                    className="px-1.5 py-0.5 rounded text-[10px] font-medium bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400 cursor-help"
+                    title={aiCorrectionStatus.message || 'AI 整理失败'}
+                  >
+                    {aiCorrectionStatus.message?.includes('删减')
+                      ? 'AI 纠正被拦截：疑似删减'
+                      : aiCorrectionStatus.message?.includes('超时')
+                        ? 'AI 纠正超时'
+                        : aiCorrectionStatus.message?.includes('未配置')
+                          ? '本地整理：未配置 API'
+                          : 'AI 纠正失败'}
+                  </span>
                 )}
               </h2>
               <div className="flex items-center gap-2">
                 {transcript.state.transcriptText && !recording.state.isRecording && (
                   <button
-                    onClick={handleRestructure}
-                    disabled={isRestructuring}
+                    onClick={() => restructure.actions.handleRestructure(sessionId, transcript.actions.receiveAiText, setAiCorrectionStatus)}
+                    disabled={restructure.state.isRestructuring}
                     className="px-2 py-1 text-[10px] font-medium rounded bg-blue-50 text-blue-600 hover:bg-blue-100 dark:bg-blue-900/20 dark:text-blue-400 dark:hover:bg-blue-900/30 disabled:opacity-50 flex items-center gap-1 transition-colors"
                     title="重新调用 DeepSeek 整理转写文本"
                   >
-                    {isRestructuring ? <Loader2 className="w-3 h-3 animate-spin" /> : <RefreshCw className="w-3 h-3" />}
+                    {restructure.state.isRestructuring ? <Loader2 className="w-3 h-3 animate-spin" /> : <RefreshCw className="w-3 h-3" />}
                     重新 AI 整理
                   </button>
                 )}
@@ -1463,6 +1023,7 @@ export default function NoteDetail() {
                           <div
                             contentEditable
                             suppressContentEditableWarning
+                            onPointerDown={(e) => { e.currentTarget.focus(); }}
                             onBlur={(e) => {
                               const blocks = transcript.state.contentBlocks;
                               const newBlocks = [...blocks];
@@ -1474,7 +1035,7 @@ export default function NoteDetail() {
                                 transcript.actions.updateContentBlocks(newBlocks);
                               }
                             }}
-                            className="p-4 text-sm text-slate-600 dark:text-slate-300 leading-relaxed whitespace-pre-line focus:outline-none min-h-[60px]"
+                            className="p-4 text-sm text-slate-600 dark:text-slate-300 leading-relaxed whitespace-pre-line focus:outline-none min-h-[60px] select-text cursor-text"
                             dangerouslySetInnerHTML={{ __html: sanitizeHTML(textBlock.content || '') as unknown as string }}
                           />
                         </div>
@@ -1486,6 +1047,7 @@ export default function NoteDetail() {
                           key={idx}
                           contentEditable
                           suppressContentEditableWarning
+                          onPointerDown={(e) => { e.currentTarget.focus(); }}
                           onBlur={(e) => {
                             const blocks = transcript.state.contentBlocks;
                             const newBlocks = [...blocks];
@@ -1497,7 +1059,7 @@ export default function NoteDetail() {
                               transcript.actions.updateContentBlocks(newBlocks);
                             }
                           }}
-                          className="w-full p-4 text-sm text-slate-600 dark:text-slate-300 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-600 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-200 leading-relaxed whitespace-pre-line min-h-[60px]"
+                          className="w-full p-4 text-sm text-slate-600 dark:text-slate-300 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-600 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-200 leading-relaxed whitespace-pre-line min-h-[60px] select-text cursor-text"
                           dangerouslySetInnerHTML={{ __html: sanitizeHTML(textBlock.content || '') as unknown as string }}
                         />
                       );
@@ -1526,6 +1088,7 @@ export default function NoteDetail() {
                               contentEditable
                               suppressContentEditableWarning
                               onFocus={(e) => { activeTextElRef.current = e.currentTarget; }}
+                          onPointerDown={(e) => { e.currentTarget.focus(); }}
                               onBlur={(e) => {
                                 const newBlocks = [...blocks];
                                 const html = e.currentTarget.innerHTML;
@@ -1537,8 +1100,8 @@ export default function NoteDetail() {
                               }}
                               className={
                                 isHeading
-                                  ? 'mt-6 first:mt-0 mb-2 text-sm font-semibold text-slate-800 dark:text-slate-100 focus:outline-none'
-                                  : 'mb-4 rounded-md border-l-2 border-transparent pl-3 pr-2 py-1 text-slate-600 dark:text-slate-300 whitespace-pre-wrap break-words hover:bg-slate-50/70 dark:hover:bg-slate-800/50 focus:bg-blue-50/50 dark:focus:bg-blue-900/10 focus:border-blue-300 focus:outline-none transition-colors'
+                                  ? 'mt-6 first:mt-0 mb-2 text-sm font-semibold text-slate-800 dark:text-slate-100 focus:outline-none select-text cursor-text'
+                                  : 'mb-4 rounded-md border-l-2 border-transparent pl-3 pr-2 py-1 text-slate-600 dark:text-slate-300 whitespace-pre-wrap break-words hover:bg-slate-50/70 dark:hover:bg-slate-800/50 focus:bg-blue-50/50 dark:focus:bg-blue-900/10 focus:border-blue-300 focus:outline-none select-text cursor-text transition-colors'
                               }
                               dangerouslySetInnerHTML={{ __html: sanitizeHTML(displayContent) as unknown as string }}
                             />
@@ -1611,6 +1174,7 @@ export default function NoteDetail() {
                           <div
                             contentEditable
                             suppressContentEditableWarning
+                            onPointerDown={(e) => { e.currentTarget.focus(); }}
                             onBlur={(e) => {
                               const newBlocks = [...blocks];
                               const textBlockIndex = blocks.indexOf(textBlock);
@@ -1621,7 +1185,7 @@ export default function NoteDetail() {
                                 transcript.actions.updateContentBlocks(newBlocks);
                               }
                             }}
-                            className="p-4 text-sm text-slate-600 dark:text-slate-300 leading-relaxed whitespace-pre-line focus:outline-none min-h-[60px]"
+                            className="p-4 text-sm text-slate-600 dark:text-slate-300 leading-relaxed whitespace-pre-line focus:outline-none min-h-[60px] select-text cursor-text"
                             dangerouslySetInnerHTML={{ __html: sanitizeHTML(textBlock.content || '') as unknown as string }}
                           />
                         </div>
@@ -1633,6 +1197,7 @@ export default function NoteDetail() {
                           key={idx}
                           contentEditable
                           suppressContentEditableWarning
+                          onPointerDown={(e) => { e.currentTarget.focus(); }}
                           onBlur={(e) => {
                             const newBlocks = [...blocks];
                             const textBlockIndex = blocks.indexOf(textBlock);
@@ -1643,7 +1208,7 @@ export default function NoteDetail() {
                               transcript.actions.updateContentBlocks(newBlocks);
                             }
                           }}
-                          className="w-full p-4 text-sm text-slate-600 dark:text-slate-300 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-600 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-200 leading-relaxed whitespace-pre-line min-h-[60px]"
+                          className="w-full p-4 text-sm text-slate-600 dark:text-slate-300 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-600 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-200 leading-relaxed whitespace-pre-line min-h-[60px] select-text cursor-text"
                           dangerouslySetInnerHTML={{ __html: sanitizeHTML(textBlock.content || '') as unknown as string }}
                         />
                       );
@@ -1663,7 +1228,7 @@ export default function NoteDetail() {
                   onFocus={() => {
                     activeTextElRef.current = transcriptEditRef.current;
                   }}
-                  placeholder={isUploadingAudio ? '正在识别上传录音，结果会逐段显示...' : '正在转录中，可直接编辑修改...'}
+                  placeholder={audioUpload.state.isUploadingAudio ? '正在识别上传录音，结果会逐段显示...' : '正在转录中，可直接编辑修改...'}
                   className="rich-text-editor w-full p-4 text-sm text-slate-600 dark:text-slate-300 bg-white dark:bg-slate-800 border border-blue-200 dark:border-blue-700 rounded-xl min-h-[200px] focus:outline-none focus:ring-2 focus:ring-blue-200 leading-relaxed whitespace-pre-wrap break-words"
                 />
                 {/* Partial text — temporary, not saved */}
@@ -1681,10 +1246,10 @@ export default function NoteDetail() {
                     正在聆听...
                   </div>
                 )}
-                {(recording.state.isProcessing || isUploadingAudio) && (
+                {(recording.state.isProcessing || audioUpload.state.isUploadingAudio) && (
                   <div className="flex items-center gap-2 text-slate-400 text-sm">
                     <Loader2 className="w-4 h-4 animate-spin" />
-                    {isUploadingAudio ? (audioUploadStatus || '正在识别上传录音...') : '正在处理录音...'}
+                    {audioUpload.state.isUploadingAudio ? (audioUpload.state.audioUploadStatus || '正在识别上传录音...') : '正在处理录音...'}
                   </div>
                 )}
               </div>
@@ -1692,15 +1257,15 @@ export default function NoteDetail() {
               /* 3) Empty state */
               <div className="flex flex-col items-center justify-center py-20 text-slate-400 dark:text-slate-500">
                 <div className="w-16 h-16 rounded-full bg-slate-100 dark:bg-slate-800 flex items-center justify-center mb-4">
-                  {isUploadingAudio ? (
+                  {audioUpload.state.isUploadingAudio ? (
                     <Loader2 className="w-6 h-6 text-blue-400 animate-spin" />
                   ) : (
                     <Mic className="w-6 h-6 text-slate-300 dark:text-slate-600" />
                   )}
                 </div>
-                <p className="text-sm">{isUploadingAudio ? '正在等待第一段转写' : '点击录制按钮开始录音'}</p>
+                <p className="text-sm">{audioUpload.state.isUploadingAudio ? '正在等待第一段转写' : '点击录制按钮开始录音'}</p>
                 <p className="text-xs mt-1 text-slate-300 dark:text-slate-600">
-                  {isUploadingAudio ? '识别结果会先显示原文，再由 AI 替换为整理稿' : '录音将实时转写，PPT 自动对齐插入'}
+                  {audioUpload.state.isUploadingAudio ? '识别结果会先显示原文，再由 AI 替换为整理稿' : '录音将实时转写，PPT 自动对齐插入'}
                 </p>
               </div>
             ) : transcript.state.transcriptText ? (
@@ -1759,7 +1324,8 @@ export default function NoteDetail() {
                         dangerouslySetInnerHTML={{ __html: sanitizeHTML(para.trim()) as unknown as string }}
                         onBlur={syncParagraphs}
                         onFocus={(e) => { activeTextElRef.current = e.currentTarget; }}
-                        className="w-full rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 px-4 py-3 text-sm text-slate-600 dark:text-slate-300 leading-7 whitespace-pre-wrap break-words shadow-sm outline-none transition-colors hover:border-slate-300 dark:hover:border-slate-600 focus:border-blue-300 dark:focus:border-blue-600 focus:ring-2 focus:ring-blue-100 dark:focus:ring-blue-900/30"
+                          onPointerDown={(e) => { e.currentTarget.focus(); }}
+                        className="w-full rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 px-4 py-3 text-sm text-slate-600 dark:text-slate-300 leading-7 whitespace-pre-wrap break-words shadow-sm outline-none transition-colors hover:border-slate-300 dark:hover:border-slate-600 focus:border-blue-300 dark:focus:border-blue-600 focus:ring-2 focus:ring-blue-100 dark:focus:ring-blue-900/30 select-text cursor-text"
                       />
                     ))}
                   </div>
@@ -1839,37 +1405,37 @@ export default function NoteDetail() {
       </div>
 
       {/* ---- Mind Map Drawer ---- */}
-      {showMindMap && (
+      {mindMap.state.showMindMap && (
         <div className="fixed inset-0 z-50 flex">
-          <div className="absolute inset-0 bg-black/30 backdrop-blur-sm" onClick={() => setShowMindMap(false)} />
+          <div className="absolute inset-0 bg-black/30 backdrop-blur-sm" onClick={() => mindMap.actions.setShowMindMap(false)} />
           <div className="relative ml-auto w-full max-w-[90vw] h-full bg-white dark:bg-slate-800 shadow-xl flex flex-col" onClick={(e) => e.stopPropagation()}>
             {/* Header */}
             <div className="flex items-center justify-between px-5 py-3 border-b border-slate-200 dark:border-slate-700 flex-shrink-0">
               <div className="flex items-center gap-2">
                 <BrainCircuit className="w-5 h-5 text-purple-500" />
                 <h2 className="text-base font-semibold text-slate-800 dark:text-slate-200">知识导图</h2>
-                {mindMapStatus?.mind_map?.title && mindMapStatus.status === 'ready' && (
-                  <span className="text-sm text-slate-400 ml-2">— {mindMapStatus.mind_map.title}</span>
+                {mindMap.state.mindMapStatus?.mind_map?.title && mindMap.state.mindMapStatus.status === 'ready' && (
+                  <span className="text-sm text-slate-400 ml-2">— {mindMap.state.mindMapStatus.mind_map.title}</span>
                 )}
               </div>
               <div className="flex items-center gap-2">
-                {mindMapStatus?.mind_map && (
-                  <button onClick={handleCopyMindMapOutline} className="p-2 rounded-lg text-slate-400 hover:text-slate-600 hover:bg-slate-100 dark:hover:bg-slate-700 transition-colors" title="复制大纲">
-                    {copyMindMapSuccess ? <Check className="w-4 h-4 text-green-500" /> : <Copy className="w-4 h-4" />}
+                {mindMap.state.mindMapStatus?.mind_map && (
+                  <button onClick={mindMap.actions.handleCopyMindMapOutline} className="p-2 rounded-lg text-slate-400 hover:text-slate-600 hover:bg-slate-100 dark:hover:bg-slate-700 transition-colors" title="复制大纲">
+                    {mindMap.state.copyMindMapSuccess ? <Check className="w-4 h-4 text-green-500" /> : <Copy className="w-4 h-4" />}
                   </button>
                 )}
-                {(mindMapStatus?.status === 'ready' || mindMapStatus?.status === 'stale') && (
-                  <button onClick={() => handleGenerateMindMap(mindMapStatus.status === 'ready')} disabled={isGeneratingMindMap} className="px-3 py-1.5 text-xs font-medium text-purple-600 bg-purple-50 dark:bg-purple-900/20 rounded-lg hover:bg-purple-100 dark:hover:bg-purple-900/30 disabled:opacity-50 flex items-center gap-1" title="重新生成">
-                    <RefreshCw className={`w-3.5 h-3.5 ${isGeneratingMindMap ? 'animate-spin' : ''}`} />
+                {(mindMap.state.mindMapStatus?.status === 'ready' || mindMap.state.mindMapStatus?.status === 'stale') && (
+                  <button onClick={() => mindMap.actions.handleGenerateMindMap(mindMap.state.mindMapStatus?.status === 'ready')} disabled={mindMap.state.isGeneratingMindMap} className="px-3 py-1.5 text-xs font-medium text-purple-600 bg-purple-50 dark:bg-purple-900/20 rounded-lg hover:bg-purple-100 dark:hover:bg-purple-900/30 disabled:opacity-50 flex items-center gap-1" title="重新生成">
+                    <RefreshCw className={`w-3.5 h-3.5 ${mindMap.state.isGeneratingMindMap ? 'animate-spin' : ''}`} />
                     重新生成
                   </button>
                 )}
-                {mindMapStatus?.status === 'ready' && (
-                  <button onClick={handleDeleteMindMap} className="p-2 rounded-lg text-slate-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20 transition-colors" title="删除导图">
+                {mindMap.state.mindMapStatus?.status === 'ready' && (
+                  <button onClick={mindMap.actions.handleDeleteMindMap} className="p-2 rounded-lg text-slate-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20 transition-colors" title="删除导图">
                     <Trash2 className="w-4 h-4" />
                   </button>
                 )}
-                <button onClick={() => setShowMindMap(false)} className="p-2 rounded-lg text-slate-400 hover:text-slate-600 hover:bg-slate-100 dark:hover:bg-slate-700 transition-colors">
+                <button onClick={() => mindMap.actions.setShowMindMap(false)} className="p-2 rounded-lg text-slate-400 hover:text-slate-600 hover:bg-slate-100 dark:hover:bg-slate-700 transition-colors">
                   <X className="w-4 h-4" />
                 </button>
               </div>
@@ -1877,40 +1443,68 @@ export default function NoteDetail() {
 
             {/* Content */}
             <div className="flex-1 overflow-hidden">
-              {mindMapStatus?.status === 'empty' ? (
+              {mindMap.state.mindMapStatus?.status === 'empty' ? (
                 <div className="flex flex-col items-center justify-center h-full text-slate-400 gap-2">
                   <FileText className="w-10 h-10 opacity-30" />
                   <p className="text-sm">当前课次没有可生成的内容</p>
                 </div>
-              ) : mindMapStatus?.status === 'not_generated' || mindMapStatus?.status === 'stale' ? (
+              ) : mindMap.state.mindMapStatus?.status === 'not_generated' || mindMap.state.mindMapStatus?.status === 'stale' ? (
                 <div className="flex flex-col items-center justify-center h-full text-slate-400 gap-4">
                   <BrainCircuit className="w-10 h-10 opacity-30" />
-                  <p className="text-sm">{mindMapStatus.status === 'stale' ? '内容已变化，需要重新生成' : '尚未生成知识导图'}</p>
-                  <button onClick={() => handleGenerateMindMap()} disabled={isGeneratingMindMap} className="px-4 py-2 text-sm font-medium text-white bg-purple-500 rounded-lg hover:bg-purple-600 disabled:opacity-50 flex items-center gap-2">
-                    {isGeneratingMindMap ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
-                    {mindMapStatus.status === 'stale' ? '重新生成' : '生成导图'}
+                  <p className="text-sm">{mindMap.state.mindMapStatus.status === 'stale' ? '内容已变化，需要重新生成' : '尚未生成知识导图'}</p>
+                  <button onClick={() => mindMap.actions.handleGenerateMindMap()} disabled={mindMap.state.isGeneratingMindMap} className="px-4 py-2 text-sm font-medium text-white bg-purple-500 rounded-lg hover:bg-purple-600 disabled:opacity-50 flex items-center gap-2">
+                    {mindMap.state.isGeneratingMindMap ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
+                    {mindMap.state.mindMapStatus.status === 'stale' ? '重新生成' : '生成导图'}
                   </button>
                 </div>
-              ) : mindMapStatus?.status === 'error' ? (
+              ) : mindMap.state.mindMapStatus?.status === 'error' ? (
                 <div className="flex flex-col items-center justify-center h-full text-slate-400 gap-4">
                   <AlertCircle className="w-10 h-10 text-red-400 opacity-50" />
-                  <p className="text-sm text-red-500">{mindMapStatus.error || '生成失败'}</p>
-                  <button onClick={() => handleGenerateMindMap()} disabled={isGeneratingMindMap} className="px-4 py-2 text-sm font-medium text-white bg-purple-500 rounded-lg hover:bg-purple-600 disabled:opacity-50">重试</button>
+                  <p className="text-sm text-red-500">{mindMap.state.mindMapStatus.error || '生成失败'}</p>
+                  <button onClick={() => mindMap.actions.handleGenerateMindMap()} disabled={mindMap.state.isGeneratingMindMap} className="px-4 py-2 text-sm font-medium text-white bg-purple-500 rounded-lg hover:bg-purple-600 disabled:opacity-50">重试</button>
                 </div>
-              ) : isGeneratingMindMap || mindMapStatus?.status === 'generating' ? (
+              ) : mindMap.state.isGeneratingMindMap || mindMap.state.mindMapStatus?.status === 'generating' ? (
                 <div className="flex flex-col items-center justify-center h-full text-slate-400 gap-3">
                   <Loader2 className="w-8 h-8 animate-spin text-purple-500" />
                   <p className="text-sm">AI 正在分析课程内容，生成知识导图...</p>
-                  {typeof mindMapStatus?.progress === 'number' && (
-                    <p className="text-xs text-slate-400">进度 {Math.round(mindMapStatus.progress * 100)}%</p>
+                  {typeof mindMap.state.mindMapStatus?.progress === 'number' && (
+                    <p className="text-xs text-slate-400">进度 {Math.round(mindMap.state.mindMapStatus.progress * 100)}%</p>
                   )}
                 </div>
-              ) : mindMapStatus?.mind_map ? (
+              ) : mindMap.state.mindMapStatus?.mind_map ? (
                 <MindMapCanvas
-                  data={mindMapStatus.mind_map}
-                  onSelect={setSelectedMindMapNode}
-                  selectedNode={selectedMindMapNode}
-                  onSourceClick={handleMindMapSourceClick}
+                  data={mindMap.state.mindMapStatus.mind_map}
+                  onSelect={mindMap.actions.setSelectedMindMapNode}
+                  selectedNode={mindMap.state.selectedMindMapNode}
+                  onSourceClick={(source) => {
+                  if (source.source_type === 'ppt' && source.page != null) {
+                    ppt.actions.setActiveSlideIndex(source.page - 1);
+                    return;
+                  }
+                  if ((source.source_type === 'transcript' || source.source_type === 'note') && source.snippet) {
+                    mindMap.actions.setShowMindMap(false);
+                    setTimeout(() => {
+                      const container = paragraphContainerRef.current;
+                      if (!container) return;
+                      const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
+                      const lowerSnippet = source.snippet!.toLowerCase();
+                      let node;
+                      while ((node = walker.nextNode() as Text | null)) {
+                        if (node.textContent?.toLowerCase().includes(lowerSnippet)) {
+                          const el = node.parentElement;
+                          if (el) {
+                            el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                            el.classList.add('bg-yellow-100', 'dark:bg-yellow-900/30', 'transition-colors');
+                            setTimeout(() => {
+                              el.classList.remove('bg-yellow-100', 'dark:bg-yellow-900/30', 'transition-colors');
+                            }, 3000);
+                          }
+                          break;
+                        }
+                      }
+                    }, 300);
+                  }
+                }}
                 />
               ) : null}
             </div>
@@ -1919,10 +1513,87 @@ export default function NoteDetail() {
       )}
 
       {/* ---- Quiz Drawer ---- */}
-      {showQuiz && (
-        <div className="fixed inset-0 z-50 flex">
-          <div className="absolute inset-0 bg-black/30 backdrop-blur-sm" onClick={() => setShowQuiz(false)} />
-          <div className="relative ml-auto w-full max-w-2xl h-full bg-white dark:bg-slate-800 shadow-xl flex flex-col" onClick={(e) => e.stopPropagation()}>
+      {quiz.state.showQuiz && (
+        <div className="fixed inset-0 z-50 flex justify-end">
+          <div className="absolute inset-0 bg-black/30 backdrop-blur-sm" onClick={() => { quiz.actions.setShowQuiz(false); quiz.actions.setShowQuizQA(false); }} />
+
+          {/* ---- Left QA Panel ---- */}
+          {quiz.state.showQuizQA && (
+            <div className="relative z-10 w-full max-w-lg h-full bg-white dark:bg-slate-800 shadow-xl flex flex-col border-r border-slate-200 dark:border-slate-700">
+              {/* Header */}
+              <div className="flex items-center justify-between px-5 py-4 border-b border-slate-200 dark:border-slate-700">
+                <div className="flex items-center gap-2">
+                  <Sparkles className="w-5 h-5 text-violet-500" />
+                  <h2 className="text-base font-semibold text-slate-800 dark:text-slate-200">AI 答疑</h2>
+                </div>
+                <button onClick={() => quiz.actions.setShowQuizQA(false)} className="p-2 rounded-lg text-slate-400 hover:text-slate-600 hover:bg-slate-100 dark:hover:bg-slate-700 transition-colors">
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+
+              {/* Search input */}
+              <div className="p-4 border-b border-slate-200 dark:border-slate-700 space-y-3">
+                <div className="flex items-center gap-2">
+                  <input
+                    value={rag.state.searchQuery}
+                    onChange={(e) => rag.actions.setSearchQuery(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') rag.actions.handleRAGAsk(sessionId, displayNotebook?.id, vectorIndex.actions.ensureIndexed);
+                    }}
+                    placeholder="输入问题，AI 将基于课堂资料回答..."
+                    className="flex-1 text-sm bg-transparent outline-none text-slate-700 dark:text-slate-200 placeholder:text-slate-400"
+                    autoFocus
+                  />
+                  <button onClick={() => rag.actions.handleRAGAsk(sessionId, displayNotebook?.id, vectorIndex.actions.ensureIndexed)} disabled={rag.state.isAskingRAG} className="px-3 py-1.5 text-xs font-medium text-white bg-violet-500 rounded-lg hover:bg-violet-600 disabled:opacity-50">
+                    {rag.state.isAskingRAG ? '...' : '提问'}
+                  </button>
+                </div>
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center rounded-lg border border-slate-200 dark:border-slate-600 overflow-hidden">
+                    <button onClick={() => rag.actions.setSearchScope('session')} className={`px-2 py-1 text-[10px] font-medium transition-colors ${rag.state.searchScope === 'session' ? 'bg-blue-500 text-white' : 'text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-700'}`}>本课次</button>
+                    <button onClick={() => rag.actions.setSearchScope('notebook')} className={`px-2 py-1 text-[10px] font-medium transition-colors ${rag.state.searchScope === 'notebook' ? 'bg-blue-500 text-white' : 'text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-700'}`}>本课程</button>
+                  </div>
+                  <span className="text-[10px] text-slate-400">基于测验和课次内容答疑</span>
+                </div>
+                {rag.state.ragError && (
+                  <div className="text-xs text-red-500">{rag.state.ragError}</div>
+                )}
+                {rag.state.ragStatus && (
+                  <div className="text-xs text-violet-500 flex items-center gap-1">
+                    <Loader2 className="w-3 h-3 animate-spin" />
+                    {rag.state.ragStatus}
+                  </div>
+                )}
+              </div>
+
+              {/* Answer area */}
+              <div className="flex-1 overflow-y-auto p-4">
+                {rag.state.ragAnswer || rag.state.ragSources.length > 0 ? (
+                  <div className="space-y-3">
+                    {rag.state.ragAnswer ? (
+                      <div className="text-sm text-slate-700 dark:text-slate-200 leading-relaxed whitespace-pre-wrap">{rag.state.ragAnswer}</div>
+                    ) : (
+                      <div className="text-xs text-slate-400">AI 暂时没有生成回答，但已检索到相关课堂来源。</div>
+                    )}
+                    {rag.state.ragSources.length > 0 && (
+                      <div className="pt-3 border-t border-slate-100 dark:border-slate-700">
+                        <p className="text-[10px] text-slate-400 mb-2">参考来源</p>
+                        {renderRagSourceCards(() => quiz.actions.setShowQuizQA(false))}
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <div className="h-full flex flex-col items-center justify-center text-slate-400 gap-3">
+                    <Sparkles className="w-10 h-10 opacity-30" />
+                    <p className="text-sm">{rag.state.isAskingRAG ? '正在思考中...' : '输入问题，AI 将基于课堂资料回答'}</p>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* ---- Right Quiz Panel ---- */}
+          <div className="relative w-full max-w-2xl h-full bg-white dark:bg-slate-800 shadow-xl flex flex-col" onClick={(e) => e.stopPropagation()}>
             {/* Header */}
             <div className="flex items-center justify-between px-5 py-4 border-b border-slate-200 dark:border-slate-700">
               <div className="flex items-center gap-2">
@@ -1930,12 +1601,17 @@ export default function NoteDetail() {
                 <h2 className="text-base font-semibold text-slate-800 dark:text-slate-200">课次测验</h2>
               </div>
               <div className="flex items-center gap-2">
-                {activeQuiz && (
-                  <button onClick={() => { setActiveQuiz(null); setQuizSubmitted(false); setQuizAnswers({}); }} className="p-2 rounded-lg text-slate-400 hover:text-slate-600 hover:bg-slate-100 dark:hover:bg-slate-700 transition-colors" title="返回列表">
-                    <ChevronDown className="w-4 h-4 rotate-90" />
-                  </button>
+                {quiz.state.activeQuiz && (
+                  <>
+                    <button onClick={() => { quiz.actions.setActiveQuiz(null); quiz.actions.setQuizSubmitted(false); quiz.actions.setQuizAnswers({}); quiz.actions.setShowQuizQA(false); }} className="p-2 rounded-lg text-slate-400 hover:text-slate-600 hover:bg-slate-100 dark:hover:bg-slate-700 transition-colors" title="返回列表">
+                      <ChevronDown className="w-4 h-4 rotate-90" />
+                    </button>
+                    <button onClick={() => quiz.actions.setShowQuizQA(!quiz.state.showQuizQA)} className={`p-2 rounded-lg transition-colors ${quiz.state.showQuizQA ? 'text-blue-600 bg-blue-50 dark:bg-blue-900/20' : 'text-slate-400 hover:text-blue-600 hover:bg-blue-50 dark:hover:bg-blue-900/20'}`} title="测验答疑">
+                      <Search className="w-4 h-4" />
+                    </button>
+                  </>
                 )}
-                <button onClick={() => setShowQuiz(false)} className="p-2 rounded-lg text-slate-400 hover:text-slate-600 hover:bg-slate-100 dark:hover:bg-slate-700 transition-colors">
+                <button onClick={() => { quiz.actions.setShowQuiz(false); quiz.actions.setShowQuizQA(false); }} className="p-2 rounded-lg text-slate-400 hover:text-slate-600 hover:bg-slate-100 dark:hover:bg-slate-700 transition-colors">
                   <X className="w-4 h-4" />
                 </button>
               </div>
@@ -1943,40 +1619,40 @@ export default function NoteDetail() {
 
             {/* Content */}
             <div className="flex-1 overflow-y-auto">
-              {quizError && (
+              {quiz.state.quizError && (
                 <div className="mx-5 mt-4 p-3 rounded-lg bg-red-50 dark:bg-red-900/20 text-sm text-red-600 dark:text-red-400 flex items-center gap-2">
                   <AlertCircle className="w-4 h-4 flex-shrink-0" />
-                  {quizError}
-                  <button onClick={() => setQuizError(null)} className="ml-auto text-red-400 hover:text-red-600"><X className="w-3 h-3" /></button>
+                  {quiz.state.quizError}
+                  <button onClick={() => quiz.actions.setQuizError(null)} className="ml-auto text-red-400 hover:text-red-600"><X className="w-3 h-3" /></button>
                 </div>
               )}
 
-              {activeQuiz ? (
+              {quiz.state.activeQuiz ? (
                 /* ---- Active Quiz View ---- */
                 <div className="p-5">
-                  <h3 className="text-lg font-bold text-slate-800 dark:text-slate-100 mb-4">{activeQuiz.title}</h3>
+                  <h3 className="text-lg font-bold text-slate-800 dark:text-slate-100 mb-4">{quiz.state.activeQuiz.title}</h3>
 
-                  {quizSubmitted && activeQuiz.submission ? (
+                  {quiz.state.quizSubmitted && quiz.state.activeQuiz.submission ? (
                     /* ---- Results View ---- */
                     <div>
                       <div className="flex items-center gap-4 mb-6 p-4 rounded-xl bg-slate-50 dark:bg-slate-700/50">
                         <div className="text-center">
-                          <div className={`text-3xl font-bold ${activeQuiz.submission.percentage >= 60 ? 'text-emerald-500' : 'text-red-500'}`}>
-                            {activeQuiz.submission.percentage}%
+                          <div className={`text-3xl font-bold ${quiz.state.activeQuiz.submission.percentage >= 60 ? 'text-emerald-500' : 'text-red-500'}`}>
+                            {quiz.state.activeQuiz.submission.percentage}%
                           </div>
                           <div className="text-xs text-slate-400 mt-1">正确率</div>
                         </div>
                         <div className="text-center">
                           <div className="text-2xl font-bold text-slate-700 dark:text-slate-200">
-                            {activeQuiz.submission.score}/{activeQuiz.submission.total}
+                            {quiz.state.activeQuiz?.submission?.score}/{quiz.state.activeQuiz?.submission?.total}
                           </div>
                           <div className="text-xs text-slate-400 mt-1">答对题数</div>
                         </div>
                       </div>
 
                       <div className="space-y-4">
-                        {activeQuiz.questions.map((q, idx) => {
-                          const result = activeQuiz.submission!.results.find(r => r.question_id === q.id);
+                        {quiz.state.activeQuiz?.questions.map((q, idx) => {
+                          const result = quiz.state.activeQuiz?.submission?.results.find(r => r.question_id === q.id);
                           const isCorrect = result?.correct;
                           return (
                             <div key={q.id} className={`p-4 rounded-xl border ${isCorrect ? 'border-emerald-200 dark:border-emerald-800 bg-emerald-50/50 dark:bg-emerald-900/10' : 'border-red-200 dark:border-red-800 bg-red-50/50 dark:bg-red-900/10'}`}>
@@ -2012,7 +1688,7 @@ export default function NoteDetail() {
                     /* ---- Taking Quiz View ---- */
                     <div>
                       <div className="space-y-5">
-                        {activeQuiz.questions.map((q, idx) => (
+                        {quiz.state.activeQuiz?.questions.map((q, idx) => (
                           <div key={q.id} className="p-4 rounded-xl border border-slate-200 dark:border-slate-600">
                             <p className="text-sm font-medium text-slate-700 dark:text-slate-200 mb-3">
                               <span className="text-emerald-500 mr-1">{idx + 1}.</span>
@@ -2022,14 +1698,14 @@ export default function NoteDetail() {
                               {q.options.map(opt => (
                                 <button
                                   key={opt.id}
-                                  onClick={() => setQuizAnswers(prev => ({ ...prev, [q.id]: opt.id }))}
+                                  onClick={() => quiz.actions.setQuizAnswers(prev => ({ ...prev, [q.id]: opt.id }))}
                                   className={`w-full text-left px-3 py-2.5 rounded-lg text-sm transition-colors flex items-center gap-2 ${
-                                    quizAnswers[q.id] === opt.id
+                                    quiz.state.quizAnswers[q.id] === opt.id
                                       ? 'bg-emerald-100 dark:bg-emerald-900/30 text-emerald-700 dark:text-emerald-300 border border-emerald-300 dark:border-emerald-700'
                                       : 'bg-slate-50 dark:bg-slate-700 text-slate-600 dark:text-slate-300 border border-transparent hover:bg-slate-100 dark:hover:bg-slate-600'
                                   }`}
                                 >
-                                  <CircleDot className={`w-4 h-4 flex-shrink-0 ${quizAnswers[q.id] === opt.id ? 'text-emerald-500' : 'text-slate-300 dark:text-slate-500'}`} />
+                                  <CircleDot className={`w-4 h-4 flex-shrink-0 ${quiz.state.quizAnswers[q.id] === opt.id ? 'text-emerald-500' : 'text-slate-300 dark:text-slate-500'}`} />
                                   <span className="font-medium mr-1">{opt.id}.</span>
                                   {opt.text}
                                 </button>
@@ -2039,10 +1715,10 @@ export default function NoteDetail() {
                         ))}
                       </div>
                       <div className="mt-6 flex items-center justify-between">
-                        <span className="text-xs text-slate-400">已答 {Object.keys(quizAnswers).length}/{activeQuiz.questions.length} 题</span>
+                        <span className="text-xs text-slate-400">已答 {Object.keys(quiz.state.quizAnswers).length}/{quiz.state.activeQuiz.questions.length} 题</span>
                         <button
-                          onClick={handleSubmitQuiz}
-                          disabled={Object.keys(quizAnswers).length < activeQuiz.questions.length}
+                          onClick={quiz.actions.handleSubmitQuiz}
+                          disabled={Object.keys(quiz.state.quizAnswers).length < quiz.state.activeQuiz.questions.length}
                           className="px-5 py-2.5 text-sm font-medium text-white bg-emerald-500 rounded-lg hover:bg-emerald-600 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
                         >
                           提交答案
@@ -2055,31 +1731,31 @@ export default function NoteDetail() {
                 /* ---- Quiz List View ---- */
                 <div className="p-5">
                   {/* Bank Status Banner */}
-                  {bankStatus && bankStatus.status !== 'ready' && (
+                  {quiz.state.bankStatus && quiz.state.bankStatus.status !== 'ready' && (
                     <div className={`mb-4 p-3 rounded-lg text-sm flex items-center gap-2 ${
-                      bankStatus.status === 'generating' ? 'bg-blue-50 dark:bg-blue-900/20 text-blue-600 dark:text-blue-400' :
-                      bankStatus.status === 'stale' ? 'bg-amber-50 dark:bg-amber-900/20 text-amber-600 dark:text-amber-400' :
-                      bankStatus.status === 'error' ? 'bg-red-50 dark:bg-red-900/20 text-red-600 dark:text-red-400' :
-                      bankStatus.status === 'empty' ? 'bg-slate-50 dark:bg-slate-700 text-slate-500' :
+                      quiz.state.bankStatus.status === 'generating' ? 'bg-blue-50 dark:bg-blue-900/20 text-blue-600 dark:text-blue-400' :
+                      quiz.state.bankStatus.status === 'stale' ? 'bg-amber-50 dark:bg-amber-900/20 text-amber-600 dark:text-amber-400' :
+                      quiz.state.bankStatus.status === 'error' ? 'bg-red-50 dark:bg-red-900/20 text-red-600 dark:text-red-400' :
+                      quiz.state.bankStatus.status === 'empty' ? 'bg-slate-50 dark:bg-slate-700 text-slate-500' :
                       'bg-slate-50 dark:bg-slate-700 text-slate-500'
                     }`}>
-                      {bankStatus.status === 'generating' && <Loader2 className="w-4 h-4 animate-spin flex-shrink-0" />}
-                      {bankStatus.status === 'stale' && <AlertCircle className="w-4 h-4 flex-shrink-0" />}
-                      {bankStatus.status === 'error' && <AlertCircle className="w-4 h-4 flex-shrink-0" />}
+                      {quiz.state.bankStatus.status === 'generating' && <Loader2 className="w-4 h-4 animate-spin flex-shrink-0" />}
+                      {quiz.state.bankStatus.status === 'stale' && <AlertCircle className="w-4 h-4 flex-shrink-0" />}
+                      {quiz.state.bankStatus.status === 'error' && <AlertCircle className="w-4 h-4 flex-shrink-0" />}
                       <span>
-                        {bankStatus.status === 'generating' && '题库生成中，请稍候...'}
-                        {bankStatus.status === 'stale' && '笔记内容已变化，题库需要更新'}
-                        {bankStatus.status === 'error' && `题库生成失败: ${bankStatus.error || '未知错误'}`}
-                        {bankStatus.status === 'empty' && '当前课次没有可生成的内容'}
-                        {bankStatus.status === 'not_generated' && '尚未生成题库'}
+                        {quiz.state.bankStatus.status === 'generating' && '题库生成中，请稍候...'}
+                        {quiz.state.bankStatus.status === 'stale' && '笔记内容已变化，题库需要更新'}
+                        {quiz.state.bankStatus.status === 'error' && `题库生成失败: ${quiz.state.bankStatus.error || '未知错误'}`}
+                        {quiz.state.bankStatus.status === 'empty' && '当前课次没有可生成的内容'}
+                        {quiz.state.bankStatus.status === 'not_generated' && '尚未生成题库'}
                       </span>
-                      {(bankStatus.status === 'stale' || bankStatus.status === 'error' || bankStatus.status === 'not_generated') && (
+                      {(quiz.state.bankStatus.status === 'stale' || quiz.state.bankStatus.status === 'error' || quiz.state.bankStatus.status === 'not_generated') && (
                         <button
-                          onClick={handleRebuildBank}
-                          disabled={isRebuildingBank}
+                          onClick={quiz.actions.handleRebuildBank}
+                          disabled={quiz.state.isRebuildingBank}
                           className="ml-auto px-2.5 py-1 text-xs font-medium text-white bg-blue-500 rounded hover:bg-blue-600 disabled:opacity-50 flex items-center gap-1"
                         >
-                          {isRebuildingBank && <Loader2 className="w-3 h-3 animate-spin" />}
+                          {quiz.state.isRebuildingBank && <Loader2 className="w-3 h-3 animate-spin" />}
                           生成题库
                         </button>
                       )}
@@ -2087,35 +1763,35 @@ export default function NoteDetail() {
                   )}
 
                   {/* Rebuild Bank Button (when bank is ready) */}
-                  {bankStatus && bankStatus.status === 'ready' && (
+                  {quiz.state.bankStatus && quiz.state.bankStatus.status === 'ready' && (
                     <div className="mb-4 flex items-center justify-between p-3 rounded-lg bg-emerald-50 dark:bg-emerald-900/10 text-sm">
                       <span className="text-emerald-600 dark:text-emerald-400">
-                        题库已就绪 ({bankStatus.question_count} 题)
+                        题库已就绪 ({quiz.state.bankStatus.question_count} 题)
                       </span>
                       <button
-                        onClick={handleRebuildBank}
-                        disabled={isRebuildingBank}
+                        onClick={quiz.actions.handleRebuildBank}
+                        disabled={quiz.state.isRebuildingBank}
                         className="px-2.5 py-1 text-xs font-medium text-amber-600 dark:text-amber-400 bg-amber-50 dark:bg-amber-900/20 rounded hover:bg-amber-100 dark:hover:bg-amber-900/40 disabled:opacity-50 flex items-center gap-1"
                         title="重新生成题库会调用 AI"
                       >
-                        {isRebuildingBank ? <Loader2 className="w-3 h-3 animate-spin" /> : <RefreshCw className="w-3 h-3" />}
+                        {quiz.state.isRebuildingBank ? <Loader2 className="w-3 h-3 animate-spin" /> : <RefreshCw className="w-3 h-3" />}
                         重新生成题库
                       </button>
                     </div>
                   )}
 
-                  {isGeneratingQuiz ? (
+                  {quiz.state.isGeneratingQuiz ? (
                     <div className="flex flex-col items-center justify-center py-16 text-slate-400 gap-3">
                       <Loader2 className="w-8 h-8 animate-spin text-emerald-500" />
                       <p className="text-sm">正在从题库抽取题目...</p>
                     </div>
-                  ) : quizList.length === 0 ? (
+                  ) : quiz.state.quizList.length === 0 ? (
                     <div className="flex flex-col items-center justify-center py-16 text-slate-400 gap-4">
                       <ClipboardCheck className="w-10 h-10 opacity-30" />
                       <p className="text-sm">尚未开始测验</p>
                       <button
-                        onClick={handleGenerateQuiz}
-                        disabled={!bankStatus || bankStatus.status !== 'ready'}
+                        onClick={quiz.actions.handleGenerateQuiz}
+                        disabled={!quiz.state.bankStatus || quiz.state.bankStatus.status !== 'ready'}
                         className="px-4 py-2 text-sm font-medium text-white bg-emerald-500 rounded-lg hover:bg-emerald-600 disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-2"
                       >
                         开始测验
@@ -2126,30 +1802,30 @@ export default function NoteDetail() {
                       <div className="flex items-center justify-between mb-4">
                         <span className="text-sm text-slate-500">历史测验</span>
                         <button
-                          onClick={handleGenerateQuiz}
-                          disabled={isGeneratingQuiz || !bankStatus || bankStatus.status !== 'ready'}
+                          onClick={quiz.actions.handleGenerateQuiz}
+                          disabled={quiz.state.isGeneratingQuiz || !quiz.state.bankStatus || quiz.state.bankStatus.status !== 'ready'}
                           className="px-3 py-1.5 text-xs font-medium text-white bg-emerald-500 rounded-lg hover:bg-emerald-600 disabled:opacity-50 flex items-center gap-1"
                         >
-                          {isGeneratingQuiz ? <Loader2 className="w-3 h-3 animate-spin" /> : null}
+                          {quiz.state.isGeneratingQuiz ? <Loader2 className="w-3 h-3 animate-spin" /> : null}
                           开始新测验
                         </button>
                       </div>
                       <div className="space-y-2">
-                        {quizList.map(quiz => (
-                          <div key={quiz.quiz_id} className="flex items-center justify-between p-3 rounded-xl border border-slate-200 dark:border-slate-600 hover:bg-slate-50 dark:hover:bg-slate-700/50 transition-colors">
+                        {quiz.state.quizList.map(q => (
+                          <div key={q.quiz_id} className="flex items-center justify-between p-3 rounded-xl border border-slate-200 dark:border-slate-600 hover:bg-slate-50 dark:hover:bg-slate-700/50 transition-colors">
                             <button
-                              onClick={() => handleOpenQuiz(quiz.quiz_id, quiz.submitted)}
+                              onClick={() => quiz.actions.handleOpenQuiz(q.quiz_id, q.submitted)}
                               className="flex-1 text-left"
                             >
-                              <div className="text-sm font-medium text-slate-700 dark:text-slate-200">{quiz.title}</div>
+                              <div className="text-sm font-medium text-slate-700 dark:text-slate-200">{q.title}</div>
                               <div className="text-xs text-slate-400 mt-0.5">
-                                {quiz.question_count} 题 · {quiz.submitted ? '已完成' : '未完成'}
-                                {quiz.score && ` · ${quiz.score.percentage}%`}
-                                {quiz.generated_at && ` · ${new Date(quiz.generated_at).toLocaleDateString()}`}
+                                {q.question_count} 题 · {q.submitted ? '已完成' : '未完成'}
+                                {q.score && ` · ${q.score.percentage}%`}
+                                {q.generated_at && ` · ${new Date(q.generated_at).toLocaleDateString()}`}
                               </div>
                             </button>
                             <button
-                              onClick={(e) => { e.stopPropagation(); handleDeleteQuiz(quiz.quiz_id); }}
+                              onClick={(e) => { e.stopPropagation(); quiz.actions.handleDeleteQuiz(q.quiz_id); }}
                               className="p-1.5 rounded-lg text-slate-300 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20 transition-colors"
                               title="删除"
                             >
@@ -2167,102 +1843,98 @@ export default function NoteDetail() {
         </div>
       )}
 
-      {showSearch && (
-        <div className="fixed inset-0 z-50 flex items-start justify-center pt-20 bg-black/30 backdrop-blur-sm" onClick={() => setShowSearch(false)}>
+      {rag.state.showSearch && (
+        <div className="fixed inset-0 z-50 flex items-start justify-center pt-20 bg-black/30 backdrop-blur-sm" onClick={() => rag.actions.setShowSearch(false)}>
           <div className="bg-white dark:bg-slate-800 rounded-2xl shadow-xl w-full max-w-lg mx-4 overflow-hidden" onClick={(e) => e.stopPropagation()}>
             <div className="flex items-center gap-2 p-4 border-b border-slate-200 dark:border-slate-700">
-              <Search className="w-4 h-4 text-slate-400" />
+              <Sparkles className="w-4 h-4 text-violet-400" />
               <input
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
-                onKeyDown={(e) => { if (e.key === 'Enter') handleSearch(); }}
-                placeholder="搜索关键词..."
+                value={rag.state.searchQuery}
+                onChange={(e) => rag.actions.setSearchQuery(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') rag.actions.handleRAGAsk(sessionId, displayNotebook?.id, vectorIndex.actions.ensureIndexed);
+                }}
+                placeholder="输入问题，AI 将基于课堂资料回答..."
                 className="flex-1 text-sm bg-transparent outline-none text-slate-700 dark:text-slate-200 placeholder:text-slate-400"
                 autoFocus
               />
               <div className="flex items-center rounded-lg border border-slate-200 dark:border-slate-600 overflow-hidden">
-                <button onClick={() => setSearchScope('session')} className={`px-2 py-1 text-[10px] font-medium transition-colors ${searchScope === 'session' ? 'bg-blue-500 text-white' : 'text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-700'}`}>本课次</button>
-                <button onClick={() => setSearchScope('notebook')} className={`px-2 py-1 text-[10px] font-medium transition-colors ${searchScope === 'notebook' ? 'bg-blue-500 text-white' : 'text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-700'}`}>本课程</button>
+                <button onClick={() => rag.actions.setSearchScope('session')} className={`px-2 py-1 text-[10px] font-medium transition-colors ${rag.state.searchScope === 'session' ? 'bg-blue-500 text-white' : 'text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-700'}`}>本课次</button>
+                <button onClick={() => rag.actions.setSearchScope('notebook')} className={`px-2 py-1 text-[10px] font-medium transition-colors ${rag.state.searchScope === 'notebook' ? 'bg-blue-500 text-white' : 'text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-700'}`}>本课程</button>
               </div>
-              <button onClick={handleSearch} disabled={isSearching} className="px-3 py-1.5 text-xs font-medium text-white bg-blue-500 rounded-lg hover:bg-blue-600 disabled:opacity-50">
-                {isSearching ? '...' : '搜索'}
+              <button onClick={() => rag.actions.handleRAGAsk(sessionId, displayNotebook?.id, vectorIndex.actions.ensureIndexed)} disabled={rag.state.isAskingRAG} className="px-3 py-1.5 text-xs font-medium text-white bg-violet-500 rounded-lg hover:bg-violet-600 disabled:opacity-50">
+                {rag.state.isAskingRAG ? '...' : '提问'}
               </button>
             </div>
-            <div className="max-h-80 overflow-y-auto">
-              {searchError ? (
-                <div className="px-4 py-8 text-center text-xs text-red-500">{searchError}</div>
-              ) : searchResults.length > 0 ? (
-                <div className="divide-y divide-slate-100 dark:divide-slate-700">
-                  {searchResults.map((r) => (
-                    <button
-                      key={r.chunk_id}
-                      onClick={() => {
-                        if (r.session_id !== sessionId) {
-                          navigate(`/subject/${r.notebook_id}/session/${r.session_id}`);
-                        }
-                        setShowSearch(false);
-                      }}
-                      className="w-full text-left px-4 py-3 hover:bg-slate-50 dark:hover:bg-slate-700/50 transition-colors"
-                    >
-                      <div className="flex items-center gap-2 mb-1">
-                        <span className={`text-[10px] px-1.5 py-0.5 rounded font-medium ${
-                          r.source_type === 'transcript' ? 'bg-blue-50 text-blue-600 dark:bg-blue-900/30 dark:text-blue-400' :
-                          r.source_type === 'ppt' ? 'bg-purple-50 text-purple-600 dark:bg-purple-900/30 dark:text-purple-400' :
-                          r.source_type === 'note' ? 'bg-amber-50 text-amber-600 dark:bg-amber-900/30 dark:text-amber-400' :
-                          'bg-slate-50 text-slate-600 dark:bg-slate-700 dark:text-slate-400'
-                        }`}>
-                          {r.source_type === 'transcript' ? '转写' : r.source_type === 'ppt' ? 'PPT' : r.source_type === 'note' ? '笔记' : r.source_type}
-                        </span>
-                        <span className="text-xs text-slate-500 dark:text-slate-400 truncate">{r.session_title}</span>
-                        <span className="ml-auto text-[10px] text-slate-400">{(r.score * 100).toFixed(0)}%</span>
+            <div className="max-h-96 overflow-y-auto">
+              <div className="p-4">
+                {rag.state.ragError && (
+                  <div className="mb-3 text-xs text-red-500">{rag.state.ragError}</div>
+                )}
+                {rag.state.ragStatus && (
+                  <div className="mb-3 text-xs text-violet-500 flex items-center gap-1">
+                    <Loader2 className="w-3 h-3 animate-spin" />
+                    {rag.state.ragStatus}
+                  </div>
+                )}
+                {rag.state.ragAnswer || rag.state.ragSources.length > 0 ? (
+                  <div className="space-y-3">
+                    {rag.state.ragAnswer ? (
+                      <div className="text-sm text-slate-700 dark:text-slate-200 leading-relaxed whitespace-pre-wrap">{rag.state.ragAnswer}</div>
+                    ) : (
+                      <div className="text-xs text-slate-400">AI 暂时没有生成回答，但已检索到相关课堂来源。</div>
+                    )}
+                    {rag.state.ragSources.length > 0 && (
+                      <div className="pt-3 border-t border-slate-100 dark:border-slate-700">
+                        <p className="text-[10px] text-slate-400 mb-2">参考来源</p>
+                        {renderRagSourceCards(() => rag.actions.setShowSearch(false))}
                       </div>
-                      <p className="text-xs text-slate-600 dark:text-slate-300 line-clamp-2">{r.snippet}</p>
-                    </button>
-                  ))}
-                </div>
-              ) : searchQuery && !isSearching ? (
-                <div className="px-4 py-8 text-center text-xs text-slate-400">未找到相关内容</div>
-              ) : (
-                <div className="px-4 py-8 text-center text-xs text-slate-400">输入关键词搜索{searchScope === 'session' ? '当前课次' : '当前课程'}</div>
-              )}
+                    )}
+                  </div>
+                ) : (
+                  <div className="py-8 text-center text-xs text-slate-400">
+                    {rag.state.isAskingRAG ? '正在思考中...' : '输入问题，AI 将基于课堂资料回答'}
+                  </div>
+                )}
+              </div>
             </div>
           </div>
         </div>
       )}
 
-      {showShareModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm" onClick={() => setShowShareModal(false)}>
+{share.state.showShareModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm" onClick={() => share.actions.setShowShareModal(false)}>
           <div className="bg-white dark:bg-slate-800 rounded-2xl shadow-xl p-6 w-full max-w-md mx-4" onClick={(e) => e.stopPropagation()}>
             <div className="flex items-center justify-between mb-4">
               <h3 className="text-base font-semibold text-slate-800 dark:text-slate-200">分享课次</h3>
-              <button onClick={() => setShowShareModal(false)} className="p-1 rounded-lg text-slate-400 hover:text-slate-600 hover:bg-slate-100 dark:hover:bg-slate-700 transition-colors"><X className="w-4 h-4" /></button>
+              <button onClick={() => share.actions.setShowShareModal(false)} className="p-1 rounded-lg text-slate-400 hover:text-slate-600 hover:bg-slate-100 dark:hover:bg-slate-700 transition-colors"><X className="w-4 h-4" /></button>
             </div>
-            {shareLoading ? (
+            {share.state.shareLoading ? (
               <div className="flex items-center justify-center py-8">
                 <Loader2 className="w-5 h-5 animate-spin text-slate-400" />
               </div>
-            ) : shareEnabled && shareLink ? (
+            ) : share.state.shareEnabled && share.state.shareLink ? (
               <>
                 <div className="flex items-center gap-2 mb-3">
                   <span className="w-2 h-2 rounded-full bg-green-400" />
                   <span className="text-xs text-green-600 dark:text-green-400">分享已开启</span>
-                  {shareExpiresAt && (
+                  {share.state.shareExpiresAt && (
                     <span className="text-xs text-amber-600 dark:text-amber-400 ml-2">
-                      有效期至 {new Date(shareExpiresAt).toLocaleString()}
+                      有效期至 {new Date(share.state.shareExpiresAt).toLocaleString()}
                     </span>
                   )}
                 </div>
                 <div className="flex items-center gap-2 mb-4">
-                  <input readOnly value={shareLink} className="flex-1 px-3 py-2 text-sm border border-slate-200 dark:border-slate-600 rounded-lg bg-slate-50 dark:bg-slate-900 text-slate-600 dark:text-slate-300" />
-                  <button onClick={() => { navigator.clipboard.writeText(shareLink); setCopySuccess(true); setTimeout(() => setCopySuccess(false), 3000); }}
-                    className="px-3 py-2 text-sm font-medium text-white bg-blue-500 rounded-lg hover:bg-blue-600 transition-colors">{copySuccess ? '已复制' : '复制'}</button>
+                  <input readOnly value={share.state.shareLink} className="flex-1 px-3 py-2 text-sm border border-slate-200 dark:border-slate-600 rounded-lg bg-slate-50 dark:bg-slate-900 text-slate-600 dark:text-slate-300" />
+                  <button onClick={() => { navigator.clipboard.writeText(share.state.shareLink); share.actions.setCopySuccess(true); setTimeout(() => share.actions.setCopySuccess(false), 3000); }}
+                    className="px-3 py-2 text-sm font-medium text-white bg-blue-500 rounded-lg hover:bg-blue-600 transition-colors">{share.state.copySuccess ? '已复制' : '复制'}</button>
                 </div>
-                {shareMaxViews !== null && (
+                {share.state.shareMaxViews !== null && (
                   <p className="text-xs text-slate-500 dark:text-slate-400 mb-3">
-                    已访问 {shareViewCount} / {shareMaxViews} 次
+                    已访问 {share.state.shareViewCount} / {share.state.shareMaxViews} 次
                   </p>
                 )}
-                <button onClick={handleDisableShare} className="w-full py-2 text-sm text-red-500 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-900/20 rounded-lg transition-colors">
+                <button onClick={() => share.actions.handleDisableShare(sessionId!)} className="w-full py-2 text-sm text-red-500 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-900/20 rounded-lg transition-colors">
                   关闭分享
                 </button>
               </>
@@ -2275,8 +1947,8 @@ export default function NoteDetail() {
                       type="number"
                       min={1}
                       placeholder="不限"
-                      value={shareExpiresIn}
-                      onChange={(e) => setShareExpiresIn(e.target.value === '' ? '' : Number(e.target.value))}
+                      value={share.state.shareExpiresIn}
+                      onChange={(e) => share.actions.setShareExpiresIn(e.target.value === '' ? '' : Number(e.target.value))}
                       className="w-full px-3 py-2 text-sm border border-slate-200 dark:border-slate-600 rounded-lg bg-slate-50 dark:bg-slate-700 text-slate-800 dark:text-slate-200 focus:outline-none focus:ring-2 focus:ring-blue-300"
                     />
                   </div>
@@ -2286,13 +1958,13 @@ export default function NoteDetail() {
                       type="number"
                       min={1}
                       placeholder="不限"
-                      value={shareMaxViewsInput}
-                      onChange={(e) => setShareMaxViewsInput(e.target.value === '' ? '' : Number(e.target.value))}
+                      value={share.state.shareMaxViewsInput}
+                      onChange={(e) => share.actions.setShareMaxViewsInput(e.target.value === '' ? '' : Number(e.target.value))}
                       className="w-full px-3 py-2 text-sm border border-slate-200 dark:border-slate-600 rounded-lg bg-slate-50 dark:bg-slate-700 text-slate-800 dark:text-slate-200 focus:outline-none focus:ring-2 focus:ring-blue-300"
                     />
                   </div>
                 </div>
-                <button onClick={handleShareSession} className="w-full py-2 text-sm font-medium text-white bg-blue-500 rounded-lg hover:bg-blue-600 transition-colors">
+                <button onClick={() => share.actions.handleShareSession(sessionId!, share.state.shareExpiresIn, share.state.shareMaxViewsInput)} className="w-full py-2 text-sm font-medium text-white bg-blue-500 rounded-lg hover:bg-blue-600 transition-colors">
                   开启分享
                 </button>
               </div>

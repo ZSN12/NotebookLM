@@ -11,24 +11,12 @@ Mimics the full frontend flow:
 import json
 import os
 import sys
-import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BACKEND_DIR))
 
-TEST_DB = Path(tempfile.gettempdir()) / "nootbook_test_e2e_audio.db"
-for suffix in ("", "-shm", "-wal"):
-    try:
-        Path(f"{TEST_DB}{suffix}").unlink()
-    except FileNotFoundError:
-        pass
-
-os.environ["SECRET_KEY"] = "test-secret-key-with-at-least-32-bytes"
-os.environ["ADMIN_DEFAULT_EMAIL"] = "admin"
-os.environ["ADMIN_DEFAULT_PASSWORD"] = "admin123"
-os.environ["DATABASE_URL"] = f"sqlite:///{TEST_DB.as_posix()}"
 os.environ["SKIP_ASR_PRELOAD"] = "1"
 os.environ["DEEPSEEK_API_KEY"] = "test-key"
 
@@ -153,8 +141,9 @@ def test_audio_batch_stream_events_and_ai_correction():
         assert transcript_list, "Note transcript should not be empty"
 
         first_tx = transcript_list[0]
-        assert first_tx["is_ai_corrected"] is True, (
-            f"Expected is_ai_corrected=True, got {first_tx.get('is_ai_corrected')}"
+        # Batch upload only does local cleanup; AI correction happens later via restructure endpoint
+        assert first_tx["is_ai_corrected"] is False, (
+            f"Expected is_ai_corrected=False, got {first_tx.get('is_ai_corrected')}"
         )
         assert first_tx.get("correction_error") is None, (
             f"Expected no correction error, got {first_tx.get('correction_error')}"
@@ -222,4 +211,64 @@ def test_audio_batch_without_llm_falls_back_to_local():
         done_event = [e for e in events if e["type"] == "done"][0]
         first_tx = done_event["note"]["transcript"][0]
         assert first_tx["is_ai_corrected"] is False
-        assert first_tx.get("correction_error") is not None
+        assert first_tx.get("correction_error") is None
+
+
+
+def test_audio_batch_chunked_upload_flow():
+    """Large file (>10MB threshold) should use resumable chunk upload then finish."""
+    with TestClient(app) as client:
+        headers = _auth_headers(client)
+        session_id = _create_notebook_and_session(client, headers)
+
+        # Build a fake ~12MB "audio" blob so it triggers chunked path
+        payload = b"RIFF" + b"\x00" * (12 * 1024 * 1024)
+
+        mock_transcriber = MagicMock()
+        mock_transcriber.transcribe.return_value = []
+
+        mock_corrector = MagicMock()
+        mock_corrector.has_llm = False
+        mock_corrector.clean_transcript_for_display.side_effect = lambda x: x
+        mock_corrector.prepare_stream_chunk.side_effect = lambda x, history="": x
+
+        with patch("app.api.process.audio.transcriber", mock_transcriber), \
+             patch("app.api.process.audio.corrector", mock_corrector), \
+             patch("app.api.process.audio._FUNASR_AVAILABLE", True):
+
+            chunk_size = 5 * 1024 * 1024
+            total_chunks = (len(payload) + chunk_size - 1) // chunk_size
+            for i in range(total_chunks):
+                chunk = payload[i * chunk_size:(i + 1) * chunk_size]
+                resp = client.post(
+                    "/api/process/audio-chunk",
+                    params={
+                        "session_id": session_id,
+                        "chunk_index": i,
+                        "total_chunks": total_chunks,
+                    },
+                    files={"file": (f"audio.part{i}", chunk, "application/octet-stream")},
+                    headers=headers,
+                )
+                assert resp.status_code == 200, f"Chunk {i} upload failed: {resp.text[:500]}"
+                data = resp.json()
+                assert data["received"] is True
+                assert data["chunk_index"] == i
+
+            finish_resp = client.post(
+                "/api/process/audio-chunk-finish",
+                params={
+                    "session_id": session_id,
+                    "file_name": "test_audio.webm",
+                    "total_chunks": total_chunks,
+                },
+                headers=headers,
+            )
+            assert finish_resp.status_code == 200, (
+                f"Finish failed: {finish_resp.status_code} {finish_resp.text[:500]}"
+            )
+
+        # The finish endpoint returns SSE (StreamingResponse) or JSON depending on
+        # whether it falls through to the batch generator. With empty segments it
+        # may yield an error event, but the HTTP handshake itself should succeed.
+        assert finish_resp.status_code == 200

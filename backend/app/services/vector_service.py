@@ -1,7 +1,8 @@
-"""Local lightweight vector service using TF-IDF style embeddings.
+"""Local vector service with neural embedding fallback to TF-IDF.
 
-No external embedding APIs or vector databases required.
-Uses jieba for Chinese tokenization and a sparse TF-IDF-like vector representation.
+Uses DashScope text-embedding-v2 for high-quality semantic vectors.
+Falls back to TF-IDF hashing when the neural service is unavailable.
+Search uses numpy for fast vectorized cosine similarity.
 """
 
 import hashlib
@@ -10,86 +11,128 @@ import math
 import re
 import struct
 from collections import Counter
-from typing import Optional
+from typing import Optional, List
 
 import jieba
+import numpy as np
 
 from app.models import (
     VectorChunk, Session as DBSession, Note, Notebook, User,
 )
 from sqlalchemy.orm import Session as DBSessionType
 
+from app.services.embedding_service import (
+    neural_embedding, neural_embedding_batch, EMBEDDING_DIM,
+)
+
 # ── Constants ──
-VEC_DIM = 512  # dimension of our sparse-ish vector
+VEC_DIM_LEGACY = 512  # dimension of legacy TF-IDF vector
 MIN_CHUNK_CHARS = 10  # skip chunks shorter than this
 CHUNK_SIZE = 300  # target chars per chunk
 CHUNK_OVERLAP = 50  # overlap between chunks
 
 
-# ── Tokenization ──
+# ── Legacy TF-IDF Embedding (fallback) ──
 
 def _tokenize(text: str) -> list[str]:
     """Tokenize Chinese + English text into words."""
-    # Split on whitespace first for English
     words: list[str] = []
     for segment in re.split(r'\s+', text):
         if not segment:
             continue
-        # If segment is mostly CJK, use jieba
         cjk_count = sum(1 for c in segment if '\u4e00' <= c <= '\u9fff')
         if cjk_count > len(segment) * 0.3:
             words.extend(jieba.lcut(segment))
         else:
             words.append(segment.lower())
-    # Filter very short tokens
     return [w for w in words if len(w) >= 2]
 
 
-# ── Hash-based feature mapping ──
-
 def _hash_feature(token: str) -> int:
-    """Map a token to a deterministic bucket index in [0, VEC_DIM)."""
+    """Map a token to a deterministic bucket index in [0, VEC_DIM_LEGACY)."""
     h = hashlib.md5(token.encode('utf-8')).hexdigest()
-    return int(h, 16) % VEC_DIM
+    return int(h, 16) % VEC_DIM_LEGACY
 
 
-# ── Embedding ──
-
-def _text_to_embedding(text: str) -> bytes:
-    """Convert text to a fixed-dimension float32 vector using TF hashing.
-
-    Each token is hashed to a bucket. The value is the sum of token frequencies,
-    then L2-normalized. Returns packed bytes (VEC_DIM * 4 bytes).
-    """
+def _text_to_embedding_tfidf(text: str) -> bytes:
+    """Legacy TF-IDF embedding."""
     tokens = _tokenize(text)
     if not tokens:
-        return struct.pack(f'{VEC_DIM}f', *([0.0] * VEC_DIM))
+        return struct.pack(f'{VEC_DIM_LEGACY}f', *([0.0] * VEC_DIM_LEGACY))
 
     counter = Counter(tokens)
-    vec = [0.0] * VEC_DIM
+    vec = [0.0] * VEC_DIM_LEGACY
     for token, count in counter.items():
         idx = _hash_feature(token)
-        # Use log(1+count) to dampen high-frequency terms
         vec[idx] += math.log1p(count)
 
-    # L2 normalize
     norm = math.sqrt(sum(v * v for v in vec))
     if norm > 0:
         vec = [v / norm for v in vec]
 
-    return struct.pack(f'{VEC_DIM}f', *vec)
+    return struct.pack(f'{VEC_DIM_LEGACY}f', *vec)
 
 
-def _cosine_similarity(a: bytes, b: bytes) -> float:
-    """Compute cosine similarity between two packed float32 vectors."""
-    vec_a = struct.unpack(f'{VEC_DIM}f', a)
-    vec_b = struct.unpack(f'{VEC_DIM}f', b)
-    dot = sum(x * y for x, y in zip(vec_a, vec_b))
-    norm_a = math.sqrt(sum(x * x for x in vec_a))
-    norm_b = math.sqrt(sum(x * x for x in vec_b))
-    if norm_a == 0 or norm_b == 0:
-        return 0.0
-    return dot / (norm_a * norm_b)
+def _text_to_embedding(text: str) -> tuple[bytes, Optional[bytes]]:
+    """Generate both legacy and neural embeddings.
+
+    Returns (legacy_embedding, neural_embedding_or_none).
+    """
+    legacy = _text_to_embedding_tfidf(text)
+    neural = neural_embedding(text)
+    return legacy, neural
+
+
+# ── Cosine Similarity (numpy vectorized) ──
+
+def _cosine_similarity(query_vec: np.ndarray, embeddings: np.ndarray) -> np.ndarray:
+    """Compute cosine similarity between query and a batch of embeddings.
+
+    Args:
+        query_vec: shape (D,)
+        embeddings: shape (N, D)
+
+    Returns:
+        scores: shape (N,)
+    """
+    # L2 normalize
+    query_norm = np.linalg.norm(query_vec)
+    emb_norms = np.linalg.norm(embeddings, axis=1)
+
+    if query_norm == 0:
+        return np.zeros(len(embeddings))
+
+    # Avoid division by zero
+    emb_norms = np.where(emb_norms == 0, 1, emb_norms)
+
+    dot = embeddings @ query_vec  # shape (N,)
+    scores = dot / (emb_norms * query_norm)
+    return scores
+
+
+def _unpack_embeddings(chunks: list[VectorChunk], prefer_v2: bool = True) -> tuple[np.ndarray, list[VectorChunk]]:
+    """Unpack embeddings from chunks into a numpy array.
+
+    Returns (embeddings_array, valid_chunks).
+    """
+    valid = []
+    vectors = []
+
+    for chunk in chunks:
+        emb_bytes = chunk.embedding_v2 if (prefer_v2 and chunk.embedding_v2) else chunk.embedding
+        if not emb_bytes:
+            continue
+        try:
+            vec = np.frombuffer(emb_bytes, dtype=np.float32)
+            vectors.append(vec)
+            valid.append(chunk)
+        except Exception:
+            continue
+
+    if not vectors:
+        return np.array([]), []
+
+    return np.stack(vectors), valid
 
 
 # ── Chunking ──
@@ -129,34 +172,47 @@ def _extract_text_from_note(note: Note) -> list[tuple[str, str, str, dict]]:
             page = block.get("page")
             title = block.get("title", "")
 
+            block_id = block.get("id") or f"block-{i}"
+
             if btype == "transcript" and content and len(content.strip()) >= MIN_CHUNK_CHARS:
-                meta = {"block_index": i, "block_type": "transcript"}
-                results.append(("layout", block.get("id", ""), content.strip(), meta))
+                meta = {"block_id": block_id, "block_index": i, "block_type": "transcript"}
+                results.append(("transcript", block_id, content.strip(), meta))
             elif btype == "note" and content and len(content.strip()) >= MIN_CHUNK_CHARS:
-                meta = {"block_index": i, "block_type": "note"}
-                results.append(("layout", block.get("id", ""), content.strip(), meta))
+                meta = {"block_id": block_id, "block_index": i, "block_type": "note"}
+                results.append(("note", block_id, content.strip(), meta))
             elif btype == "ppt":
-                # Index PPT title and any text content
                 ppt_text = ""
                 if title:
                     ppt_text += title + " "
                 if content:
                     ppt_text += content + " "
                 if ppt_text.strip() and len(ppt_text.strip()) >= MIN_CHUNK_CHARS:
-                    meta = {"block_index": i, "block_type": "ppt", "page": page}
-                    results.append(("ppt", block.get("id", ""), ppt_text.strip(), meta))
+                    meta = {"block_id": block_id, "block_index": i, "block_type": "ppt", "page": page}
+                    results.append(("ppt", block_id, ppt_text.strip(), meta))
 
     # 2. Transcript (if no layout blocks)
     if not layout_blocks:
         transcript = note.transcript
         if transcript and isinstance(transcript, list):
-            full_text = " ".join(
-                chunk.get("text", "")
-                for chunk in sorted(transcript, key=lambda x: x.get("chunk_index", 0))
-                if isinstance(chunk, dict)
-            ).strip()
-            if full_text and len(full_text) >= MIN_CHUNK_CHARS:
-                results.append(("transcript", note.id, full_text, {}))
+            for idx, chunk in enumerate(sorted(transcript, key=lambda x: x.get("chunk_index", 0))):
+                if not isinstance(chunk, dict):
+                    continue
+                text = (
+                    chunk.get("display_text")
+                    or chunk.get("corrected_text")
+                    or chunk.get("text")
+                    or ""
+                ).strip()
+                if text and len(text) >= MIN_CHUNK_CHARS:
+                    chunk_index = chunk.get("chunk_index", idx)
+                    meta = {
+                        "block_id": f"transcript-{chunk_index}",
+                        "block_type": "transcript",
+                        "chunk_index": chunk_index,
+                        "correction_stage": chunk.get("correction_stage"),
+                        "is_ai_corrected": chunk.get("is_ai_corrected"),
+                    }
+                    results.append(("transcript", meta["block_id"], text, meta))
 
     # 3. Note content (fallback)
     if not results and note.content:
@@ -186,11 +242,7 @@ def _extract_text_from_note(note: Note) -> list[tuple[str, str, str, dict]]:
 # ── Content fingerprint ──
 
 def _compute_session_content_hash(note: Note) -> str:
-    """Compute a stable SHA-256 fingerprint of all note content.
-
-    Serializes content, transcript, ppt_images, layout_blocks with
-    sort_keys=True and ensure_ascii=False for deterministic output.
-    """
+    """Compute a stable SHA-256 fingerprint of all note content."""
     payload = {
         "content": note.content or "",
         "transcript": note.transcript or [],
@@ -203,9 +255,8 @@ def _compute_session_content_hash(note: Note) -> str:
 
 # ── Index building ──
 
-def build_session_index(session_id: str, user: User, db: DBSessionType) -> int:
+def build_session_index(session_id: str, user: User, db: DBSessionType, use_neural: bool = True) -> int:
     """Build vector index for a single session. Returns number of chunks created."""
-    # Verify ownership
     session = db.query(DBSession).filter(
         DBSession.id == session_id
     ).join(Notebook).filter(Notebook.user_id == user.id).first()
@@ -220,44 +271,60 @@ def build_session_index(session_id: str, user: User, db: DBSessionType) -> int:
         db.commit()
         return 0
 
-    # Compute content fingerprint for stale detection
     session_content_hash = _compute_session_content_hash(note)
-
     extracted = _extract_text_from_note(note)
     chunk_count = 0
 
+    # Collect all chunk texts for batch neural embedding
+    chunk_texts = []
+    chunk_metas = []
+    chunk_sources = []
+
     for source_type, source_id, text, meta in extracted:
-        # Chunk long texts
         text_chunks = _chunk_text(text)
         for idx, chunk_text in enumerate(text_chunks):
             if len(chunk_text.strip()) < MIN_CHUNK_CHARS:
                 continue
+            chunk_texts.append(chunk_text)
+            chunk_metas.append({
+                **meta,
+                "chunk_in_source": idx,
+                "chunk_index": meta.get("chunk_index", idx),
+                "session_content_hash": session_content_hash,
+            })
+            chunk_sources.append((source_type, source_id))
 
-            content_hash = hashlib.sha256(chunk_text.encode('utf-8')).hexdigest()
-            embedding = _text_to_embedding(chunk_text)
+    # Batch neural embedding
+    neural_embeddings = [None] * len(chunk_texts)
+    if use_neural:
+        neural_embeddings = neural_embedding_batch(chunk_texts)
 
-            chunk_meta = {**meta, "chunk_in_source": idx, "session_content_hash": session_content_hash}
+    # Create VectorChunk records
+    for i, chunk_text in enumerate(chunk_texts):
+        content_hash = hashlib.sha256(chunk_text.encode('utf-8')).hexdigest()
+        legacy_emb = _text_to_embedding_tfidf(chunk_text)  # legacy TF-IDF only
 
-            vc = VectorChunk(
-                user_id=user.id,
-                notebook_id=session.notebook_id,
-                session_id=session_id,
-                source_type=source_type,
-                source_id=source_id,
-                chunk_index=chunk_count,
-                text=chunk_text,
-                chunk_meta=chunk_meta,
-                embedding=embedding,
-                content_hash=content_hash,
-            )
-            db.add(vc)
-            chunk_count += 1
+        vc = VectorChunk(
+            user_id=user.id,
+            notebook_id=session.notebook_id,
+            session_id=session_id,
+            source_type=chunk_sources[i][0],
+            source_id=chunk_sources[i][1],
+            chunk_index=chunk_count,
+            text=chunk_text,
+            chunk_meta=chunk_metas[i],
+            embedding=legacy_emb,
+            embedding_v2=neural_embeddings[i],
+            content_hash=content_hash,
+        )
+        db.add(vc)
+        chunk_count += 1
 
     db.commit()
     return chunk_count
 
 
-def build_notebook_index(notebook_id: str, user: User, db: DBSessionType) -> int:
+def build_notebook_index(notebook_id: str, user: User, db: DBSessionType, use_neural: bool = True) -> int:
     """Build vector index for all sessions in a notebook. Returns total chunks."""
     notebook = db.query(Notebook).filter(
         Notebook.id == notebook_id,
@@ -268,7 +335,7 @@ def build_notebook_index(notebook_id: str, user: User, db: DBSessionType) -> int
 
     total = 0
     for session in notebook.sessions:
-        total += build_session_index(session.id, user, db)
+        total += build_session_index(session.id, user, db, use_neural=use_neural)
     return total
 
 
@@ -286,8 +353,6 @@ def search_vectors(
     if not query.strip():
         return []
 
-    query_embedding = _text_to_embedding(query)
-
     # Build base query - only user's own chunks
     q = db.query(VectorChunk).filter(VectorChunk.user_id == user.id)
 
@@ -300,14 +365,45 @@ def search_vectors(
     if not chunks:
         return []
 
-    # Score each chunk
+    # Determine if we have neural embeddings available
+    has_v2 = any(c.embedding_v2 is not None for c in chunks)
+    prefer_v2 = has_v2
+
+    # Get query embedding (match the type used in chunks)
+    if prefer_v2:
+        query_emb_bytes = neural_embedding(query)
+        if query_emb_bytes is None:
+            # Neural service unavailable, fallback to legacy
+            prefer_v2 = False
+
+    if not prefer_v2:
+        query_emb_bytes = _text_to_embedding_tfidf(query)
+
+    # Unpack chunk embeddings into numpy array
+    embeddings_np, valid_chunks = _unpack_embeddings(chunks, prefer_v2=prefer_v2)
+    if len(valid_chunks) == 0:
+        return []
+
+    # Unpack query vector
+    query_vec = np.frombuffer(query_emb_bytes, dtype=np.float32)
+
+    # Vectorized cosine similarity (batched to avoid OOM with large N)
+    MAX_BATCH = 2000
+    if len(valid_chunks) > MAX_BATCH:
+        all_scores = []
+        for i in range(0, len(valid_chunks), MAX_BATCH):
+            batch_emb = embeddings_np[i:i+MAX_BATCH]
+            batch_scores = _cosine_similarity(query_vec, batch_emb)
+            all_scores.extend(batch_scores.tolist())
+        scores = np.array(all_scores)
+    else:
+        scores = _cosine_similarity(query_vec, embeddings_np)
+
+    # Build scored results
     scored = []
-    for chunk in chunks:
-        if not chunk.embedding:
-            continue
-        score = _cosine_similarity(query_embedding, chunk.embedding)
-        if score > 0.01:  # minimum relevance threshold
-            scored.append((chunk, score))
+    for chunk, score in zip(valid_chunks, scores):
+        if score > 0.01:
+            scored.append((chunk, float(score)))
 
     # Sort by score descending
     scored.sort(key=lambda x: x[1], reverse=True)
@@ -315,7 +411,6 @@ def search_vectors(
     # Build results
     results = []
     for chunk, score in scored[:limit]:
-        # Get session and notebook info
         session = db.query(DBSession).filter(DBSession.id == chunk.session_id).first()
         notebook = db.query(Notebook).filter(Notebook.id == chunk.notebook_id).first()
 
@@ -326,6 +421,7 @@ def search_vectors(
             "session_id": chunk.session_id,
             "session_title": session.title if session else "未知",
             "source_type": chunk.source_type,
+            "source_id": chunk.source_id,
             "snippet": chunk.text[:200] + ("..." if len(chunk.text) > 200 else ""),
             "score": round(score, 4),
             "metadata": chunk.chunk_meta or {},
@@ -338,7 +434,6 @@ def search_vectors(
 
 def get_session_index_status(session_id: str, user: User, db: DBSessionType) -> dict:
     """Get indexing status for a session."""
-    # Verify ownership
     session = db.query(DBSession).filter(
         DBSession.id == session_id
     ).join(Notebook).filter(Notebook.user_id == user.id).first()
@@ -357,9 +452,7 @@ def get_session_index_status(session_id: str, user: User, db: DBSessionType) -> 
     elif chunk_count == 0:
         status = "not_indexed"
     else:
-        # Check if content has changed since last index
         current_hash = _compute_session_content_hash(note) if note else ""
-        # Read indexed hash from any chunk's chunk_meta
         sample_chunk = db.query(VectorChunk).filter(
             VectorChunk.session_id == session_id
         ).first()
@@ -368,10 +461,16 @@ def get_session_index_status(session_id: str, user: User, db: DBSessionType) -> 
             indexed_hash = sample_chunk.chunk_meta.get("session_content_hash", "")
         status = "indexed" if indexed_hash == current_hash else "stale"
 
-    result = {
+    # Check if has neural embeddings
+    has_neural = db.query(VectorChunk).filter(
+        VectorChunk.session_id == session_id,
+        VectorChunk.embedding_v2.isnot(None),
+    ).count() > 0
+
+    return {
         "session_id": session_id,
         "chunk_count": chunk_count,
         "has_content": has_content,
         "status": status,
+        "has_neural_embedding": has_neural,
     }
-    return result

@@ -3,24 +3,12 @@
 import json
 import os
 import sys
-import tempfile
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BACKEND_DIR))
 
-TEST_DB = Path(tempfile.gettempdir()) / "nootbook_test_three_tier.db"
-for suffix in ("", "-shm", "-wal"):
-    try:
-        (Path(f"{TEST_DB}{suffix}")).unlink()
-    except FileNotFoundError:
-        pass
-
-os.environ["SECRET_KEY"] = "test-three-tier-secret-key-at-least-32-bytes!!!"
-os.environ["ADMIN_DEFAULT_EMAIL"] = "admin"
-os.environ["ADMIN_DEFAULT_PASSWORD"] = "admin123"
-os.environ["DATABASE_URL"] = f"sqlite:///{TEST_DB.as_posix()}"
 os.environ["SKIP_ASR_PRELOAD"] = "1"
 os.environ["DEEPSEEK_API_KEY"] = "test-key-for-three-tier"
 
@@ -196,47 +184,46 @@ def test_restructure_endpoint_fallback_on_failure():
             assert note_data["transcript"][0]["raw_text"] == "raw text from ASR"
             assert note_data["transcript"][0]["corrected_text"] is None
             assert note_data["transcript"][0]["is_ai_corrected"] is False
-            assert note_data["transcript"][0]["correction_error"] == "AI 整理失败"
+            assert note_data["transcript"][0]["correction_error"] == "AI 整理失败，已使用本地整理稿"
 
 
 # ── Integration: streaming ASR finalize saves three tiers ──
 
-def test_streaming_asr_finalize_saves_three_tiers():
+def test_streaming_asr_finalize_saves_local_only():
+    """finalize() no longer calls DeepSeek; it returns a local-only entry."""
     from app.services.streaming_asr import StreamingRecognizer
-    from app.services.term_corrector import corrector as local_corrector
 
-    with patch.object(local_corrector, "restructure_transcript", return_value="今天我们学习了单例模式。"):
-        with patch.object(local_corrector, "preserves_source_content", return_value=True):
-            rec = StreamingRecognizer(session_id="s1", course_title="测试")
-            rec.final_segments = [MagicMock(text="今天 我们 学习了 单例 模式 啊", start_ms=0, end_ms=5000)]
-            rec.all_timestamps = [{"text": "今天", "start": 0, "end": 500}]
-            rec.audio_buffer = bytearray()
+    rec = StreamingRecognizer(session_id="s1", course_title="测试")
+    rec.final_segments = [MagicMock(text="今天 我们 学习了 单例 模式 啊", start_ms=0, end_ms=5000)]
+    rec.all_timestamps = [{"text": "今天", "start": 0, "end": 500}]
+    rec.audio_buffer = bytearray()
 
-            payload = rec.finalize()
-            entry = payload["transcript"][0]
+    payload = rec.finalize()
+    entry = payload["transcript"][0]
 
-            assert entry["raw_text"] == "今天 我们 学习了 单例 模式 啊"
-            assert entry["display_text"] is not None
-            assert entry["corrected_text"] is not None
-            assert entry["is_ai_corrected"] is True
-            assert entry["correction_error"] is None
+    assert entry["raw_text"] == "今天 我们 学习了 单例 模式 啊"
+    assert entry["display_text"] is not None
+    assert entry["corrected_text"] is None
+    assert entry["is_ai_corrected"] is False
+    assert entry["correction_error"] is None
+    assert entry["correction_stage"] == "local"
 
 
-def test_streaming_asr_finalize_fallback_on_failure():
+def test_streaming_asr_finalize_local_no_failure():
+    """Without DeepSeek, finalize never reports an AI failure."""
     from app.services.streaming_asr import StreamingRecognizer
-    from app.services.term_corrector import corrector as local_corrector
 
-    with patch.object(local_corrector, "restructure_transcript", side_effect=RuntimeError("API down")):
-        rec = StreamingRecognizer(session_id="s1", course_title="测试")
-        rec.final_segments = [MagicMock(text="今天 我们 学习了 单例 模式 啊", start_ms=0, end_ms=5000)]
-        rec.all_timestamps = [{"text": "今天", "start": 0, "end": 500}]
-        rec.audio_buffer = bytearray()
+    rec = StreamingRecognizer(session_id="s1", course_title="测试")
+    rec.final_segments = [MagicMock(text="今天 我们 学习了 单例 模式 啊", start_ms=0, end_ms=5000)]
+    rec.all_timestamps = [{"text": "今天", "start": 0, "end": 500}]
+    rec.audio_buffer = bytearray()
 
-        payload = rec.finalize()
-        entry = payload["transcript"][0]
+    payload = rec.finalize()
+    entry = payload["transcript"][0]
 
-        assert entry["raw_text"] == "今天 我们 学习了 单例 模式 啊"
-        assert entry["display_text"] is not None
-        assert entry["corrected_text"] is None
-        assert entry["is_ai_corrected"] is False
-        assert entry["correction_error"] == "AI 整理失败"
+    assert entry["raw_text"] == "今天 我们 学习了 单例 模式 啊"
+    assert entry["display_text"] is not None
+    assert entry["corrected_text"] is None
+    assert entry["is_ai_corrected"] is False
+    assert entry["correction_error"] is None
+    assert entry["correction_stage"] == "local"

@@ -2,6 +2,13 @@ import { API_BASE } from '@/config';
 
 const TOKEN_KEY = "nootbook_token";
 
+export interface UserProfile {
+  id: string;
+  email: string;
+  username?: string | null;
+  avatar_url?: string | null;
+}
+
 export function getToken(): string | null {
   return localStorage.getItem(TOKEN_KEY);
 }
@@ -30,8 +37,8 @@ async function authFetch(path: string, body: object): Promise<Response> {
       signal: controller.signal,
     });
     return res;
-  } catch (err: any) {
-    if (err.name === "AbortError") {
+  } catch (err: unknown) {
+    if (err instanceof Error && err.name === "AbortError") {
       throw new Error("请求超时，请检查后端是否在 8003 端口运行");
     }
     throw new Error(`无法连接到服务器 (${API_BASE})，请确认后端已启动`);
@@ -76,7 +83,7 @@ export async function resetPassword(email: string, newPassword: string): Promise
   }
 }
 
-export async function getProfile(): Promise<any> {
+export async function getProfile(): Promise<UserProfile> {
   const token = getToken();
   if (!token) throw new Error("Not authenticated");
   const res = await fetch(`${API_BASE}/api/auth/me`, {
@@ -86,7 +93,7 @@ export async function getProfile(): Promise<any> {
   return res.json();
 }
 
-export async function updateProfile(username: string): Promise<any> {
+export async function updateProfile(username: string): Promise<UserProfile> {
   const token = getToken();
   const res = await fetch(`${API_BASE}/api/auth/profile`, {
     method: "PUT",

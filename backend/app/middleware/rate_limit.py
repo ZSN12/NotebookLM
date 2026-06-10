@@ -56,6 +56,15 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         auth = request.headers.get("authorization", "")
         if auth.startswith("Bearer "):
             return f"user:{hash(auth)}"
+        # Prefer X-Forwarded-For / X-Real-IP for reverse-proxy setups
+        xff = request.headers.get("x-forwarded-for", "")
+        if xff:
+            ip = xff.split(",")[0].strip()
+            if ip:
+                return f"ip:{ip}"
+        xri = request.headers.get("x-real-ip", "")
+        if xri:
+            return f"ip:{xri}"
         return f"ip:{request.client.host}" if request.client else "ip:unknown"
 
     def _check_rate_limit(self, user_key: str, path: str) -> tuple[bool, dict]:

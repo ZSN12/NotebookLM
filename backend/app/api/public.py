@@ -114,10 +114,7 @@ def get_share_slides_pdf(
 
     _validate_share_token(session, token)
 
-    pdf_path = SLIDE_DIR / session_id / "slides.pdf"
-    if not pdf_path.exists():
-        raise HTTPException(status_code=404, detail="PDF not found")
-
+    pdf_path = _safe_media_path(SLIDE_DIR, session_id, "slides.pdf")
     return FileResponse(pdf_path)
 
 

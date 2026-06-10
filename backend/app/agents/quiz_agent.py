@@ -19,12 +19,13 @@ class QuizAgent(BaseAgent):
     prompt_name = "quiz"
 
     temperature = 0.4
-    max_tokens = 8000
+    max_tokens = 12000
 
-    # Number of questions per batch.
-    BATCH1_COUNT = 5
-    BATCH2_COUNT = 5
-    MIN_TOTAL_QUESTIONS = 10
+    # Number of questions per batch. The bank should be larger than a single
+    # attempt so later quizzes can sample different questions from it.
+    BATCH1_COUNT = 15
+    BATCH2_COUNT = 15
+    MIN_TOTAL_QUESTIONS = 30
 
     def _call_batch(
         self,
@@ -56,7 +57,7 @@ class QuizAgent(BaseAgent):
 
         questions = self._try_generate(prompt_template, prompt, count)
         if len(questions) >= count:
-            return questions
+            return questions[:count]
 
         if retry:
             logger.info(
@@ -82,7 +83,7 @@ class QuizAgent(BaseAgent):
             raise ValueError(
                 f"AI 返回的题目数量不足: 要求 {count} 道，实际仅 {len(questions)} 道有效题目"
             )
-        return questions
+        return questions[:count]
 
     def _try_generate(
         self,
@@ -106,6 +107,16 @@ class QuizAgent(BaseAgent):
             )
         return questions
 
+    @staticmethod
+    def _normalize_question(text: str) -> str:
+        """Normalize question text for deduplication."""
+        import re
+        t = text.strip().lower()
+        # Remove common punctuation and whitespace variations
+        t = re.sub(r"[\s\n\r\t]+", " ", t)
+        t = re.sub(r"[。？?！!，,、；;：:\"\"''（）()【】\[\]{}]+", "", t)
+        return t.strip()
+
     def _update_progress(self, ctx: AgentContext, progress: float) -> None:
         if ctx.task:
             ctx.task.progress = progress
@@ -127,7 +138,7 @@ class QuizAgent(BaseAgent):
                 count=self.BATCH1_COUNT,
                 focus="请重点关注课程的核心概念和主要知识点。",
             )
-            self._update_progress(ctx, 0.5)
+            self._update_progress(ctx, 0.45)
 
             # Batch 2: details and difficult points (deduplicated)
             batch1_texts = [q["question"] for q in batch1]
@@ -138,11 +149,23 @@ class QuizAgent(BaseAgent):
                 focus="请重点关注课程的细节、难点和深入理解。",
                 existing_questions=batch1_texts,
             )
+            self._update_progress(ctx, 0.85)
 
             all_questions = batch1 + batch2
+
+            # Hard deduplication by normalized question text
+            seen_normalized: set[str] = set()
+            deduped: list[dict] = []
+            for q in all_questions:
+                norm = self._normalize_question(q.get("question", ""))
+                if norm and norm not in seen_normalized:
+                    seen_normalized.add(norm)
+                    deduped.append(q)
+            all_questions = deduped
+
             if len(all_questions) < self.MIN_TOTAL_QUESTIONS:
                 raise ValueError(
-                    f"题库题目数量不足: 共 {len(all_questions)} 道，"
+                    f"题库题目数量不足: 去重后共 {len(all_questions)} 道，"
                     f"至少需要 {self.MIN_TOTAL_QUESTIONS} 道"
                 )
 
